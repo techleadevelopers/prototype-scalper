@@ -5,6 +5,7 @@ import {
   recordTradeOutcome,
   exportAllOutcomes,
   tradeCount,
+  getTelemetrySseEmitter,
 } from "../lib/telemetryStore";
 import { getQuantBrainRecentTrades, getQuantBrainTradeSummary, syncQuantBrainOutcome } from "../lib/quantBrainClient";
 import { AdaptiveEngine } from "../lib/adaptiveEngine";
@@ -222,6 +223,68 @@ router.get("/telemetry/export", async (_req: Request, res: Response) => {
     getQuantBrainRecentTrades("all", 2_000),
   ]);
   res.json(mergeOutcomes(localOutcomes, quantRecentTrades));
+});
+
+/**
+ * GET /api/telemetry/live — Server-Sent Events real-time feed.
+ *
+ * Streams:
+ *   { type: "engine_state", data: GlobalState }      — on connect + every 15s
+ *   { type: "trade_recorded", data: TradeOutcome }   — whenever a trade is logged
+ *   { type: "heartbeat", ts: number }                — every 20s keepalive
+ *
+ * Client usage:
+ *   const es = new EventSource("/api/telemetry/live", { withCredentials: true })
+ *   es.onmessage = (e) => { const msg = JSON.parse(e.data); ... }
+ */
+router.get("/telemetry/live", (req: Request, res: Response) => {
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  res.flushHeaders();
+
+  function send(msg: Record<string, unknown>) {
+    res.write(`data: ${JSON.stringify(msg)}\n\n`);
+  }
+
+  // Send initial engine snapshot on connect
+  try {
+    const engine = getEngine();
+    const global = engine.globalState();
+    send({ type: "engine_state", data: global });
+  } catch {
+    // non-fatal — just skip initial snapshot if engine unavailable
+  }
+
+  // Engine heartbeat + state refresh every 15s
+  const stateInterval = setInterval(() => {
+    try {
+      const engine = getEngine();
+      const global = engine.globalState();
+      send({ type: "engine_state", data: global });
+    } catch {
+      // ignore
+    }
+  }, 15_000);
+
+  // Keepalive heartbeat every 20s (prevents proxy timeout)
+  const heartbeatInterval = setInterval(() => {
+    send({ type: "heartbeat", ts: Date.now() });
+  }, 20_000);
+
+  // Listen for new trade outcomes
+  const { sseEmitter } = getTelemetrySseEmitter();
+  function onTrade(outcome: unknown) {
+    send({ type: "trade_recorded", data: outcome });
+  }
+  sseEmitter.on("trade", onTrade);
+
+  req.on("close", () => {
+    clearInterval(stateInterval);
+    clearInterval(heartbeatInterval);
+    sseEmitter.off("trade", onTrade);
+  });
 });
 
 export default router;

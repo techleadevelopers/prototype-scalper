@@ -358,6 +358,16 @@ export function startQuantBrainOutcomeSync(initialOutcomes: TradeOutcome[] = [])
   void flushPendingQuantBrainOutcomes();
 }
 
+export interface SentimentContext {
+  direction: "BULL" | "BEAR" | "NEUTRAL";
+  confidence: number;
+  biasRatio: number;
+  dominantSide: "LONG" | "SHORT" | "NEUTRAL";
+  vwapDeviation?: number;
+  volumeDelta?: number;
+  momentum24h?: number;
+}
+
 export interface QuantBrainEdgeInput {
   symbol: string;
   side: "BUY" | "SELL";
@@ -368,6 +378,7 @@ export interface QuantBrainEdgeInput {
   currentWinRate?: number;
   currentProfitFactor?: number;
   config: BotConfig;
+  sentimentContext?: SentimentContext;
 }
 
 export async function evaluateQuantBrainEdge(

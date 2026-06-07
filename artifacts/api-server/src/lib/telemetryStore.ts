@@ -19,6 +19,7 @@
  * - Rotação de arquivo por tamanho
  */
 
+import { EventEmitter } from "events";
 import * as fs from "fs";
 import * as path from "path";
 import * as crypto from "crypto";
@@ -477,6 +478,7 @@ export function recordTradeOutcome(raw: Omit<TradeOutcome, "id"> & { id?: string
 
   appendToDiskAsync(outcome);
   getEngine().recordOutcome(outcome);
+  emitSseTrade(outcome);
 
   logMetric({
     name: "trade.recorded",
@@ -634,6 +636,18 @@ export function exportOutcomesAsJsonl(): string {
 /** How many trades are in the telemetry store */
 export function tradeCount(): number {
   return getEngine().globalState().totalTrades;
+}
+
+// ── SSE emitter for real-time streaming ─────────────────────────────────────
+const _sseEmitter = new EventEmitter();
+_sseEmitter.setMaxListeners(100);
+
+export function getTelemetrySseEmitter(): { sseEmitter: EventEmitter } {
+  return { sseEmitter: _sseEmitter };
+}
+
+export function emitSseTrade(outcome: TradeOutcome): void {
+  _sseEmitter.emit("trade", outcome);
 }
 
 /** Create a manual backup */

@@ -16,6 +16,7 @@ import {
   Wifi,
   WifiOff,
   XCircle,
+  BarChart2,
 } from "lucide-react";
 import {
   getGetBingXTickerQueryKey,
@@ -33,6 +34,169 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 
 type Side = "LONG" | "SHORT";
 type AnyRecord = Record<string, any>;
+
+interface SentimentIndicators {
+  vwapDeviation: number;
+  volumeDelta: number;
+  momentum4h: number;
+  momentum24h: number;
+  ema12vs24: string;
+  rangePosition: number;
+  bodyBias: number;
+  volumeTrend: string;
+  highLowBreak: string;
+}
+
+interface SentimentResult {
+  symbol: string;
+  direction: "BULL" | "BEAR" | "NEUTRAL";
+  confidence: number;
+  biasRatio: number;
+  dominantSide: "LONG" | "SHORT" | "NEUTRAL";
+  entryBias: { longWeight: number; shortWeight: number };
+  indicators: SentimentIndicators;
+  candles24h: number;
+  fetchedAt: number;
+  error?: string;
+}
+
+async function fetchSentiment(symbol: string): Promise<SentimentResult> {
+  const res = await fetch(apiUrl(`/api/bot/sentiment?symbol=${encodeURIComponent(symbol)}`), {
+    credentials: "include",
+  });
+  if (!res.ok) throw new Error(`Sentiment HTTP ${res.status}`);
+  return await res.json() as SentimentResult;
+}
+
+function SentimentPanel({ symbol }: { symbol: string }) {
+  const { data, isLoading } = useQuery({
+    queryKey: ["sentiment", symbol],
+    queryFn: () => fetchSentiment(symbol),
+    refetchInterval: 5 * 60 * 1000,
+    placeholderData: (prev) => prev,
+    retry: 1,
+  });
+
+  if (isLoading && !data) {
+    return (
+      <section className="border border-border/50 bg-card/25 p-4">
+        <div className="flex items-center gap-2 mb-4">
+          <BarChart2 className="h-4 w-4 text-primary" />
+          <h2 className="text-sm font-semibold">Sentimento 24h · Viés Direcional</h2>
+        </div>
+        <Skeleton className="h-20 w-full" />
+      </section>
+    );
+  }
+
+  if (!data) return null;
+
+  const { direction, confidence, biasRatio, entryBias, indicators, error } = data;
+  const dirColor = direction === "BULL" ? "text-green-400" : direction === "BEAR" ? "text-red-400" : "text-amber-400";
+  const dirBg = direction === "BULL" ? "bg-green-500/10 border-green-500/30" : direction === "BEAR" ? "bg-red-500/10 border-red-500/30" : "bg-amber-500/10 border-amber-500/30";
+  const longPct = Math.round(entryBias.longWeight * 100);
+  const shortPct = 100 - longPct;
+
+  const bars: { label: string; value: number; unit: string; bullish: boolean }[] = [
+    { label: "Desvio VWAP", value: indicators.vwapDeviation, unit: "%", bullish: indicators.vwapDeviation >= 0 },
+    { label: "Delta vol", value: indicators.volumeDelta * 100, unit: "%", bullish: indicators.volumeDelta >= 0 },
+    { label: "Mom 4h", value: indicators.momentum4h, unit: "%", bullish: indicators.momentum4h >= 0 },
+    { label: "Mom 24h", value: indicators.momentum24h, unit: "%", bullish: indicators.momentum24h >= 0 },
+    { label: "Bias body", value: indicators.bodyBias * 100, unit: "%", bullish: indicators.bodyBias >= 0 },
+  ];
+
+  return (
+    <section className={`border p-4 ${dirBg}`}>
+      <div className="flex flex-wrap items-center gap-2 mb-4">
+        <BarChart2 className="h-4 w-4 text-primary" />
+        <h2 className="text-sm font-semibold">Sentimento 24h · Viés Direcional</h2>
+        <Badge variant="outline" className={`font-mono font-bold ${dirColor}`}>{direction}</Badge>
+        <span className="text-xs text-muted-foreground ml-1">confiança {(confidence * 100).toFixed(0)}%</span>
+        {error && <span className="text-[9px] text-amber-400 ml-auto font-mono">⚠ {error}</span>}
+      </div>
+
+      <div className="grid gap-5 sm:grid-cols-[1fr_1.2fr]">
+        {/* Bias distribution bar */}
+        <div>
+          <p className="text-[10px] uppercase tracking-wider text-muted-foreground mb-2">Distribuição de entradas recomendada</p>
+          <div className="flex h-8 w-full overflow-hidden rounded-md border border-border/40">
+            <div
+              className="flex items-center justify-center bg-green-500/25 text-[11px] font-bold text-green-400 transition-all"
+              style={{ width: `${longPct}%` }}
+            >
+              {longPct >= 20 ? `${longPct}% L` : ""}
+            </div>
+            <div
+              className="flex items-center justify-center bg-red-500/25 text-[11px] font-bold text-red-400 transition-all"
+              style={{ width: `${shortPct}%` }}
+            >
+              {shortPct >= 20 ? `${shortPct}% S` : ""}
+            </div>
+          </div>
+          <div className="flex justify-between mt-1.5">
+            <span className="font-mono text-[10px] text-green-400">{longPct}% LONG</span>
+            <span className="font-mono text-[10px] text-red-400">{shortPct}% SHORT</span>
+          </div>
+          <div className="mt-3 grid grid-cols-3 gap-2 text-center">
+            <div className="border border-border/30 rounded p-2">
+              <p className="text-[8px] uppercase text-muted-foreground">EMA 12/24</p>
+              <p className={`font-mono text-xs font-bold ${indicators.ema12vs24 === "BULL" ? "text-green-400" : indicators.ema12vs24 === "BEAR" ? "text-red-400" : "text-muted-foreground"}`}>
+                {indicators.ema12vs24}
+              </p>
+            </div>
+            <div className="border border-border/30 rounded p-2">
+              <p className="text-[8px] uppercase text-muted-foreground">Posição</p>
+              <p className="font-mono text-xs font-bold">{(indicators.rangePosition * 100).toFixed(0)}%</p>
+              <p className="text-[7px] text-muted-foreground">{indicators.rangePosition > 0.65 ? "topo" : indicators.rangePosition < 0.35 ? "fundo" : "meio"}</p>
+            </div>
+            <div className="border border-border/30 rounded p-2">
+              <p className="text-[8px] uppercase text-muted-foreground">Vol trend</p>
+              <p className={`font-mono text-xs font-bold ${indicators.volumeTrend === "RISING" ? "text-green-400" : indicators.volumeTrend === "FALLING" ? "text-red-400" : "text-muted-foreground"}`}>
+                {indicators.volumeTrend === "RISING" ? "↑" : indicators.volumeTrend === "FALLING" ? "↓" : "—"} {indicators.volumeTrend}
+              </p>
+            </div>
+          </div>
+        </div>
+
+        {/* Indicator bars */}
+        <div className="space-y-2">
+          {bars.map((bar) => {
+            const absVal = Math.abs(bar.value);
+            const pct = Math.min(100, absVal * 5);
+            return (
+              <div key={bar.label}>
+                <div className="flex justify-between mb-0.5">
+                  <span className="text-[10px] text-muted-foreground">{bar.label}</span>
+                  <span className={`font-mono text-[10px] font-bold ${bar.bullish ? "text-green-400" : "text-red-400"}`}>
+                    {bar.value >= 0 ? "+" : ""}{bar.value.toFixed(3)}{bar.unit}
+                  </span>
+                </div>
+                <div className="flex h-1.5 w-full overflow-hidden rounded-full bg-muted/30">
+                  <div
+                    className={`h-full rounded-full ${bar.bullish ? "bg-green-500/60" : "bg-red-500/60"}`}
+                    style={{ width: `${pct}%`, marginLeft: bar.bullish ? "50%" : `${50 - pct / 2}%`, maxWidth: "50%" }}
+                  />
+                </div>
+              </div>
+            );
+          })}
+          <div className="mt-1">
+            <div className="flex justify-between mb-0.5">
+              <span className="text-[10px] text-muted-foreground">Breakout</span>
+              <span className={`font-mono text-[10px] font-bold ${indicators.highLowBreak === "BREAKOUT_UP" ? "text-green-400" : indicators.highLowBreak === "BREAKOUT_DOWN" ? "text-red-400" : "text-muted-foreground"}`}>
+                {indicators.highLowBreak === "BREAKOUT_UP" ? "↑ BREAKOUT UP" : indicators.highLowBreak === "BREAKOUT_DOWN" ? "↓ BREAKOUT DOWN" : "RANGE BOUND"}
+              </span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <p className="mt-3 text-[9px] text-muted-foreground">
+        Baseado em {data.candles24h} candles 1h · {data.fetchedAt ? new Date(data.fetchedAt).toLocaleTimeString() : "--"} · Cache 5min
+      </p>
+    </section>
+  );
+}
 
 interface IntelligenceResponse {
   symbol: string;
@@ -285,6 +449,8 @@ export default function IntelligencePage() {
             <span className="font-mono text-[10px] text-muted-foreground">{lastUpdated}</span>
           </div>
         </header>
+
+        <SentimentPanel symbol={symbol} />
 
         {demoAnalysis?.connected && (
           <section className="grid grid-cols-1 gap-3 border border-blue-500/25 bg-blue-500/5 p-4 sm:grid-cols-3">

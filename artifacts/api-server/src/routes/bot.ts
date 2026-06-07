@@ -11,6 +11,7 @@ import { AdaptiveEngine, type BtcRegime, type ClusterKey, type PositionSide, typ
 import { computeAllCandleEdges, computeCandleEdge, type CandleInterval } from "../lib/candleEdge";
 import { feeDragRejectReason, maxCorrelatedBulkOrders } from "../lib/executionRisk";
 import { getQuantBrainIntelligence } from "../lib/quantBrainClient";
+import { getMarketSentiment, getMarketSentimentBulk, type SentimentResult } from "../lib/sentimentEngine";
 import {
   buildAttachedProtection,
   candleConfirmationRejects,
@@ -519,6 +520,56 @@ function buildBulkCorrelationRejects(orders: BulkOrderItem[], maxPerCluster: num
   return rejects;
 }
 
+/**
+ * GET /api/bot/sentiment — 24h directional bias engine per symbol.
+ *
+ * Returns SentimentResult for each allowed symbol:
+ *   direction: BULL | BEAR | NEUTRAL
+ *   confidence: 0-1
+ *   biasRatio: 0.5 = neutral; 0.72 = 72% weight to dominantSide
+ *   entryBias: { longWeight, shortWeight } for bulk order distribution
+ *   indicators: vwapDeviation, volumeDelta, momentum4h, momentum24h, ema12vs24, etc.
+ *
+ * Use biasRatio to tilt bulk entry distribution:
+ *   BULL 0.75 → 75% of bulk slots are LONG, 25% SHORT
+ *   BEAR 0.70 → 70% SHORT, 30% LONG
+ */
+router.get("/bot/sentiment", async (req: Request, res: Response) => {
+  const config = getBotConfig();
+  const symbols = config.allowedSymbols.length > 0 ? config.allowedSymbols : [];
+  const single = req.query.symbol as string | undefined;
+
+  if (single) {
+    const result = await getMarketSentiment(single);
+    res.json(result);
+    return;
+  }
+
+  if (symbols.length === 0) {
+    res.json({ symbols: [], fetchedAt: Date.now() });
+    return;
+  }
+
+  const results = await getMarketSentimentBulk(symbols);
+
+  const overallScore = results.reduce((acc, r) => {
+    const w = r.confidence;
+    return acc + (r.direction === "BULL" ? w : r.direction === "BEAR" ? -w : 0);
+  }, 0) / Math.max(1, results.length);
+
+  const portfolioBias: "BULL" | "BEAR" | "NEUTRAL" =
+    overallScore > 0.08 ? "BULL" : overallScore < -0.08 ? "BEAR" : "NEUTRAL";
+
+  const portfolioBiasRatio = Math.max(0.5, Math.min(0.80, 0.5 + Math.abs(overallScore) * 2.5));
+
+  res.json({
+    symbols: results,
+    portfolioBias,
+    portfolioBiasRatio,
+    fetchedAt: Date.now(),
+  });
+});
+
 /** GET /api/bot/scan — parallel multi-symbol scan with adaptive ranking */
 router.get("/bot/scan", async (req: Request, res: Response) => {
   const config = getBotConfig();
@@ -558,20 +609,34 @@ router.get("/bot/scan", async (req: Request, res: Response) => {
     positionSideFilter === "SHORT" ? ["SHORT"] :
     ["LONG", "SHORT"];
 
-  // Fetch all tickers in parallel — public endpoint, no auth, no rate limit concern
-  const tickerResults = await Promise.allSettled(
-    symbols.map(async (sym) => {
-      const url = `${BINGX_PUBLIC_BASE}/openApi/swap/v2/quote/ticker?symbol=${encodeURIComponent(sym)}`;
-      const resp = await fetch(url, { signal: AbortSignal.timeout(3000) });
-      const json = await resp.json() as Record<string, unknown>;
-      if (json.code !== 0) throw new Error(`ticker error ${sym}: ${json.msg}`);
-      const d = (json.data as Record<string, unknown>) ?? {};
-      return {
-        symbol: sym,
-        lastPrice: String(d.lastPrice ?? "0"),
-        priceChangePct: parseFloat(String(d.priceChangePercent ?? "0")),
-      };
-    })
+  // Fetch tickers AND sentiment in parallel — both public endpoints
+  const [tickerResults, sentimentResults] = await Promise.all([
+    Promise.allSettled(
+      symbols.map(async (sym) => {
+        const url = `${BINGX_PUBLIC_BASE}/openApi/swap/v2/quote/ticker?symbol=${encodeURIComponent(sym)}`;
+        const resp = await fetch(url, { signal: AbortSignal.timeout(3000) });
+        const json = await resp.json() as Record<string, unknown>;
+        if (json.code !== 0) throw new Error(`ticker error ${sym}: ${json.msg}`);
+        const d = (json.data as Record<string, unknown>) ?? {};
+        return {
+          symbol: sym,
+          lastPrice: String(d.lastPrice ?? "0"),
+          priceChangePct: parseFloat(String(d.priceChangePercent ?? "0")),
+        };
+      })
+    ),
+    getMarketSentimentBulk(symbols).catch(() => symbols.map((s) => ({
+      symbol: s, direction: "NEUTRAL" as const, confidence: 0, biasRatio: 0.5,
+      dominantSide: "NEUTRAL" as const, entryBias: { longWeight: 0.5, shortWeight: 0.5 },
+      indicators: { vwapDeviation: 0, volumeDelta: 0, momentum4h: 0, momentum24h: 0,
+        ema12vs24: "FLAT" as const, rangePosition: 0.5, bodyBias: 0, volumeTrend: "FLAT" as const,
+        highLowBreak: "RANGE_BOUND" as const },
+      candles24h: 0, fetchedAt: Date.now(),
+    }))),
+  ]);
+
+  const sentimentBySymbol = new Map<string, SentimentResult>(
+    sentimentResults.map((r) => [r.symbol, r])
   );
 
   // Build ScanSymbol entries for each symbol × each applicable side
@@ -656,14 +721,31 @@ router.get("/bot/scan", async (req: Request, res: Response) => {
       }
 
       const gatePass = gateRejects.length === 0;
-      const rankingScore = gatePass ? engine.rankingScore(clusterKey, Math.max(0, ev)) : 0;
+
+      const sentiment = sentimentBySymbol.get(sym);
+      const sentimentDirection = sentiment?.direction ?? "NEUTRAL";
+      const sentimentBiasRatio = sentiment?.biasRatio ?? 0.5;
+      const sentimentConfidence = sentiment?.confidence ?? 0;
+
+      // Sentiment-aware ranking boost: if this side aligns with dominant sentiment, boost rank
+      const sentimentAligned =
+        (side === "LONG" && sentimentDirection === "BULL") ||
+        (side === "SHORT" && sentimentDirection === "BEAR");
+      const sentimentBoost = sentimentAligned && sentimentConfidence > 0.3
+        ? sentimentConfidence * 0.15
+        : !sentimentAligned && sentimentConfidence > 0.4
+          ? -sentimentConfidence * 0.10
+          : 0;
+      const sentimentAdjustedRank = gatePass
+        ? Math.max(0, engine.rankingScore(clusterKey, Math.max(0, ev)) + sentimentBoost)
+        : 0;
 
       scanSymbols.push({
         symbol: sym,
         positionSide: side,
         lastPrice: ticker?.lastPrice ?? "0",
         priceChangePct: ticker?.priceChangePct ?? 0,
-        rankingScore,
+        rankingScore: sentimentAdjustedRank,
         priorityScore,
         toxicityScore,
         ewmaWinRate,
@@ -673,6 +755,17 @@ router.get("/bot/scan", async (req: Request, res: Response) => {
         gateRejects,
         isCandidate: gatePass,
         isToxic,
+        sentiment: {
+          direction: sentimentDirection,
+          confidence: sentimentConfidence,
+          biasRatio: sentimentBiasRatio,
+          dominantSide: sentiment?.dominantSide ?? "NEUTRAL",
+          aligned: sentimentAligned,
+          longWeight: sentiment?.entryBias.longWeight ?? 0.5,
+          shortWeight: sentiment?.entryBias.shortWeight ?? 0.5,
+          vwapDeviation: sentiment?.indicators.vwapDeviation ?? 0,
+          momentum24h: sentiment?.indicators.momentum24h ?? 0,
+        },
       });
     }
   }
@@ -685,6 +778,17 @@ router.get("/bot/scan", async (req: Request, res: Response) => {
 
   const candidateCount = scanSymbols.filter((s) => s.isCandidate).length;
 
+  // Portfolio-level directional bias from sentiment
+  const sentimentScores = sentimentResults.map((r) => {
+    const w = r.confidence;
+    return r.direction === "BULL" ? w : r.direction === "BEAR" ? -w : 0;
+  });
+  const portfolioSentimentScore = sentimentScores.reduce((a, b) => a + b, 0) / Math.max(1, sentimentScores.length);
+  const portfolioBias: "BULL" | "BEAR" | "NEUTRAL" =
+    portfolioSentimentScore > 0.08 ? "BULL" : portfolioSentimentScore < -0.08 ? "BEAR" : "NEUTRAL";
+  const portfolioBiasRatio = Math.max(0.5, Math.min(0.80, 0.5 + Math.abs(portfolioSentimentScore) * 2.5));
+  const recommendedLongPct = portfolioBias === "BULL" ? portfolioBiasRatio : portfolioBias === "BEAR" ? 1 - portfolioBiasRatio : 0.5;
+
   res.json({
     scanTime: Date.now(),
     btcRegime,
@@ -693,6 +797,10 @@ router.get("/bot/scan", async (req: Request, res: Response) => {
     symbols: scanSymbols,
     candidateCount,
     maxOrdersPerSecond: BINGX_RATE_LIMIT,
+    portfolioBias,
+    portfolioBiasRatio,
+    recommendedLongPct,
+    recommendedShortPct: 1 - recommendedLongPct,
   });
 });
 
