@@ -1,0 +1,244 @@
+Act as a principal ML platform engineer, quantitative researcher, and production reliability auditor.
+
+CONTEXT
+
+This system currently trades exclusively with BingX VST/demo capital, but it must behave with the same engineering rigor expected for proprietary institutional capital.
+
+The Quant Brain is an external intelligence service operating continuously. It consumes real-time candles, indicators, market regime data, sentiment/context features, sniper signals and reconciled VST outcomes.
+
+The objective is not guaranteed profit. The objective is to detect, measure and maintain statistically validated net edge while preventing data corruption, model drift, leakage, overfitting and failures caused by continuous high-volume processing.
+
+Do not enable real-money credentials.
+
+PRIMARY AUDIT OBJECTIVE
+
+Audit and improve the complete Quant Brain lifecycle:
+
+market data
+→ feature generation
+→ prediction
+→ executor decision
+→ VST campaign
+→ reconciled outcome
+→ training dataset
+→ validation
+→ calibration
+→ champion/challenger promotion
+→ monitoring and rollback
+
+First inspect runtime paths. Do not assume a component works because a file, function, endpoint or environment variable exists.
+
+1. DATA PIPELINE AUDIT
+
+Trace every data source and verify:
+
+- candle timestamps and timezone normalization;
+- candle ordering and deduplication;
+- incomplete candle handling;
+- missing intervals;
+- stale data;
+- duplicated events;
+- delayed or out-of-order arrivals;
+- symbol normalization;
+- reconnect recovery;
+- historical backfill;
+- feature/outcome joins;
+- database transaction boundaries.
+
+Define one canonical event-time policy.
+
+Never use an unfinished candle as a closed-candle feature unless explicitly modeled as such.
+
+Add data-quality metrics:
+
+- freshness;
+- completeness;
+- duplicate rate;
+- missing-candle rate;
+- out-of-order rate;
+- invalid-value rate;
+- feature-null rate;
+- outcome-link failure rate.
+
+2. FUTURE-DATA LEAKAGE AUDIT
+
+Prove that every feature used by a prediction existed before the decision timestamp.
+
+Audit:
+
+- rolling windows;
+- candle close timestamps;
+- normalization;
+- target construction;
+- train/validation splitting;
+- feature backfills;
+- regime labels;
+- PnL labels;
+- MFE/MAE;
+- sentiment timestamps.
+
+Create automated leakage tests.
+
+MFE, MAE, exit price, closing reason and future candles must never enter entry-time features.
+
+3. SAMPLE IDENTITY AND CORRELATION
+
+Separate:
+
+- execution_id;
+- signal_id;
+- campaign_id;
+- market_event_id;
+- independent_sample_id.
+
+Several stacked orders from one symbol, direction and continuous signal are one correlated campaign, not several independent ML observations.
+
+Prevent duplicated campaign outcomes from overweighting training.
+
+Measure sample concentration by:
+
+- symbol;
+- side;
+- regime;
+- hour;
+- signal family;
+- campaign;
+- correlated market event.
+
+4. LABEL QUALITY
+
+Audit hit/miss and profitability labels.
+
+Verify:
+
+- one final label per campaign;
+- idempotent updates;
+- partial-close handling;
+- TP, SL and manual close semantics;
+- net PnL sign;
+- commission treatment;
+- unresolved campaigns;
+- late outcomes;
+- contradictory labels;
+- class imbalance.
+
+Do not label an unresolved campaign as a miss.
+
+Version every label definition.
+
+5. FEATURE INTEGRITY
+
+Create a feature registry containing:
+
+- feature name;
+- definition;
+- source;
+- timeframe;
+- version;
+- expected range;
+- null policy;
+- freshness requirement;
+- training/inference parity test.
+
+Detect:
+
+- NaN and infinity;
+- impossible values;
+- constant features;
+- exploding ranges;
+- unit mismatches;
+- changed schemas;
+- training-serving skew;
+- redundant and unstable features.
+
+Predictions must fail closed or use an explicitly tagged baseline when critical features are invalid.
+
+6. DATA AND CONCEPT DRIFT
+
+Monitor separately:
+
+Data drift:
+- feature distribution changes;
+- missingness changes;
+- volume and volatility shifts;
+- symbol-universe changes.
+
+Concept drift:
+- predicted probability versus observed outcome;
+- calibration degradation;
+- net expectancy degradation;
+- regime-specific performance changes;
+- direction-specific degradation.
+
+Implement metrics such as:
+
+- PSI;
+- Jensen-Shannon divergence;
+- KS statistic where appropriate;
+- rolling Brier score;
+- Expected Calibration Error;
+- calibration slope/intercept;
+- rolling net expectancy;
+- Profit Factor;
+- drawdown.
+
+Thresholds must be configurable and based on stable reference windows.
+
+7. CALIBRATION AUDIT
+
+Audit whether probabilities represent observed frequencies.
+
+Generate calibration reports by:
+
+- global model;
+- score bucket;
+- symbol;
+- LONG/SHORT;
+- regime;
+- model version;
+- fallback versus ML.
+
+Use chronological out-of-sample calibration.
+
+Do not calibrate and evaluate on the same samples.
+
+Compare isotonic, Platt/sigmoid and uncalibrated models. Select using out-of-sample Brier score, calibration error and net expectancy, not AUC alone.
+
+8. MODEL VALIDATION
+
+Require:
+
+- chronological train/validation/test partitions;
+- walk-forward validation;
+- purge gap between partitions when labels overlap;
+- deterministic baseline comparison;
+- minimum independent campaign samples;
+- both classes represented;
+- confidence intervals;
+- regime and symbol breakdown;
+- pessimistic sensitivity tests.
+
+Evaluate:
+
+- precision and recall;
+- ROC-AUC and PR-AUC;
+- Brier score;
+- calibration error;
+- net expectancy;
+- Profit Factor;
+- maximum drawdown;
+- stability across folds;
+- performance concentration.
+
+Reject models whose profitability depends on one symbol, one period or a tiny number of campaigns.
+
+9. CHAMPION/CHALLENGER GOVERNANCE
+
+Maintain immutable metadata:
+
+- model version;
+- feature version;
+- label version;
+- training dataset fingerprint;
+- training period;
+- validation results;

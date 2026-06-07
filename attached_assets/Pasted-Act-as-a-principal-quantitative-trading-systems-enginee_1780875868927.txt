@@ -1,0 +1,252 @@
+Act as a principal quantitative trading systems engineer.
+
+The repository operates exclusively through the BingX VST/demo account. Demo orders are real exchange demo orders, so SCALP_ALLOW_EXECUTION must remain true. Do not enable or configure a real-money account.
+
+Do not add cosmetic features or new indicators yet. Audit and complete the end-to-end sniper validation and learning loop:
+
+signal
+→ campaign
+→ stacked VST orders
+→ exchange reconciliation
+→ closing detection
+→ realized PnL
+→ outcome memory
+→ ML training sample
+→ calibrated prediction
+→ controlled strategy decision
+
+1. AUDIT THE CURRENT DELIVERY
+
+Verify from executable runtime paths, not filenames or claims:
+
+- serviceState transitions;
+- persistent JSONL ledger;
+- campaign assignment;
+- stacked-order reconciliation;
+- MFE/MAE updates;
+- realized PnL capture;
+- Quant Brain outcome ingestion;
+- model training;
+- frontend reporting;
+- restart recovery.
+
+Report anything implemented but not actually called.
+
+2. EXCHANGE RECONCILIATION
+
+BingX may aggregate multiple orders into one position.
+
+Implement deterministic reconciliation between:
+
+- signal_id;
+- campaign_id;
+- client_order_id;
+- exchange_order_id;
+- symbol and side;
+- requested quantity;
+- filled quantity;
+- average entry;
+- exchange position;
+- closing fills.
+
+Never infer that one stacked entry closed merely because an aggregated position changed.
+
+Support:
+
+- partial fills;
+- partial closes;
+- several entries sharing one position;
+- manual closure;
+- TP/SL closure;
+- server restart;
+- delayed exchange responses;
+- duplicate API responses.
+
+3. DURABLE LEDGER
+
+Audit whether JSONL writes are safe under concurrent sniper and monitor loops.
+
+Require:
+
+- serialized writes;
+- idempotency keys;
+- deduplication;
+- atomic state transitions;
+- corruption recovery;
+- bounded file growth;
+- restart replay;
+- reconciliation checkpoints.
+
+If JSONL cannot safely provide these guarantees, migrate the ledger to the existing database with transactional updates. Do not maintain two competing sources of truth.
+
+4. CANONICAL PNL
+
+Use the PnL and commission reported by the BingX VST account whenever available.
+
+Track:
+
+- realized gross PnL;
+- exchange commission;
+- realized net PnL;
+- quantity opened and closed;
+- remaining quantity;
+- average entry and exit;
+- PnL per execution;
+- PnL per campaign;
+- PnL per symbol;
+- total account equity.
+
+Add reconciliation:
+
+expected_equity_delta =
+realized_pnl
+- commission
++ unrealized_pnl
+
+Report any unexplained difference.
+
+Do not introduce complex pre-trade slippage simulation. Only observe and store execution-price deviation after execution.
+
+5. INTELLIGENT FALLBACK
+
+Correct service-state semantics:
+
+HEALTHY:
+- model and baseline available;
+- normal validated demo stacking.
+
+DEGRADED:
+- reduce stacking and cycle concurrency.
+
+SHADOW_ONLY:
+- untrained, unavailable or degraded ML cannot control execution;
+- conservative deterministic baseline may continue in VST demo;
+- maximum one entry per campaign;
+- clearly tag every fallback trade.
+
+PAUSED:
+- no new entries;
+- continue monitoring and closing existing positions;
+- continue reconciliation and telemetry.
+
+Never stop position monitoring because entry execution is paused.
+
+6. ADAPTIVE RISK
+
+Replace fixed absolute loss limits with configurable account-relative controls:
+
+- rolling loss as percentage of VST equity;
+- campaign drawdown;
+- symbol exposure;
+- total portfolio exposure;
+- correlated exposure;
+- consecutive campaign losses;
+- maximum open notional.
+
+Keep optional absolute limits as secondary safeguards.
+
+Stacking must never increase because existing entries are losing.
+
+7. LEARNING LOOP
+
+Prove that every closed VST campaign creates exactly one valid strategy outcome and that individual executions remain available for execution analysis.
+
+Separate:
+
+- execution samples;
+- campaign samples;
+- independent ML samples.
+
+Prevent ten correlated BTC entries from becoming ten independent ML labels.
+
+Each ML sample must contain only information available at entry time.
+
+8. MODEL READINESS
+
+The model must report:
+
+- observed samples;
+- pending samples;
+- hit and miss classes;
+- training readiness;
+- calibration;
+- out-of-sample expectancy;
+- model version;
+- feature version;
+- baseline comparison.
+
+A model may influence stacking only after:
+
+- minimum independent campaign count;
+- both outcome classes exist;
+- chronological walk-forward validation passes;
+- calibrated out-of-sample performance beats baseline;
+- net demo PnL remains positive after exchange commission.
+
+9. SNIPER CAMPAIGN POLICY
+
+Use campaign-based sequential stacking:
+
+- first entry explores the signal;
+- subsequent entries require persistent or improved edge;
+- enforce cooldown between entries;
+- do not repeat the same signal/candle;
+- stop stacking when edge weakens;
+- close or stop adding when direction changes;
+- enforce one direction per symbol.
+
+Track the marginal reason for every additional entry.
+
+10. END-TO-END TEST
+
+Create a deterministic VST-safe validation procedure:
+
+- generate a qualifying signal;
+- place multiple same-direction demo entries;
+- verify exchange IDs and quantities;
+- restart the API server;
+- recover the campaign;
+- partially close the position;
+- close the remainder;
+- reconcile PnL and commission;
+- create exactly one campaign outcome;
+- deliver it to Quant Brain;
+- verify dashboard reporting;
+- verify no duplicate outcome after another restart.
+
+Do not fabricate the exchange result. If the VST market does not produce the required close naturally, test the lifecycle through controlled fixtures and clearly distinguish fixture evidence from real VST evidence.
+
+11. TESTS
+
+Add and run tests for:
+
+- concurrent ledger writes;
+- duplicate exchange events;
+- partial fills and closes;
+- aggregated stacked positions;
+- restart recovery;
+- stale data;
+- QB outage;
+- database/ledger failure;
+- HEALTHY/DEGRADED/SHADOW_ONLY/PAUSED behavior;
+- equity-relative breakers;
+- PnL reconciliation;
+- campaign sample deduplication;
+- future-data leakage.
+
+12. FINAL DELIVERY
+
+Return:
+
+1. Confirmed gaps.
+2. Runtime paths audited.
+3. Files and schemas changed.
+4. Exact test results.
+5. VST lifecycle evidence.
+6. PnL reconciliation evidence.
+7. Quant Brain ingestion evidence.
+8. Model-readiness evidence.
+9. Remaining risks.
+10. Confirmation that SCALP_ALLOW_EXECUTION=true remains restricted to BingX VST/demo credentials.
+
+Do not claim profitability from unit tests. Profitability must come from accumulated, reconciled VST campaign outcomes.
