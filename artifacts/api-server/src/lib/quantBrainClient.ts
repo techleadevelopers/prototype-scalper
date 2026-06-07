@@ -61,6 +61,9 @@ const sidecarCache = new Map<string, { value: unknown; expiresAt: number; staleU
 
 // Max entries per unbounded Map — evict oldest when exceeded to prevent memory leak
 const MAX_CACHE_ENTRIES = 500;
+// Max pending outcomes before evicting oldest — prevents OOM during extended QB downtime
+// at high-frequency stacking rates (e.g. 100 trades/hour × 24h = 2400 entries without this)
+const MAX_PENDING_OUTCOMES = 1_000;
 
 function evictOldest<V extends { expiresAt: number }>(map: Map<string, V>): void {
   if (map.size <= MAX_CACHE_ENTRIES) return;
@@ -68,6 +71,15 @@ function evictOldest<V extends { expiresAt: number }>(map: Map<string, V>): void
   const sorted = Array.from(map.entries()).sort((a, b) => a[1].expiresAt - b[1].expiresAt);
   const toDelete = Math.ceil(sorted.length / 3);
   for (let i = 0; i < toDelete; i++) map.delete(sorted[i][0]);
+}
+
+function evictOldestPending(): void {
+  if (pendingOutcomes.size <= MAX_PENDING_OUTCOMES) return;
+  // Sort by entryTime ascending and evict oldest third to bound memory usage
+  const sorted = Array.from(pendingOutcomes.entries())
+    .sort((a, b) => (a[1].entryTime ?? 0) - (b[1].entryTime ?? 0));
+  const toDelete = Math.ceil(sorted.length / 3);
+  for (let i = 0; i < toDelete; i++) pendingOutcomes.delete(sorted[i][0]);
 }
 
 function quantBrainUrl(): string | null {
@@ -339,6 +351,7 @@ export async function syncQuantBrainOutcome(
     return { synced: true };
   } catch (err) {
     pendingOutcomes.set(outcome.id, outcome);
+    evictOldestPending();
     return {
       synced: false,
       error: err instanceof Error ? err.message : "unknown error",

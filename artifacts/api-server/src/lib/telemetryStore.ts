@@ -53,6 +53,19 @@ let lastHealthCheck = Date.now();
 let totalRecords = 0;
 let lastBackupSize = 0;
 
+// ========== WRITE LOCK ==========
+// Serializes all updateTradeOutcome calls — prevents race conditions during
+// high-frequency stacking where concurrent position closes can overlap and
+// one rewriteTelemetryFile() call overwrites another's changes.
+let _writeLockQueue: Promise<void> = Promise.resolve();
+
+function acquireWriteLock(): Promise<() => void> {
+  let resolve!: () => void;
+  const prev = _writeLockQueue;
+  _writeLockQueue = new Promise<void>((r) => { resolve = r; });
+  return prev.then(() => resolve);
+}
+
 // ========== UTILITY FUNCTIONS ==========
 
 function ensureDirectories(): void {
@@ -500,35 +513,43 @@ export async function updateTradeOutcome(
   id: string,
   patch: Partial<Omit<TradeOutcome, "id">>,
 ): Promise<TradeOutcome | null> {
-  await flushWriteBuffer();
+  // Acquire write lock — serializes concurrent updates during high-frequency
+  // stacking. Without this, two simultaneous closes would each read the full
+  // file, modify their record, and one would overwrite the other's changes.
+  const unlock = await acquireWriteLock();
+  try {
+    await flushWriteBuffer();
 
-  const outcomes = loadFromDisk();
-  const index = outcomes.findIndex((outcome) => outcome.id === id);
-  if (index < 0) return null;
+    const outcomes = loadFromDisk();
+    const index = outcomes.findIndex((outcome) => outcome.id === id);
+    if (index < 0) return null;
 
-  const updated: TradeOutcome = {
-    ...outcomes[index],
-    ...patch,
-    id,
-  };
+    const updated: TradeOutcome = {
+      ...outcomes[index],
+      ...patch,
+      id,
+    };
 
-  const validation = TradeOutcomeSchema.safeParse(updated);
-  if (!validation.success) {
-    logger.error({ errors: validation.error.issues, id, patch }, "Invalid trade outcome update");
-    throw new Error(`Invalid trade outcome update: ${validation.error.issues.map((issue) => issue.message).join(", ")}`);
+    const validation = TradeOutcomeSchema.safeParse(updated);
+    if (!validation.success) {
+      logger.error({ errors: validation.error.issues, id, patch }, "Invalid trade outcome update");
+      throw new Error(`Invalid trade outcome update: ${validation.error.issues.map((issue) => issue.message).join(", ")}`);
+    }
+
+    outcomes[index] = validation.data;
+    rewriteTelemetryFile(outcomes);
+    getEngine().replaceOutcome(validation.data);
+
+    logMetric({
+      name: "trade.updated",
+      value: 1,
+      tags: { symbol: validation.data.symbol, side: validation.data.positionSide, pnlSource: validation.data.pnlSource ?? "unknown" },
+    });
+
+    return validation.data;
+  } finally {
+    unlock();
   }
-
-  outcomes[index] = validation.data;
-  rewriteTelemetryFile(outcomes);
-  getEngine().replaceOutcome(validation.data);
-
-  logMetric({
-    name: "trade.updated",
-    value: 1,
-    tags: { symbol: validation.data.symbol, side: validation.data.positionSide, pnlSource: validation.data.pnlSource ?? "unknown" },
-  });
-
-  return validation.data;
 }
 
 /**
