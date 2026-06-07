@@ -10,7 +10,12 @@ import { exportAllOutcomes, getEngine } from "../lib/telemetryStore";
 import { AdaptiveEngine, type BtcRegime, type ClusterKey, type PositionSide, type TradeOutcome } from "../lib/adaptiveEngine";
 import { computeAllCandleEdges, computeCandleEdge, type CandleInterval } from "../lib/candleEdge";
 import { feeDragRejectReason, maxCorrelatedBulkOrders } from "../lib/executionRisk";
-import { getQuantBrainIntelligence } from "../lib/quantBrainClient";
+import {
+  getQuantBrainIntelligence,
+  evaluateQuantBrainEdge,
+  quantBrainGateMode,
+  type QuantBrainEdgeInput,
+} from "../lib/quantBrainClient";
 import { getMarketSentiment, getMarketSentimentBulk, type SentimentResult } from "../lib/sentimentEngine";
 import {
   buildAttachedProtection,
@@ -243,15 +248,22 @@ router.post("/bot/order", async (req: Request, res: Response) => {
     }
   }
 
-  // Gate 8: capital gate — check open position count + margin
+  // Gate 8: capital gate + QB edge evaluation + sentiment (all in parallel)
   let openPositionsCount = 0;
   let marginUtilization = 0;
   let openPositions: Record<string, unknown>[] = [];
-  try {
-    const [posData, balData] = await Promise.all([
+  let qbShadowRejects: string[] = [];
+
+  const [capitalData, sentimentForQb] = await Promise.all([
+    Promise.all([
       bingxGet("/openApi/swap/v2/user/positions", {}, creds.apiKey, creds.secretKey),
       bingxGet("/openApi/swap/v2/user/balance", {}, creds.apiKey, creds.secretKey),
-    ]);
+    ]).catch(() => null),
+    getMarketSentiment(symbol).catch(() => null),
+  ]);
+
+  if (capitalData) {
+    const [posData, balData] = capitalData;
     if (posData.code === 0) {
       openPositions = ((posData.data as unknown[]) ?? []) as Record<string, unknown>[];
       openPositions = openPositions.filter((p) => parseFloat(String(p.positionAmt ?? "0")) !== 0);
@@ -263,8 +275,40 @@ router.post("/bot/order", async (req: Request, res: Response) => {
       const equity = parseFloat(bal.equity ?? "1");
       marginUtilization = equity > 0 ? usedMargin / equity : 0;
     }
-  } catch {
-    // non-fatal — proceed without capital gate if fetch fails
+  }
+
+  // QB edge gate — called after capital gate (sentiment already fetched in parallel above)
+  try {
+    const qbInput: QuantBrainEdgeInput = {
+      symbol, side, positionSide,
+      hourUtc: currentHour,
+      btcChangePct,
+      currentEv,
+      currentWinRate,
+      currentProfitFactor,
+      config,
+      sentimentContext: sentimentForQb ? {
+        direction: sentimentForQb.direction,
+        confidence: sentimentForQb.confidence,
+        biasRatio: sentimentForQb.biasRatio,
+        dominantSide: sentimentForQb.dominantSide,
+        vwapDeviation: sentimentForQb.indicators.vwapDeviation,
+        volumeDelta: sentimentForQb.indicators.volumeDelta,
+        momentum24h: sentimentForQb.indicators.momentum24h,
+      } : undefined,
+    };
+    const qbResult = await evaluateQuantBrainEdge(qbInput);
+    const qbMode = quantBrainGateMode();
+    if (qbMode === "enforce" && !qbResult.allow) {
+      // Enforce mode: QB rejects block the trade
+      gateRejects.push(...qbResult.gateRejects.map((r) => `QB_${r}`));
+    } else if (qbResult.gateRejects.length > 0) {
+      // Shadow mode: QB rejects are observational only — log for calibration
+      qbShadowRejects = qbResult.gateRejects;
+      req.log.info({ symbol, positionSide, qbShadowRejects }, "QB shadow rejects (not blocking)");
+    }
+  } catch (err) {
+    req.log.debug({ err }, "QB edge evaluation skipped — not blocking");
   }
 
   if (openPositionsCount >= config.maxConcurrentPositions) {
@@ -294,6 +338,7 @@ router.post("/bot/order", async (req: Request, res: Response) => {
       side,
       quantity: quantity ?? null,
       gateRejects,
+      qbShadowRejects,
       observationMode: true,
       message: gateRejects.length > 0
         ? `BLOCKED by ${gateRejects.length} gate(s). Also observation mode (SCALP_ALLOW_EXECUTION=false).`
@@ -312,6 +357,7 @@ router.post("/bot/order", async (req: Request, res: Response) => {
       side,
       quantity: quantity ?? null,
       gateRejects,
+      qbShadowRejects,
       observationMode: false,
       message: `REJECTED by ${gateRejects.length} gate(s): ${gateRejects[0]}`,
     });
@@ -655,6 +701,17 @@ router.get("/bot/scan", async (req: Request, res: Response) => {
     gateRejects: string[];
     isCandidate: boolean;
     isToxic: boolean;
+    sentiment?: {
+      direction: string;
+      confidence: number;
+      biasRatio: number;
+      dominantSide: string;
+      aligned: boolean;
+      longWeight: number;
+      shortWeight: number;
+      vwapDeviation: number;
+      momentum24h: number;
+    };
   }> = [];
 
   for (let i = 0; i < symbols.length; i++) {
@@ -1090,6 +1147,43 @@ async function executeSingleOrder(
   const feeDragReject = feeDragRejectReason(item.currentEv, config.marginPerTrade, config);
   if (feeDragReject) {
     gateRejects.push(feeDragReject);
+  }
+
+  // QB edge gate (shadow: log, enforce: block) — fire-and-forget in shadow to avoid bulk latency
+  const qbMode = quantBrainGateMode();
+  if (qbMode === "enforce") {
+    try {
+      const sentiment = await getMarketSentiment(symbol).catch(() => null);
+      const qbResult = await evaluateQuantBrainEdge({
+        symbol, side, positionSide, hourUtc: currentHour,
+        btcChangePct, currentEv: item.currentEv, config,
+        sentimentContext: sentiment ? {
+          direction: sentiment.direction, confidence: sentiment.confidence,
+          biasRatio: sentiment.biasRatio, dominantSide: sentiment.dominantSide,
+          vwapDeviation: sentiment.indicators.vwapDeviation,
+          volumeDelta: sentiment.indicators.volumeDelta,
+          momentum24h: sentiment.indicators.momentum24h,
+        } : undefined,
+      });
+      if (!qbResult.allow) {
+        gateRejects.push(...qbResult.gateRejects.map((r) => `QB_${r}`));
+      }
+    } catch { /* QB errors never block bulk */ }
+  } else {
+    // Shadow: non-blocking — evaluate in background for logging
+    getMarketSentiment(symbol).catch(() => null).then((sentiment) =>
+      evaluateQuantBrainEdge({
+        symbol, side, positionSide, hourUtc: currentHour,
+        btcChangePct, currentEv: item.currentEv, config,
+        sentimentContext: sentiment ? {
+          direction: sentiment.direction, confidence: sentiment.confidence,
+          biasRatio: sentiment.biasRatio, dominantSide: sentiment.dominantSide,
+          vwapDeviation: sentiment.indicators.vwapDeviation,
+          volumeDelta: sentiment.indicators.volumeDelta,
+          momentum24h: sentiment.indicators.momentum24h,
+        } : undefined,
+      })
+    ).catch(() => {});
   }
 
   // Observation mode short-circuit

@@ -374,6 +374,33 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
     config = payload.get("config") or {}
     gate_rejects: list[str] = []
 
+    # ── Sentiment context (24h directional bias from sentimentEngine.ts) ──────
+    sentiment_ctx = payload.get("sentimentContext") or {}
+    sentiment_direction = str(sentiment_ctx.get("direction", "NEUTRAL")).upper()
+    sentiment_confidence = float(sentiment_ctx.get("confidence") or 0)
+    sentiment_bias_ratio = float(sentiment_ctx.get("biasRatio") or 0.5)
+    # True when 24h bias matches the requested position side
+    sentiment_aligned = (
+        (position_side == "LONG" and sentiment_direction == "BULL")
+        or (position_side == "SHORT" and sentiment_direction == "BEAR")
+    )
+    # True when 24h bias strongly contradicts the requested side
+    sentiment_counter = (
+        (position_side == "LONG" and sentiment_direction == "BEAR")
+        or (position_side == "SHORT" and sentiment_direction == "BULL")
+    )
+    # Hard-block counter-trend entries only when sentiment is very confident
+    if (
+        sentiment_counter
+        and sentiment_confidence >= 0.75
+        and sentiment_bias_ratio >= 0.72
+    ):
+        gate_rejects.append(
+            f"SENTIMENT_COUNTER_REJECT: 24h bias {sentiment_direction} "
+            f"({sentiment_confidence:.0%} conf, {sentiment_bias_ratio:.0%} weight) "
+            f"conflicts with {position_side}"
+        )
+
     # ========== GATES EXISTENTES (MANTIDOS) ==========
     allowed_symbols = _list(config.get("allowedSymbols"))
     if allowed_symbols and symbol not in allowed_symbols:
@@ -440,7 +467,8 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
         gate_rejects.append("DATA_STALE_REJECT: market snapshots are stale")
     if any(frame["quality"] == "GAPPED" for frame in data_quality.values()):
         gate_rejects.append("DATA_GAP_REJECT: snapshot continuity is degraded")
-    if _bool(config.get("requireFull15mContext"), True):
+    # requireFull15mContext defaults False so startup doesn't block for 15min
+    if _bool(config.get("requireFull15mContext"), False):
         if (
             data_quality["alt15m"]["coveragePct"] < 0.8
             or data_quality["btc15m"]["coveragePct"] < 0.8
@@ -543,15 +571,17 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
     volatility_regime, current_vol, vol_history = _calculate_volatility_regime_from_history(alt_history)
     adjusted_stop = _calculate_volatility_adjusted_stop(current_vol, stop_move_pct, volatility_regime)
 
-    if volatility_regime == "HIGH" and current_vol > 1.5:
-        gate_rejects.append(f"HIGH_VOLATILITY_REJECT: current vol {current_vol:.2f}% > 1.5%")
+    # Threshold 2.5% to allow normal alt-coin volatility without blocking
+    if volatility_regime == "HIGH" and current_vol > 2.5:
+        gate_rejects.append(f"HIGH_VOLATILITY_REJECT: current vol {current_vol:.2f}% > 2.5%")
 
     # 2. Sharpe Ratio de trades realizados
     recent_returns = await _get_recent_returns(symbol, position_side, days=30)
     realized_sharpe = _calculate_sharpe_from_trades(recent_returns)
 
-    if len(recent_returns) >= 10 and realized_sharpe < 0.5:
-        gate_rejects.append(f"LOW_REALIZED_SHARPE_REJECT: Sharpe {realized_sharpe:.2f} < 0.5")
+    # min 25 samples before Sharpe gate activates; threshold 0.3 to avoid blocking early-stage operation
+    if len(recent_returns) >= 25 and realized_sharpe < 0.3:
+        gate_rejects.append(f"LOW_REALIZED_SHARPE_REJECT: Sharpe {realized_sharpe:.2f} < 0.3")
 
     # 3. Correlação e Penalidade
     correlation = _calculate_correlation_from_history(alt_history, btc_history)
@@ -574,7 +604,8 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
         btc_regime, current_vol * 2, btc_trend_strength, correlation
     )
 
-    if regime_confidence["regime_confidence"] < 0.5:
+    # Threshold 0.4 to allow entries in ambiguous but not chaotic regimes
+    if regime_confidence["regime_confidence"] < 0.4:
         gate_rejects.append(f"LOW_REGIME_CONFIDENCE: confidence {regime_confidence['regime_confidence']:.2f}")
 
     # 5. Bootstrap EV Confidence
@@ -645,6 +676,13 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
     if samples < recommendation.get("minSamplesForLiveGate", 8):
         score = min(float(sniper.get("score", 0.0)), float(signal_edge.get("score", 0.5)))
 
+    # ── Sentiment alignment adjustment ──────────────────────────────────────────
+    # Aligned 24h bias boosts score; counter-bias penalises it.
+    if sentiment_aligned and sentiment_confidence > 0.3:
+        score = min(1.0, score * (1.0 + sentiment_confidence * 0.15))
+    elif sentiment_counter and sentiment_confidence > 0.3:
+        score = score * (1.0 - sentiment_confidence * 0.10)
+
     # ========== NOVOS CAMPOS NO RETORNO ==========
     return {
         "allow": allow,
@@ -656,6 +694,13 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
         "positionSide": position_side,
         "hourUtc": hour_utc,
         "btcRegime": btc_regime,
+        "sentimentContext": {
+            "direction": sentiment_direction,
+            "confidence": round(sentiment_confidence, 3),
+            "biasRatio": round(sentiment_bias_ratio, 3),
+            "aligned": sentiment_aligned,
+            "counter": sentiment_counter,
+        },
         "sniper": sniper,
         "signalMemory": signal_memory,
         "signalEdge": signal_edge,

@@ -233,11 +233,16 @@ async function getCachedJson<T>(
 
 async function getCachedIntelligenceEdge(input: QuantBrainEdgeInput): Promise<QuantBrainEdgeResult> {
   const regimeBucket = Math.round((input.btcChangePct ?? 0) * 10) / 10;
+  // Include sentiment direction + bias bucket so BULL/BEAR shifts invalidate the cache
+  const sentimentKey = input.sentimentContext
+    ? `${input.sentimentContext.direction}:${Math.round(input.sentimentContext.biasRatio * 10)}`
+    : "ns";
   const cacheKey = [
     input.symbol,
     input.positionSide,
     input.hourUtc ?? "na",
     regimeBucket,
+    sentimentKey,
     quantBrainGateMode(),
   ].join(":");
   const now = Date.now();
