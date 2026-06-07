@@ -1,0 +1,78 @@
+Objetivo Financeiro: Estratégia Sniper Scalp
+
+Executar muitas operações curtas, LONG ou SHORT, buscando pequenos lucros líquidos repetitivos. Cada ativo deve ser tratado como uma campanha agregada, não como várias posições independentes.
+
+Exemplo:
+
+BTC: até 10 entradas fracionadas na mesma direção.
+SOL: até 8 entradas.
+Novas entradas somente enquanto o edge continuar válido.
+Proibido LONG e SHORT simultâneos no mesmo ativo.
+Encerrar a campanha quando o edge desaparecer, mesmo antes do alvo.
+Fórmula principal
+
+PnL líquido =
+PnL bruto
+- taxa de entrada
+- taxa de saída
+- slippage
+- funding
+A BingX informa taxa padrão de aproximadamente 0,05% para ordens taker. Portanto, entrada e saída taker custam cerca de 0,10% do valor total da posição, antes do slippage.
+
+Exemplo BTC
+
+Premissas:
+
+10 entradas
+Margem por entrada: 25 USDT
+Alavancagem: 20x
+Notional por entrada: 500 USDT
+Notional agregado: 5.000 USDT
+Movimento-alvo: +0,22%
+Taxas ida e volta: -0,10%
+Slippage estimado: -0,02%
+Movimento líquido: +0,10%
+Resultado:
+
+Lucro líquido por entrada: 500 × 0,10% = 0,50 USDT
+Lucro da campanha: 10 × 0,50 = 5,00 USDT
+Mas o cálculo do prejuízo precisa ser equivalente. Com stop de 0,12%:
+
+Perda líquida por entrada:
+500 × (0,12% + 0,10% + 0,02%) = -1,20 USDT
+
+Perda máxima da campanha:
+10 × -1,20 = -12,00 USDT
+Nesse cenário, a taxa mínima de acerto para empatar seria:
+
+Win rate mínimo = 1,20 / (1,20 + 0,50)
+Win rate mínimo = 70,6%
+Portanto, buscar +0,50 USDT por operação só funciona se o sistema mantiver assertividade superior a aproximadamente 71%, nesse exemplo.
+
+Relatório de desempenho a cada 4 horas
+
+Operações executadas
+Win rate LONG
+Win rate SHORT
+PnL bruto
+Taxas e slippage
+PnL líquido
+Profit Factor
+Maior sequência de perdas
+PnL por ativo
+PnL por regime de mercado
+Exposição máxima simultânea
+Decisão automática:
+
+Profit Factor >= 1,20: continuar
+Profit Factor entre 1,00 e 1,20: reduzir entradas
+Profit Factor < 1,00: pausar novas campanhas
+4 perdas consecutivas: circuit breaker
+Mercado lateral sem volume: reduzir frequência
+Edge invertido: encerrar campanha, não abrir hedge
+A meta correta não é “quantidade de posições”, mas:
+
+Lucro esperado por operação =
+(win rate × ganho médio)
+- (loss rate × perda média)
+O sistema somente deve aumentar de 1 para 10 entradas quando o lucro esperado permanecer positivo após taxas, slippage e concentração de risco.
