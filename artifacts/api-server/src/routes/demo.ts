@@ -7,7 +7,8 @@ import { evaluateQuantBrainEdge, quantBrainGateMode, syncQuantBrainOutcome } fro
 import type { BtcRegime, TradeOutcome } from "../lib/adaptiveEngine";
 import { feeDragRejectReason } from "../lib/executionRisk";
 import { buildTelemetryState } from "./telemetry";
-import { computeCandleEdge } from "../lib/candleEdge";
+import { computeCandleEdge, computeAllCandleEdges } from "../lib/candleEdge";
+import type { ClusterKey } from "../lib/adaptiveEngine";
 import {
   buildAttachedProtection,
   candleConfirmationRejects,
@@ -1440,6 +1441,571 @@ router.post("/demo/close", async (req: Request, res: Response) => {
     req.log.error({ err }, "demo close error");
     res.status(500).json({ error: "Demo close failed" });
   }
+});
+
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  DEMO SNIPER AUTOPILOT — score-tiered multi-asset placement                ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+const DEMO_SNIPER_GLOBAL_MAX = parseInt(process.env["DEMO_SNIPER_GLOBAL_MAX"] ?? "50", 10);
+const DEMO_SNIPER_PER_SYMBOL_MAX = parseInt(process.env["DEMO_SNIPER_PER_SYMBOL_MAX"] ?? "10", 10);
+const DEMO_SNIPER_CYCLE_MS = parseInt(process.env["DEMO_SNIPER_CYCLE_MS"] ?? "30000", 10);
+const DEMO_SNIPER_MONITOR_MS = parseInt(process.env["DEMO_SNIPER_MONITOR_MS"] ?? "12000", 10);
+
+interface DemoSniperPlacement {
+  symbol: string;
+  positionSide: string;
+  score: number;
+  tier: number;
+}
+
+interface DemoSniperCycleSummary {
+  cycle: number;
+  startedAt: number;
+  durationMs: number;
+  btcRegime: string;
+  openTotal: number;
+  scanned: number;
+  placed: number;
+  skipped: number;
+  placements: DemoSniperPlacement[];
+}
+
+interface DemoSniperState {
+  running: boolean;
+  startedAt: number | null;
+  creds: { apiKey: string; secretKey: string } | null;
+  placeHandle: NodeJS.Timeout | null;
+  monitorHandle: NodeJS.Timeout | null;
+  cycleCount: number;
+  totalPlaced: number;
+  stopReason: string | null;
+  lastCycleAt: number | null;
+  lastCycleSummary: DemoSniperCycleSummary | null;
+  cycleHistory: DemoSniperCycleSummary[];
+}
+
+// Module-level open trade registry (survives session loss, keyed by orderId)
+const sniperOpenTrades = new Map<string, DemoOpenTrade>();
+const sniperRecordedIds = new Set<string>();
+
+const demoSniper: DemoSniperState = {
+  running: false,
+  startedAt: null,
+  creds: null,
+  placeHandle: null,
+  monitorHandle: null,
+  cycleCount: 0,
+  totalPlaced: 0,
+  stopReason: null,
+  lastCycleAt: null,
+  lastCycleSummary: null,
+  cycleHistory: [],
+};
+
+function scoreTierMaxEntries(score: number): number {
+  if (score < 0.60) return 0;
+  if (score < 0.70) return 1;
+  if (score < 0.80) return 3;
+  if (score < 0.90) return 5;
+  return 10;
+}
+
+async function runDemoSniperCycle(): Promise<void> {
+  if (!demoSniper.running || !demoSniper.creds) return;
+  const config = getBotConfig();
+  const engine = getEngine();
+  const { apiKey, secretKey } = demoSniper.creds;
+  const t0 = Date.now();
+  demoSniper.cycleCount++;
+  const cycleNum = demoSniper.cycleCount;
+
+  // 1. Fetch BTC regime + open positions in parallel
+  let btcChangePct = 0;
+  let currentPositions: Array<{ symbol: string; positionSide: string; positionAmt: string }> = [];
+
+  try {
+    const [btcRes, posData] = await Promise.all([
+      fetch(
+        `https://open-api.bingx.com/openApi/swap/v2/quote/ticker?symbol=BTC-USDT&timestamp=${Date.now()}`,
+        { signal: AbortSignal.timeout(4000) },
+      ).then((r) => r.json() as Promise<Record<string, unknown>>).catch(() => null),
+      bingxGet("/openApi/swap/v2/user/positions", {}, apiKey, secretKey).catch(() => null),
+    ]);
+    if (btcRes && String(btcRes.code) === "0") {
+      const d = (btcRes.data as Record<string, string>) ?? {};
+      btcChangePct = parseFloat(d.priceChangePercent ?? "0") || 0;
+    }
+    if (posData && isBingXSuccess(posData)) {
+      currentPositions = (getRawPositions(posData) as Array<Record<string, unknown>>)
+        .filter((p) => parseFloat(String(p.positionAmt ?? "0")) !== 0)
+        .map((p) => ({
+          symbol: String(p.symbol ?? ""),
+          positionSide: String(p.positionSide ?? ""),
+          positionAmt: String(p.positionAmt ?? "0"),
+        }));
+    }
+  } catch { /* continue */ }
+
+  const btcRegime = inferBtcRegime(btcChangePct, config.btcRegimeThresholdPct);
+  const hourUtc = new Date().getUTCHours();
+  const globalOpen = currentPositions.length;
+
+  if (globalOpen >= DEMO_SNIPER_GLOBAL_MAX) {
+    demoSniper.lastCycleAt = Date.now();
+    demoSniper.cycleHistory.push({
+      cycle: cycleNum, startedAt: t0, durationMs: Date.now() - t0,
+      btcRegime, openTotal: globalOpen, scanned: 0, placed: 0, skipped: 0, placements: [],
+    });
+    if (demoSniper.cycleHistory.length > 50) demoSniper.cycleHistory.shift();
+    return;
+  }
+
+  // 2. Build per-(symbol, positionSide) open count from exchange
+  const openCounts = new Map<string, number>();
+  for (const p of currentPositions) {
+    const k = `${p.symbol.toUpperCase()}:${p.positionSide.toUpperCase()}`;
+    openCounts.set(k, (openCounts.get(k) ?? 0) + 1);
+  }
+
+  const symbols = config.allowedSymbols;
+  if (symbols.length === 0) {
+    demoSniper.lastCycleAt = Date.now();
+    return;
+  }
+
+  // 3. Compute candle edges for all symbols
+  const candleEdges = await computeAllCandleEdges(symbols, "5m").catch(() =>
+    symbols.map((sym) => ({ symbol: sym, longScore: 0, shortScore: 0, emaCross: null, volumeRatio: 1 })),
+  );
+
+  // 4. Score all (symbol, side) pairs and build candidates
+  interface ScoredCandidate {
+    symbol: string;
+    positionSide: "LONG" | "SHORT";
+    side: "BUY" | "SELL";
+    score: number;
+    tier: number;
+    currentOpen: number;
+  }
+
+  const candidates: ScoredCandidate[] = [];
+
+  for (let i = 0; i < symbols.length; i++) {
+    const sym = symbols[i];
+    const candle = candleEdges[i] as { longScore?: number; shortScore?: number } | undefined;
+    if (!candle) continue;
+
+    for (const ps of ["LONG", "SHORT"] as const) {
+      // Single-side enforcement
+      const oppKey = `${sym}:${ps === "LONG" ? "SHORT" : "LONG"}`;
+      if (config.preventHedgedPositions && (openCounts.get(oppKey) ?? 0) > 0) continue;
+
+      const clusterKey: ClusterKey = { symbol: sym, positionSide: ps, hourUtc, btcRegime };
+      const symProfile = engine.symbolProfile(sym);
+      if (symProfile?.isToxic) continue;
+
+      const clusterProfile = engine.clusterProfile(clusterKey);
+      const ev = clusterProfile?.ev ?? symProfile?.ev ?? 0;
+      const candleScore = ps === "LONG" ? (candle.longScore ?? 0) : (candle.shortScore ?? 0);
+      const combinedScore = engine.combinedEdgeScore(clusterKey, ev, candleScore);
+
+      const tier = scoreTierMaxEntries(combinedScore);
+      if (tier === 0) continue;
+
+      const posKey = `${sym}:${ps}`;
+      const currentOpen = openCounts.get(posKey) ?? 0;
+      if (currentOpen >= Math.min(tier, DEMO_SNIPER_PER_SYMBOL_MAX)) continue;
+
+      candidates.push({
+        symbol: sym,
+        positionSide: ps,
+        side: ps === "LONG" ? "BUY" : "SELL",
+        score: combinedScore,
+        tier,
+        currentOpen,
+      });
+    }
+  }
+
+  // 5. Sort by score descending, allocate entries respecting caps
+  candidates.sort((a, b) => b.score - a.score);
+
+  const placements: DemoSniperPlacement[] = [];
+  let placed = 0;
+  let skipped = 0;
+  let globalHeadroom = DEMO_SNIPER_GLOBAL_MAX - globalOpen;
+
+  for (const c of candidates) {
+    if (globalHeadroom <= 0) break;
+
+    const posKey = `${c.symbol}:${c.positionSide}`;
+    const entriesToAdd = Math.min(
+      c.tier - c.currentOpen,
+      DEMO_SNIPER_PER_SYMBOL_MAX - c.currentOpen,
+      globalHeadroom,
+    );
+
+    for (let n = 0; n < entriesToAdd; n++) {
+      if (globalHeadroom <= 0) break;
+
+      const price = await fetchDemoLastPrice(c.symbol).catch(() => null);
+      if (!price || price <= 0) { skipped++; break; }
+
+      const qty = Math.floor(((config.marginPerTrade * config.leverage) / price) * 1000) / 1000;
+      if (!qty || qty <= 0) { skipped++; break; }
+
+      const protection = buildAttachedProtection(price, c.positionSide, config);
+
+      try {
+        const data = await bingxPost(
+          "/openApi/swap/v2/trade/order",
+          {
+            symbol: c.symbol,
+            side: c.side,
+            positionSide: c.positionSide,
+            type: config.orderType,
+            quantity: qty,
+            leverage: config.leverage,
+            stopLoss: protection?.stopLoss,
+            takeProfit: protection?.takeProfit,
+          },
+          apiKey,
+          secretKey,
+        );
+
+        if (!isBingXSuccess(data)) { skipped++; continue; }
+
+        const order = (data.data as Record<string, unknown>)?.order as Record<string, unknown>;
+        const orderId = String(order?.orderId ?? `sniper-${Date.now()}-${c.symbol}-${c.positionSide}`);
+        const entryPrice = parseFloat(String(order?.avgPrice ?? "")) || price;
+
+        sniperOpenTrades.set(orderId, {
+          orderId,
+          symbol: c.symbol,
+          side: c.side,
+          positionSide: c.positionSide,
+          quantity: qty,
+          entryPrice,
+          expectedEntryPrice: price,
+          entryTime: Date.now(),
+          hourUtc,
+          btcRegime,
+          leverage: config.leverage,
+          marginUsed: config.marginPerTrade,
+          expectedTpProfit: config.marginPerTrade * config.leverage * (config.takeProfitPct / 100),
+        });
+
+        demoSniper.totalPlaced++;
+        placed++;
+        globalHeadroom--;
+        openCounts.set(posKey, (openCounts.get(posKey) ?? 0) + 1);
+        placements.push({ symbol: c.symbol, positionSide: c.positionSide, score: c.score, tier: c.tier });
+      } catch { skipped++; }
+    }
+  }
+
+  const summary: DemoSniperCycleSummary = {
+    cycle: cycleNum,
+    startedAt: t0,
+    durationMs: Date.now() - t0,
+    btcRegime,
+    openTotal: globalOpen + placed,
+    scanned: candidates.length,
+    placed,
+    skipped,
+    placements,
+  };
+
+  demoSniper.lastCycleAt = Date.now();
+  demoSniper.lastCycleSummary = summary;
+  demoSniper.cycleHistory.push(summary);
+  if (demoSniper.cycleHistory.length > 50) demoSniper.cycleHistory.shift();
+}
+
+async function runDemoSniperMonitor(): Promise<void> {
+  if (!demoSniper.creds || sniperOpenTrades.size === 0) return;
+  const { apiKey, secretKey } = demoSniper.creds;
+  const config = getBotConfig();
+
+  let livePositions: Array<{ symbol: string; positionSide: string }>;
+  try {
+    const posData = await bingxGet("/openApi/swap/v2/user/positions", {}, apiKey, secretKey);
+    if (!isBingXSuccess(posData)) return;
+    livePositions = (getRawPositions(posData) as Array<Record<string, unknown>>)
+      .filter((p) => parseFloat(String(p.positionAmt ?? "0")) !== 0)
+      .map((p) => ({ symbol: String(p.symbol ?? ""), positionSide: String(p.positionSide ?? "") }));
+  } catch { return; }
+
+  const openSet = new Set(livePositions.map((p) => `${p.symbol.toUpperCase()}:${p.positionSide.toUpperCase()}`));
+
+  for (const [orderId, entry] of sniperOpenTrades.entries()) {
+    if (sniperRecordedIds.has(orderId)) { sniperOpenTrades.delete(orderId); continue; }
+    const key = `${entry.symbol.toUpperCase()}:${entry.positionSide.toUpperCase()}`;
+    if (openSet.has(key)) continue; // still open
+
+    // Position closed — estimate exit price and record outcome
+    const exitPrice = await fetchDemoLastPrice(entry.symbol).catch(() => null);
+    if (!exitPrice) continue;
+
+    const grossPnl = estimateGrossPnl(entry.positionSide, entry.entryPrice, exitPrice, entry.quantity);
+    const fee = Math.max(0, Math.abs(entry.marginUsed * entry.leverage) * 0.001);
+    const realizedPnl = grossPnl - fee;
+
+    const favorableMovePct = entry.positionSide === "LONG"
+      ? ((exitPrice - entry.entryPrice) / entry.entryPrice) * 100
+      : ((entry.entryPrice - exitPrice) / entry.entryPrice) * 100;
+
+    const exitReason: TradeOutcome["exitReason"] =
+      favorableMovePct >= config.takeProfitPct * 0.7 ? "TAKE_PROFIT"
+      : favorableMovePct <= -(config.stopLossPct * 0.7) ? "STOP_LOSS"
+      : "MANUAL";
+
+    try {
+      const outcome = recordTradeOutcome({
+        isDemo: true,
+        source: "bingx-vst",
+        entryOrderId: entry.orderId,
+        symbol: entry.symbol,
+        positionSide: entry.positionSide,
+        side: entry.side,
+        entryTime: entry.entryTime,
+        exitTime: Date.now(),
+        hourUtc: entry.hourUtc,
+        btcRegime: entry.btcRegime,
+        entryPrice: entry.entryPrice,
+        exitPrice,
+        qty: entry.quantity,
+        leverage: entry.leverage,
+        marginUsed: entry.marginUsed,
+        grossPnl,
+        fee,
+        realizedPnl,
+        pnlSource: "price_estimate",
+        estimated: true,
+        expectedEntryPrice: entry.expectedEntryPrice,
+        exitReason,
+        expectedTpProfit: entry.expectedTpProfit,
+      });
+      sniperRecordedIds.add(orderId);
+      sniperOpenTrades.delete(orderId);
+      void syncQuantBrainOutcome(outcome).catch(() => {});
+    } catch { /* non-fatal */ }
+  }
+}
+
+function stopDemoSniper(reason: string): void {
+  if (demoSniper.placeHandle) { clearInterval(demoSniper.placeHandle); demoSniper.placeHandle = null; }
+  if (demoSniper.monitorHandle) { clearInterval(demoSniper.monitorHandle); demoSniper.monitorHandle = null; }
+  demoSniper.running = false;
+  demoSniper.creds = null;
+  demoSniper.stopReason = reason;
+}
+
+function getSniperStatus() {
+  return {
+    running: demoSniper.running,
+    startedAt: demoSniper.startedAt,
+    uptimeMs: demoSniper.startedAt ? Date.now() - demoSniper.startedAt : null,
+    cycleCount: demoSniper.cycleCount,
+    totalPlaced: demoSniper.totalPlaced,
+    stopReason: demoSniper.stopReason,
+    lastCycleAt: demoSniper.lastCycleAt,
+    lastCycleSummary: demoSniper.lastCycleSummary,
+    recentHistory: demoSniper.cycleHistory.slice(-10),
+    openTrades: sniperOpenTrades.size,
+    config: {
+      globalMax: DEMO_SNIPER_GLOBAL_MAX,
+      perSymbolMax: DEMO_SNIPER_PER_SYMBOL_MAX,
+      cycleMs: DEMO_SNIPER_CYCLE_MS,
+      scoreTiers: "score<0.60→0, 0.60-0.69→1, 0.70-0.79→3, 0.80-0.89→5, ≥0.90→10",
+    },
+  };
+}
+
+/** POST /api/demo/sniper/start */
+router.post("/demo/sniper/start", (req: Request, res: Response) => {
+  const creds = getDemoCredentials(req);
+  if (!creds) { res.status(401).json({ error: "Demo not connected." }); return; }
+
+  if (demoSniper.running) {
+    res.json({ started: false, reason: "Sniper already running", ...getSniperStatus() });
+    return;
+  }
+
+  demoSniper.running = true;
+  demoSniper.startedAt = Date.now();
+  demoSniper.creds = { ...creds };
+  demoSniper.cycleCount = 0;
+  demoSniper.totalPlaced = 0;
+  demoSniper.stopReason = null;
+  demoSniper.lastCycleSummary = null;
+  demoSniper.cycleHistory = [];
+
+  runDemoSniperCycle().catch(() => {});
+  demoSniper.placeHandle = setInterval(() => { runDemoSniperCycle().catch(() => {}); }, DEMO_SNIPER_CYCLE_MS);
+  demoSniper.monitorHandle = setInterval(() => { runDemoSniperMonitor().catch(() => {}); }, DEMO_SNIPER_MONITOR_MS);
+
+  req.log.info({ cycleMs: DEMO_SNIPER_CYCLE_MS, globalMax: DEMO_SNIPER_GLOBAL_MAX }, "[demo-sniper] started");
+  res.json({ started: true, ...getSniperStatus() });
+});
+
+/** POST /api/demo/sniper/stop */
+router.post("/demo/sniper/stop", (req: Request, res: Response) => {
+  if (!demoSniper.running) {
+    res.json({ stopped: false, reason: "Sniper not running", ...getSniperStatus() });
+    return;
+  }
+  stopDemoSniper("MANUAL_STOP");
+  req.log.info({ totalPlaced: demoSniper.totalPlaced, cycleCount: demoSniper.cycleCount }, "[demo-sniper] stopped");
+  res.json({ stopped: true, ...getSniperStatus() });
+});
+
+/** GET /api/demo/sniper/status */
+router.get("/demo/sniper/status", (_req: Request, res: Response) => {
+  res.json({
+    ...getSniperStatus(),
+    openTradesList: Array.from(sniperOpenTrades.values()).map((t) => ({
+      orderId: t.orderId,
+      symbol: t.symbol,
+      positionSide: t.positionSide,
+      entryPrice: t.entryPrice,
+      quantity: t.quantity,
+      marginUsed: t.marginUsed,
+      entryTime: t.entryTime,
+      btcRegime: t.btcRegime,
+    })),
+  });
+});
+
+/** GET /api/demo/campaign — dual-view: per-entry + per-symbol aggregate */
+router.get("/demo/campaign", (_req: Request, res: Response) => {
+  const outcomes = getEngine().rawOutcomes()
+    .filter((o) => o.isDemo === true || o.source === "bingx-vst")
+    .sort((a, b) => (a.entryTime ?? 0) - (b.entryTime ?? 0));
+
+  type SymbolCampaign = {
+    symbol: string;
+    trades: number;
+    wins: number;
+    totalPnl: number;
+    totalFees: number;
+    totalGrossPnl: number;
+    holdTimes: number[];
+    runningPnl: number;
+    peakPnl: number;
+    maxDrawdown: number;
+    lastTradeAt: number;
+    tpCount: number;
+    slCount: number;
+    entries: Array<{
+      id: string;
+      entryTime: number;
+      exitTime: number;
+      positionSide: string;
+      entryPrice: number;
+      exitPrice: number;
+      realizedPnl: number;
+      fee: number;
+      grossPnl: number;
+      exitReason: string;
+      isWin: boolean;
+      holdMs: number;
+      btcRegime: string;
+      estimated: boolean;
+    }>;
+  };
+
+  const symbolMap = new Map<string, SymbolCampaign>();
+
+  for (const o of outcomes) {
+    if (!symbolMap.has(o.symbol)) {
+      symbolMap.set(o.symbol, {
+        symbol: o.symbol,
+        trades: 0, wins: 0, totalPnl: 0, totalFees: 0, totalGrossPnl: 0,
+        holdTimes: [], runningPnl: 0, peakPnl: 0, maxDrawdown: 0,
+        lastTradeAt: 0, tpCount: 0, slCount: 0, entries: [],
+      });
+    }
+    const s = symbolMap.get(o.symbol)!;
+    const isWin = (o.realizedPnl ?? 0) > 0;
+    const holdMs = (o.exitTime ?? 0) - (o.entryTime ?? 0);
+
+    s.trades++;
+    if (isWin) s.wins++;
+    s.totalPnl += o.realizedPnl ?? 0;
+    s.totalFees += o.fee ?? 0;
+    s.totalGrossPnl += o.grossPnl ?? 0;
+    if (holdMs > 0) s.holdTimes.push(holdMs);
+    s.runningPnl += o.realizedPnl ?? 0;
+    if (s.runningPnl > s.peakPnl) s.peakPnl = s.runningPnl;
+    const dd = s.peakPnl - s.runningPnl;
+    if (dd > s.maxDrawdown) s.maxDrawdown = dd;
+    s.lastTradeAt = Math.max(s.lastTradeAt, o.exitTime ?? 0);
+    if (o.exitReason === "TAKE_PROFIT") s.tpCount++;
+    if (o.exitReason === "STOP_LOSS") s.slCount++;
+
+    s.entries.push({
+      id: o.id,
+      entryTime: o.entryTime ?? 0,
+      exitTime: o.exitTime ?? 0,
+      positionSide: o.positionSide,
+      entryPrice: o.entryPrice ?? 0,
+      exitPrice: o.exitPrice ?? 0,
+      realizedPnl: parseFloat((o.realizedPnl ?? 0).toFixed(4)),
+      fee: parseFloat((o.fee ?? 0).toFixed(4)),
+      grossPnl: parseFloat((o.grossPnl ?? 0).toFixed(4)),
+      exitReason: o.exitReason ?? "UNKNOWN",
+      isWin,
+      holdMs,
+      btcRegime: o.btcRegime ?? "NEUTRAL",
+      estimated: o.estimated ?? false,
+    });
+  }
+
+  const symbols = Array.from(symbolMap.values())
+    .map((s) => ({
+      symbol: s.symbol,
+      trades: s.trades,
+      wins: s.wins,
+      losses: s.trades - s.wins,
+      winRate: s.trades > 0 ? parseFloat((s.wins / s.trades).toFixed(4)) : 0,
+      totalPnl: parseFloat(s.totalPnl.toFixed(4)),
+      totalFees: parseFloat(s.totalFees.toFixed(4)),
+      totalGrossPnl: parseFloat(s.totalGrossPnl.toFixed(4)),
+      avgHoldMs: s.holdTimes.length > 0
+        ? Math.round(s.holdTimes.reduce((a, b) => a + b, 0) / s.holdTimes.length) : 0,
+      maxDrawdown: parseFloat(s.maxDrawdown.toFixed(4)),
+      lastTradeAt: s.lastTradeAt,
+      tpCount: s.tpCount,
+      slCount: s.slCount,
+      entries: s.entries.slice(-100),
+    }))
+    .sort((a, b) => b.totalPnl - a.totalPnl);
+
+  const totalPnl = symbols.reduce((sum, s) => sum + s.totalPnl, 0);
+  const totalTrades = symbols.reduce((sum, s) => sum + s.trades, 0);
+  const totalWins = symbols.reduce((sum, s) => sum + s.wins, 0);
+  const totalFees = symbols.reduce((sum, s) => sum + s.totalFees, 0);
+  const maxDrawdown = Math.max(...symbols.map((s) => s.maxDrawdown), 0);
+
+  res.json({
+    summary: {
+      totalTrades,
+      totalWins,
+      totalLosses: totalTrades - totalWins,
+      winRate: totalTrades > 0 ? parseFloat((totalWins / totalTrades).toFixed(4)) : 0,
+      totalPnl: parseFloat(totalPnl.toFixed(4)),
+      totalFees: parseFloat(totalFees.toFixed(4)),
+      maxDrawdown: parseFloat(maxDrawdown.toFixed(4)),
+      symbolCount: symbols.length,
+      bestSymbol: symbols[0]?.symbol ?? null,
+      worstSymbol: symbols[symbols.length - 1]?.symbol ?? null,
+      sniperRunning: demoSniper.running,
+      sniperOpenTrades: sniperOpenTrades.size,
+    },
+    symbols,
+  });
 });
 
 export { router as demoRouter };
