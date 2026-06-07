@@ -1,0 +1,208 @@
+Act as a principal quantitative validation engineer.
+
+The previous implementation added the sniper demo architecture. Your next task is to build a rigorous financial testing, observability and edge-calibration system.
+
+Do not enable real-money trading. Do not optimize for impressive backtest results. Optimize for reliable evidence of positive net expectancy.
+
+CORE FINANCIAL PRINCIPLE
+
+The system must increase stacking only when the marginal next entry has positive expected value after:
+
+- entry fee;
+- exit fee;
+- bid/ask spread;
+- market impact;
+- slippage;
+- funding;
+- latency;
+- adverse selection.
+
+Trade count and gross PnL are not profitability evidence.
+
+1. BUILD A CANONICAL FINANCIAL LEDGER
+
+Create an immutable double-entry-style demo ledger.
+
+Record separately:
+
+- initial simulated balance;
+- reserved margin;
+- released margin;
+- realized gross PnL;
+- unrealized PnL;
+- entry fees;
+- exit fees;
+- slippage cost;
+- spread cost;
+- funding;
+- liquidation or protection loss;
+- net realized PnL;
+- final equity.
+
+Required reconciliation:
+
+final_equity =
+initial_equity
++ realized_gross_pnl
+- fees
+- slippage
+- spread_cost
+- funding
++ unrealized_pnl
+
+The system must detect and report any reconciliation difference.
+
+2. BUILD A REALISTIC EXECUTION SIMULATOR
+
+Do not assume every order fills at the candle close.
+
+Simulate:
+
+- bid and ask prices;
+- maker and taker fills;
+- partial fills;
+- rejected orders;
+- execution latency;
+- price movement during latency;
+- symbol-specific slippage;
+- volume and liquidity limits;
+- stop-loss gaps;
+- take-profit queue uncertainty.
+
+Use pessimistic defaults when market microstructure data is unavailable.
+
+3. CREATE A MULTI-LAYER TEST SYSTEM
+
+Implement:
+
+- deterministic unit tests;
+- property-based financial tests;
+- integration tests;
+- historical replay tests;
+- walk-forward tests;
+- Monte Carlo resampling;
+- stress tests;
+- service-failure tests;
+- concurrency tests;
+- shadow-production validation.
+
+Test invariants:
+
+- fees never increase profit;
+- stacking never exceeds limits;
+- closing a position releases its margin;
+- the same fill cannot be processed twice;
+- net PnL always reconciles with equity;
+- LONG and SHORT calculations are symmetric;
+- future market information cannot enter features;
+- campaign PnL equals the sum of its executions;
+- losing campaigns cannot be reported as profitable;
+- failed telemetry prevents new demo executions.
+
+4. CALIBRATE THE EDGE
+
+For every score bucket, symbol, side and regime, calculate:
+
+- sample count;
+- predicted probability;
+- observed win rate;
+- calibration error;
+- gross expectancy;
+- net expectancy;
+- Profit Factor;
+- Sharpe and Sortino estimates;
+- maximum drawdown;
+- MAE and MFE;
+- average holding time;
+- fee drag;
+- confidence interval.
+
+AUC must not be used as the primary deployment metric.
+
+Primary metric:
+
+net_expectancy_per_unit_of_risk
+
+A model is eligible only when it beats a deterministic baseline out of sample and after all costs.
+
+5. IMPLEMENT CHAMPION/CHALLENGER VALIDATION
+
+Maintain:
+
+- deterministic baseline;
+- current champion model;
+- challenger model;
+- model version;
+- feature version;
+- training period;
+- validation period;
+- calibration report.
+
+Promote a challenger only when it improves net expectancy without violating drawdown limits.
+
+Automatically roll back when live-demo performance crosses degradation thresholds.
+
+6. IMPLEMENT INTELLIGENT STACKING
+
+Treat all entries from the same symbol, direction and continuous signal as one campaign.
+
+Use sequential stacking:
+
+Entry 1: exploratory position
+Entry 2: allowed only after edge persistence
+Entry 3+: require stronger evidence and remaining risk budget
+
+Never stack because previous entries are losing.
+
+Do not use martingale, loss doubling or averaging down without an independently validated signal.
+
+For every additional entry calculate:
+
+marginal_net_EV
+correlation_adjusted_exposure
+campaign_drawdown
+remaining_symbol_risk
+remaining_portfolio_risk
+
+Reject the entry if marginal net EV is not positive.
+
+7. CREATE ADAPTIVE SCORE TIERS
+
+Do not hardcode profitability assumptions.
+
+Generate stacking tiers from calibrated out-of-sample evidence.
+
+Example initial research policy:
+
+- untrained or fallback model: maximum 1 entry;
+- weak calibrated edge: maximum 1 entry;
+- moderate validated edge: maximum 2 entries;
+- strong validated edge: maximum 3 entries;
+- exceptional edge: maximum 5 entries;
+- more than 5: disabled until statistically validated.
+
+The system may test higher stacking in an isolated experiment, but it must not treat correlated positions as independent samples.
+
+8. FOUR-HOUR CONTROL WINDOW
+
+Every four hours generate a decision report, but never retrain solely on four hours of data.
+
+Report:
+
+- number of campaigns;
+- number of executions;
+- net PnL;
+- expectancy;
+- Profit Factor;
+- drawdown;
+- calibration drift;
+- fees as percentage of gross profit;
+- performance by symbol, side and regime;
+- baseline versus model;
+- fallback usage;
+- rejection reasons.
+
+Possible decisions:
+
+- CONTINUE;
+- REDUCE

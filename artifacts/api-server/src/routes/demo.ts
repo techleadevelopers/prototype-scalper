@@ -15,6 +15,35 @@ import {
   recentPerformanceRejects,
   summarizeRecentPerformance,
 } from "../lib/entryProtection";
+import {
+  initDemoTradeStore,
+  persistOpenTrade,
+  updateOpenTradeMfe,
+  closeOpenTrade,
+  getOpenTrades,
+  getOpenTradeByOrderId,
+  resolveCampaignId,
+  loadClosedTrades,
+  getCampaignSummary,
+} from "../lib/demoTradeStore";
+import {
+  getServiceState,
+  isExecutionAllowed,
+  recordQbFailure,
+  recordQbSuccess,
+  recordApiError,
+  recordApiSuccess,
+  recordTradeLoss,
+  recordTradeWin,
+  recordBtcPriceUpdate,
+  checkDataFreshness,
+  resetServiceState,
+} from "../lib/serviceState";
+
+// Initialise persistent demo trade store on module load
+void initDemoTradeStore().catch((err) => {
+  console.error("[demoTradeStore] init failed", err);
+});
 
 interface DemoOpenTrade {
   orderId: string;
@@ -1052,6 +1081,11 @@ router.post("/demo/order", async (req: Request, res: Response) => {
     quantBrainEdge = edge;
     if (edge.error && edge.error !== "missing QUANT_BRAIN_URL") {
       req.log.warn({ error: edge.error, symbol, positionSide }, "quant brain edge unavailable");
+      // Track QB failures for service state machine
+      const isTimeout = /timeout|ETIMEDOUT|ECONNREFUSED/i.test(edge.error ?? "");
+      recordQbFailure(isTimeout ? "timeout" : "unavailable");
+    } else if (!edge.error) {
+      recordQbSuccess();
     }
     if (execute && edge.error) {
       gateRejects.push(`QUANT_UNAVAILABLE_REJECT: ${edge.error}`);
@@ -1451,6 +1485,7 @@ const DEMO_SNIPER_GLOBAL_MAX = parseInt(process.env["DEMO_SNIPER_GLOBAL_MAX"] ??
 const DEMO_SNIPER_PER_SYMBOL_MAX = parseInt(process.env["DEMO_SNIPER_PER_SYMBOL_MAX"] ?? "10", 10);
 const DEMO_SNIPER_CYCLE_MS = parseInt(process.env["DEMO_SNIPER_CYCLE_MS"] ?? "30000", 10);
 const DEMO_SNIPER_MONITOR_MS = parseInt(process.env["DEMO_SNIPER_MONITOR_MS"] ?? "12000", 10);
+const STALE_DATA_THRESHOLD_MS = parseInt(process.env["STALE_DATA_SHADOW_MS"] ?? "90000", 10);
 
 interface DemoSniperPlacement {
   symbol: string;
@@ -1513,6 +1548,14 @@ function scoreTierMaxEntries(score: number): number {
 
 async function runDemoSniperCycle(): Promise<void> {
   if (!demoSniper.running || !demoSniper.creds) return;
+
+  // ── Service state gate ───────────────────────────────────────────────────
+  const svcState = getServiceState();
+  if (!isExecutionAllowed()) {
+    console.info(`[demo-sniper] skipping cycle — service state ${svcState.state} (${svcState.reason ?? "n/a"})`);
+    return;
+  }
+
   const config = getBotConfig();
   const engine = getEngine();
   const { apiKey, secretKey } = demoSniper.creds;
@@ -1535,6 +1578,10 @@ async function runDemoSniperCycle(): Promise<void> {
     if (btcRes && String(btcRes.code) === "0") {
       const d = (btcRes.data as Record<string, string>) ?? {};
       btcChangePct = parseFloat(d.priceChangePercent ?? "0") || 0;
+      recordBtcPriceUpdate();
+      recordApiSuccess();
+    } else {
+      recordApiError();
     }
     if (posData && isBingXSuccess(posData)) {
       currentPositions = (getRawPositions(posData) as Array<Record<string, unknown>>)
@@ -1550,6 +1597,15 @@ async function runDemoSniperCycle(): Promise<void> {
   const btcRegime = inferBtcRegime(btcChangePct, config.btcRegimeThresholdPct);
   const hourUtc = new Date().getUTCHours();
   const globalOpen = currentPositions.length;
+
+  // ── Stale data gate — block entries when BTC price is too old ────────────
+  const freshness = checkDataFreshness();
+  if (!freshness.fresh) {
+    const ageDesc = freshness.ageMs !== null ? `${freshness.ageMs}ms` : "never fetched";
+    console.warn(`[demo-sniper] skipping entries — BTC price data stale (age: ${ageDesc}, threshold: ${STALE_DATA_THRESHOLD_MS}ms)`);
+    demoSniper.lastCycleAt = Date.now();
+    return;
+  }
 
   if (globalOpen >= DEMO_SNIPER_GLOBAL_MAX) {
     demoSniper.lastCycleAt = Date.now();
@@ -1680,6 +1736,7 @@ async function runDemoSniperCycle(): Promise<void> {
         const orderId = String(order?.orderId ?? `sniper-${Date.now()}-${c.symbol}-${c.positionSide}`);
         const entryPrice = parseFloat(String(order?.avgPrice ?? "")) || price;
 
+        const entryTime = Date.now();
         sniperOpenTrades.set(orderId, {
           orderId,
           symbol: c.symbol,
@@ -1688,13 +1745,42 @@ async function runDemoSniperCycle(): Promise<void> {
           quantity: qty,
           entryPrice,
           expectedEntryPrice: price,
-          entryTime: Date.now(),
+          entryTime,
           hourUtc,
           btcRegime,
           leverage: config.leverage,
           marginUsed: config.marginPerTrade,
           expectedTpProfit: config.marginPerTrade * config.leverage * (config.takeProfitPct / 100),
         });
+
+        // Persist to durable trade store (survives server restarts)
+        void persistOpenTrade({
+          orderId,
+          symbol: c.symbol,
+          side: c.side,
+          positionSide: c.positionSide,
+          entryTime,
+          entryPrice,
+          expectedEntryPrice: price,
+          qty,
+          leverage: config.leverage,
+          marginUsed: config.marginPerTrade,
+          notional: entryPrice * qty,
+          tpPct: config.takeProfitPct,
+          slPct: config.stopLossPct,
+          btcRegime,
+          hourUtc,
+          edgeScore: c.score,
+          modelVersion: "sniper-v1",
+          fallbackMode: false,
+          mfe: 0,
+          mae: 0,
+          mfeAt: null,
+          maeAt: null,
+          lastMarkPrice: null,
+          lastCheckedAt: null,
+          closedAt: null,
+        }).catch(() => {});
 
         demoSniper.totalPlaced++;
         placed++;
@@ -1729,12 +1815,20 @@ async function runDemoSniperMonitor(): Promise<void> {
   const config = getBotConfig();
 
   let livePositions: Array<{ symbol: string; positionSide: string }>;
+  // key = "SYMBOL:POSITIONSIDE" → latest mark price from position response
+  const openMarkPrices = new Map<string, number>();
   try {
     const posData = await bingxGet("/openApi/swap/v2/user/positions", {}, apiKey, secretKey);
     if (!isBingXSuccess(posData)) return;
-    livePositions = (getRawPositions(posData) as Array<Record<string, unknown>>)
-      .filter((p) => parseFloat(String(p.positionAmt ?? "0")) !== 0)
-      .map((p) => ({ symbol: String(p.symbol ?? ""), positionSide: String(p.positionSide ?? "") }));
+    const rawPositions = (getRawPositions(posData) as Array<Record<string, unknown>>)
+      .filter((p) => parseFloat(String(p.positionAmt ?? "0")) !== 0);
+    livePositions = rawPositions.map((p) => ({ symbol: String(p.symbol ?? ""), positionSide: String(p.positionSide ?? "") }));
+    for (const p of rawPositions) {
+      const markPrice = parseFloat(String(p.markPrice ?? p.currentPrice ?? "0"));
+      if (markPrice > 0) {
+        openMarkPrices.set(`${String(p.symbol ?? "").toUpperCase()}:${String(p.positionSide ?? "").toUpperCase()}`, markPrice);
+      }
+    }
   } catch { return; }
 
   const openSet = new Set(livePositions.map((p) => `${p.symbol.toUpperCase()}:${p.positionSide.toUpperCase()}`));
@@ -1742,7 +1836,17 @@ async function runDemoSniperMonitor(): Promise<void> {
   for (const [orderId, entry] of sniperOpenTrades.entries()) {
     if (sniperRecordedIds.has(orderId)) { sniperOpenTrades.delete(orderId); continue; }
     const key = `${entry.symbol.toUpperCase()}:${entry.positionSide.toUpperCase()}`;
-    if (openSet.has(key)) continue; // still open
+    if (openSet.has(key)) {
+      // Update MFE/MAE for the open position using the last known mark price
+      const storeEntry = getOpenTradeByOrderId(orderId);
+      if (storeEntry) {
+        const markInfo = openMarkPrices.get(key);
+        if (markInfo && markInfo > 0) {
+          void updateOpenTradeMfe(storeEntry.tradeId, markInfo).catch(() => {});
+        }
+      }
+      continue;
+    }
 
     // Position closed — estimate exit price and record outcome
     const exitPrice = await fetchDemoLastPrice(entry.symbol).catch(() => null);
@@ -1757,8 +1861,8 @@ async function runDemoSniperMonitor(): Promise<void> {
       : ((entry.entryPrice - exitPrice) / entry.entryPrice) * 100;
 
     const exitReason: TradeOutcome["exitReason"] =
-      favorableMovePct >= config.takeProfitPct * 0.7 ? "TAKE_PROFIT"
-      : favorableMovePct <= -(config.stopLossPct * 0.7) ? "STOP_LOSS"
+      favorableMovePct >= config.takeProfitPct * 0.7 ? "TP"
+      : favorableMovePct <= -(config.stopLossPct * 0.7) ? "SL"
       : "MANUAL";
 
     try {
@@ -1790,6 +1894,29 @@ async function runDemoSniperMonitor(): Promise<void> {
       sniperRecordedIds.add(orderId);
       sniperOpenTrades.delete(orderId);
       void syncQuantBrainOutcome(outcome).catch(() => {});
+
+      // Update service state circuit breaker
+      if (realizedPnl > 0) recordTradeWin();
+      else recordTradeLoss(realizedPnl);
+
+      // Close the persistent demoTradeStore entry
+      const storeEntry = getOpenTradeByOrderId(orderId);
+      if (storeEntry) {
+        void closeOpenTrade(storeEntry.tradeId, {
+          exitTime: outcome.exitTime ?? Date.now(),
+          exitPrice,
+          expectedExitPrice: null,
+          grossPnl,
+          fee,
+          entrySlippage: entry.expectedEntryPrice != null ? Math.abs(entry.entryPrice - entry.expectedEntryPrice) : 0,
+          exitSlippage: 0,
+          realizedPnl,
+          pnlSource: "price_estimate",
+          estimated: true,
+          exitReason,
+          exitOrderId: null,
+        }).catch(() => {});
+      }
     } catch { /* non-fatal */ }
   }
 }
@@ -1942,8 +2069,8 @@ router.get("/demo/campaign", (_req: Request, res: Response) => {
     const dd = s.peakPnl - s.runningPnl;
     if (dd > s.maxDrawdown) s.maxDrawdown = dd;
     s.lastTradeAt = Math.max(s.lastTradeAt, o.exitTime ?? 0);
-    if (o.exitReason === "TAKE_PROFIT") s.tpCount++;
-    if (o.exitReason === "STOP_LOSS") s.slCount++;
+    if (o.exitReason === "TP") s.tpCount++;
+    if (o.exitReason === "SL") s.slCount++;
 
     s.entries.push({
       id: o.id,

@@ -171,19 +171,19 @@ function inferExitReason(
   positionSide: "LONG" | "SHORT",
   takeProfitPct: number,
   stopLossPct: number,
-): "TAKE_PROFIT" | "STOP_LOSS" | "UNKNOWN" {
-  if (entryPrice <= 0 || exitPrice <= 0) return "UNKNOWN";
+): "TP" | "SL" | "MANUAL" {
+  if (entryPrice <= 0 || exitPrice <= 0) return "MANUAL";
 
   const movePct = positionSide === "LONG"
     ? ((exitPrice - entryPrice) / entryPrice) * 100
     : ((entryPrice - exitPrice) / entryPrice) * 100;
 
   // TP hit: price moved at least 70% of expected TP distance in the right direction
-  if (movePct >= takeProfitPct * 0.70) return "TAKE_PROFIT";
+  if (movePct >= takeProfitPct * 0.70) return "TP";
   // SL hit: price moved at least 70% of expected SL distance against us
-  if (movePct <= -stopLossPct * 0.70) return "STOP_LOSS";
+  if (movePct <= -stopLossPct * 0.70) return "SL";
   // Ambiguous region (partial TP, manual close, liquidation, etc.)
-  return "UNKNOWN";
+  return "MANUAL";
 }
 
 // ── Core Poll Cycle ───────────────────────────────────────────────────────────

@@ -10,6 +10,8 @@ import {
   Gauge,
   RefreshCw,
   ShieldAlert,
+  ShieldCheck,
+  ShieldOff,
   Target,
   TrendingDown,
   TrendingUp,
@@ -17,6 +19,7 @@ import {
   WifiOff,
   XCircle,
   BarChart2,
+  Pause,
 } from "lucide-react";
 import {
   getGetBingXTickerQueryKey,
@@ -257,6 +260,118 @@ function pct(value: unknown, digits = 2) {
 
 function num(value: unknown, digits = 3) {
   return Number(value ?? 0).toFixed(digits);
+}
+
+// ─── Service State Panel ──────────────────────────────────────────────────────
+
+interface ServiceStateSnapshot {
+  state: "HEALTHY" | "DEGRADED" | "SHADOW_ONLY" | "PAUSED";
+  reason: string | null;
+  since: number;
+  qbFailures: number;
+  apiErrors: number;
+  consecutiveLosses: number;
+  rollingLossPnl: number;
+  lastBtcPriceAt: number | null;
+  staleDataThresholdMs: number;
+  history: Array<{ state: string; reason: string | null; at: number }>;
+}
+
+function ServiceStatePanel() {
+  const { data, isLoading, dataUpdatedAt } = useQuery<ServiceStateSnapshot>({
+    queryKey: ["service-state"],
+    queryFn: async () => {
+      const res = await fetch(apiUrl("/api/service-state"), { credentials: "include" });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return res.json() as Promise<ServiceStateSnapshot>;
+    },
+    refetchInterval: 5_000,
+    placeholderData: (prev) => prev,
+    retry: 2,
+  });
+
+  const stateColors: Record<string, string> = {
+    HEALTHY: "text-green-400 border-green-500/40 bg-green-500/8",
+    DEGRADED: "text-amber-400 border-amber-500/40 bg-amber-500/8",
+    SHADOW_ONLY: "text-orange-400 border-orange-500/40 bg-orange-500/8",
+    PAUSED: "text-red-400 border-red-500/40 bg-red-500/8",
+  };
+  const stateIcon: Record<string, React.ReactNode> = {
+    HEALTHY: <ShieldCheck className="h-3.5 w-3.5" />,
+    DEGRADED: <ShieldAlert className="h-3.5 w-3.5" />,
+    SHADOW_ONLY: <ShieldOff className="h-3.5 w-3.5" />,
+    PAUSED: <Pause className="h-3.5 w-3.5" />,
+  };
+
+  const state = data?.state ?? "HEALTHY";
+  const colorClass = stateColors[state] ?? stateColors.HEALTHY;
+  const icon = stateIcon[state] ?? stateIcon.HEALTHY;
+
+  const btcAgeMs = data?.lastBtcPriceAt ? Date.now() - data.lastBtcPriceAt : null;
+  const btcStale = btcAgeMs !== null && data?.staleDataThresholdMs ? btcAgeMs > data.staleDataThresholdMs : false;
+
+  return (
+    <section className={`border p-4 ${colorClass}`}>
+      <div className="mb-3 flex items-center gap-2">
+        {icon}
+        <h2 className="text-sm font-semibold">Estado do serviço</h2>
+        {isLoading && <RefreshCw className="ml-auto h-3 w-3 animate-spin text-muted-foreground" />}
+        {!isLoading && dataUpdatedAt > 0 && (
+          <span className="ml-auto text-[9px] text-muted-foreground font-mono">
+            {new Date(dataUpdatedAt).toLocaleTimeString()}
+          </span>
+        )}
+      </div>
+
+      {!data ? (
+        <p className="text-[10px] text-muted-foreground">Carregando...</p>
+      ) : (
+        <div className="space-y-2">
+          <div className="flex justify-between text-xs">
+            <span className="text-muted-foreground">Estado</span>
+            <span className={`font-mono font-bold ${colorClass.split(" ")[0]}`}>{state}</span>
+          </div>
+          {data.reason && (
+            <div className="flex justify-between text-xs">
+              <span className="text-muted-foreground">Motivo</span>
+              <span className="font-mono uppercase text-[10px]">{data.reason}</span>
+            </div>
+          )}
+          <div className="flex justify-between text-xs">
+            <span className="text-muted-foreground">QB falhas (5min)</span>
+            <span className={`font-mono ${data.qbFailures >= 3 ? "text-amber-400" : ""}`}>{data.qbFailures}</span>
+          </div>
+          <div className="flex justify-between text-xs">
+            <span className="text-muted-foreground">Perdas seguidas</span>
+            <span className={`font-mono ${data.consecutiveLosses >= 4 ? "text-red-400" : ""}`}>{data.consecutiveLosses}</span>
+          </div>
+          <div className="flex justify-between text-xs">
+            <span className="text-muted-foreground">PnL acumulado</span>
+            <span className={`font-mono ${data.rollingLossPnl < 0 ? "text-red-400" : "text-green-400"}`}>
+              {data.rollingLossPnl >= 0 ? "+" : ""}${data.rollingLossPnl.toFixed(2)}
+            </span>
+          </div>
+          <div className="flex justify-between text-xs">
+            <span className="text-muted-foreground">BTC price age</span>
+            <span className={`font-mono ${btcStale ? "text-red-400" : "text-muted-foreground"}`}>
+              {btcAgeMs !== null ? `${(btcAgeMs / 1000).toFixed(0)}s` : "n/a"}
+              {btcStale && " ⚠ STALE"}
+            </span>
+          </div>
+          {(state === "SHADOW_ONLY" || state === "PAUSED") && (
+            <div className="mt-2 rounded border border-red-500/30 bg-red-500/5 p-2 text-[10px] text-red-400">
+              ⛔ Novas entradas bloqueadas — use POST /api/service-state/reset para recuperar
+            </div>
+          )}
+          {state === "DEGRADED" && (
+            <div className="mt-2 rounded border border-amber-500/30 bg-amber-500/5 p-2 text-[10px] text-amber-400">
+              ⚠ Execução degradada — monitorando falhas
+            </div>
+          )}
+        </div>
+      )}
+    </section>
+  );
 }
 
 function StatusBadge({ ok, on, off }: { ok: boolean; on: string; off: string }) {
@@ -804,6 +919,8 @@ export default function IntelligencePage() {
                   <div className="flex justify-between text-xs"><span className="text-muted-foreground">Hora UTC</span><span className="flex items-center gap-1 font-mono"><Clock3 className="h-3 w-3" />{data?.hourUtc}:00</span></div>
                 </div>
               </section>
+
+              <ServiceStatePanel />
             </div>
 
             {quant && Object.keys(quant.errors).length > 0 && (
