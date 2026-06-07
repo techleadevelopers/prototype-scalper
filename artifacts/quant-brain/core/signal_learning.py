@@ -321,6 +321,7 @@ async def record_signal_from_gate(
         "btc": sniper.get("btcFeatures", {}),
         "alt_timeframes": sniper.get("altTimeframes", {}),
         "btc_timeframes": sniper.get("btcTimeframes", {}),
+        "candle_regime": sniper.get("candleRegime", {}),
         "target_moves_pct": target_moves,
         "target_probabilities": sniper.get("targetProbabilities", {}),
         "estimated_cost_pct": estimated_cost_pct,

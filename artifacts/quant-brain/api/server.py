@@ -331,10 +331,10 @@ async def _initialize_runtime_services():
         "shadow_signal_sampler",
         lambda: sample_shadow_signals_once(engine),
         interval_seconds=sampler_interval,
-        timeout_seconds=_SHADOW_SAMPLER_JOB_TIMEOUT_SECONDS,
-        priority="low",
+        timeout_seconds=max(30, int(float(os.environ.get("SHADOW_SAMPLER_JOB_TIMEOUT_SECONDS", "60")))),
+        priority="normal",
         enabled=os.environ.get("SHADOW_SAMPLER_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"},
-        run_immediately=False,
+        run_immediately=True,
     )
     job_supervisor.start()
     log.info(f"Runtime job supervisor started with {len(job_supervisor.jobs)} jobs")

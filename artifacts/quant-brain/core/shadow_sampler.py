@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import time
 from typing import Any
 
+from core.candle_regime import candle_regime_status
 from core.feature_engine import FeatureEngine, SYMBOLS
 from core.movement_sniper import evaluate_sniper_window
 from core.signal_learning import record_signal_from_gate
 from layers.tactical import get_snapshot_history, process_tactical_cycle
+
+log = logging.getLogger("shadow_sampler")
 
 
 SHADOW_SAMPLER_SOURCE_TYPE = "shadow_sampler"
@@ -99,15 +103,23 @@ async def sample_shadow_signals_once(engine: FeatureEngine) -> dict[str, Any]:
         if symbol.strip()
     ]
 
+    cycle_num = int(_sampler_state["cycles"]) + 1
+    log.info("Shadow sampler cycle=%d starting for %d symbols", cycle_num, len(symbols))
+
     if not engine.get_all_snapshots():
         await process_tactical_cycle(engine)
 
     btc_history = get_snapshot_history("BTC-USDT", max(window_seconds, 900))
     if len(btc_history) < bootstrap_samples:
-        for _ in range(bootstrap_samples - len(btc_history)):
+        needed = bootstrap_samples - len(btc_history)
+        log.info("Shadow sampler bootstrap: need %d more BTC snapshots", needed)
+        for _ in range(needed):
             await process_tactical_cycle(engine)
             _sampler_state["bootstrapCycles"] = int(_sampler_state["bootstrapCycles"]) + 1
             await asyncio.sleep(0.25)
+
+    regime = candle_regime_status()
+    btc_regime = (regime.get("symbols") or {}).get("BTC-USDT", {})
 
     attempted = 0
     recorded = 0
@@ -119,6 +131,10 @@ async def sample_shadow_signals_once(engine: FeatureEngine) -> dict[str, Any]:
         alt_history = get_snapshot_history(sym, max(window_seconds, 900))
         btc_history = get_snapshot_history("BTC-USDT", max(window_seconds, 900))
         if len(alt_history) < bootstrap_samples or len(btc_history) < bootstrap_samples:
+            log.debug(
+                "Shadow sampler skip %s: alt_history=%d btc_history=%d (need %d)",
+                sym, len(alt_history), len(btc_history), bootstrap_samples,
+            )
             skipped_no_data += 1
             continue
 
@@ -128,6 +144,7 @@ async def sample_shadow_signals_once(engine: FeatureEngine) -> dict[str, Any]:
             btc_history,
             window_seconds=window_seconds,
         )
+        sniper["candleRegime"] = btc_regime
 
         for fallback_side in ("LONG", "SHORT"):
             attempted += 1
@@ -136,12 +153,17 @@ async def sample_shadow_signals_once(engine: FeatureEngine) -> dict[str, Any]:
             recorded += 1 if was_recorded else 0
             analyses.append(_compact_analysis(sym, fallback_side, sniper, was_recorded))
 
+    log.info(
+        "Shadow sampler cycle=%d done: attempted=%d recorded=%d skipped=%d",
+        cycle_num, attempted, recorded, skipped_no_data,
+    )
+
     _sampler_state.update({
         "enabled": _env_bool("SHADOW_SAMPLER_ENABLED", True),
         "running": True,
         "lastRunAt": time.time(),
         "lastError": None,
-        "cycles": int(_sampler_state["cycles"]) + 1,
+        "cycles": cycle_num,
         "attempted": int(_sampler_state["attempted"]) + attempted,
         "recorded": int(_sampler_state["recorded"]) + recorded,
         "skippedNoData": int(_sampler_state["skippedNoData"]) + skipped_no_data,

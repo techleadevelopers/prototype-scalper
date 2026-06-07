@@ -1,3 +1,1 @@
-- [QB-Sentiment Integration](qb-sentiment-integration.md) — QB edge gate now consumes 24h sentimentContext; SENTIMENT_COUNTER_REJECT fires when conf≥0.75 & biasRatio≥0.72
-- [QB Gate Thresholds](qb-gate-thresholds.md) — Gate thresholds relaxed for 24h alt-coin operation; HIGH_VOL 2.5%, SHARPE 25 samples/0.3, requireFull15mContext default False
-- [QB Entry Flow](qb-entry-flow.md) — QB is called in /api/bot/order (parallel with capital gate) and executeSingleOrder (fire-and-forget shadow, await enforce)
+- [Shadow ML Gaps Fix](shadow-ml-gaps.md) — root causes of 0/300 samples: priority="low" skipped by semaphore, run_immediately=False, 25s timeout, missing candle regime features

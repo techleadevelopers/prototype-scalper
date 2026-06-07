@@ -23,6 +23,10 @@ CATEGORICAL_FEATURES = [
     "alt_1m_breakout",
     "alt_5m_breakout",
     "alt_15m_breakout",
+    "btc_candle_bias",
+    "btc_candle_action",
+    "btc_1h_trend",
+    "btc_4h_trend",
 ]
 NUMERICAL_FEATURES = [
     "alt_price_change_pct",
@@ -58,6 +62,12 @@ NUMERICAL_FEATURES = [
     "alt_15m_rangePct",
     "alt_15m_wickRatio",
     "alt_15m_volumeRatioAvg",
+    "btc_correction_risk",
+    "btc_trend_score",
+    "btc_1h_move_pct",
+    "btc_4h_move_pct",
+    "btc_1h_volume_ratio",
+    "btc_4h_volatility_pct",
 ]
 
 # Feature importance tracking
@@ -70,6 +80,7 @@ def _feature_dict(row: dict[str, Any]) -> dict[str, Any]:
     alt = features.get("alt", {})
     btc = features.get("btc", {})
     alt_frames = features.get("alt_timeframes", {})
+    candle_regime = features.get("candle_regime", {})
 
     result: dict[str, Any] = {
         "symbol": row.get("symbol", ""),
@@ -83,7 +94,7 @@ def _feature_dict(row: dict[str, Any]) -> dict[str, Any]:
     # Features do alt e btc
     for prefix, source in (("alt", alt), ("btc", btc)):
         for key in NUMERICAL_FEATURES:
-            if key.startswith(prefix):
+            if key.startswith(prefix) and not key.startswith("btc_correction") and not key.startswith("btc_trend") and not key.startswith("btc_1h") and not key.startswith("btc_4h"):
                 feature_name = key.replace(f"{prefix}_", "")
                 result[key] = float(source.get(feature_name, 0) or 0)
         result[f"{prefix}_movement_state"] = str(source.get("movement_state", "NO_DATA"))
@@ -95,6 +106,20 @@ def _feature_dict(row: dict[str, Any]) -> dict[str, Any]:
             result[f"alt_{frame_name}_{key}"] = float(frame.get(key, 0) or 0)
         result[f"alt_{frame_name}_breakout"] = str(frame.get("breakoutState", "NO_DATA"))
 
+    # Features de candle regime macro (1h/4h/1d contexto BTC)
+    tf_1h = candle_regime.get("1h", {})
+    tf_4h = candle_regime.get("4h", {})
+    result["btc_candle_bias"] = str(candle_regime.get("bias", "NEUTRAL"))
+    result["btc_candle_action"] = str(candle_regime.get("action", "RANGE_ONLY"))
+    result["btc_1h_trend"] = str(tf_1h.get("trend", "NEUTRAL"))
+    result["btc_4h_trend"] = str(tf_4h.get("trend", "NEUTRAL"))
+    result["btc_correction_risk"] = float(candle_regime.get("correctionRisk", 0) or 0)
+    result["btc_trend_score"] = float(candle_regime.get("trendScore", 0) or 0)
+    result["btc_1h_move_pct"] = float(tf_1h.get("movePct", 0) or 0)
+    result["btc_4h_move_pct"] = float(tf_4h.get("movePct", 0) or 0)
+    result["btc_1h_volume_ratio"] = float(tf_1h.get("volumeRatio", 1) or 1)
+    result["btc_4h_volatility_pct"] = float(tf_4h.get("volatilityPct", 0) or 0)
+
     # Features derivadas (interações)
     result["alt_btc_momentum_ratio"] = (
         result.get("alt_price_change_pct", 0) / max(0.01, abs(result.get("btc_price_change_pct", 0.01)))
@@ -104,6 +129,10 @@ def _feature_dict(row: dict[str, Any]) -> dict[str, Any]:
     )
     result["rsi_extreme"] = 1 if result.get("alt_rsi", 50) > 75 or result.get("alt_rsi", 50) < 25 else 0
     result["spread_penalty"] = min(1.0, result.get("alt_spread_bps", 0) / 20)
+    result["regime_aligned"] = 1 if (
+        (row.get("side", "") == "LONG" and result["btc_candle_bias"] == "LONG") or
+        (row.get("side", "") == "SHORT" and result["btc_candle_bias"] == "SHORT")
+    ) else 0
 
     return result
 
