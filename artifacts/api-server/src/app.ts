@@ -6,9 +6,11 @@ import router from "./routes";
 import { logger } from "./lib/logger";
 import { initTelemetryStore, exportAllOutcomes } from "./lib/telemetryStore";
 import { startQuantBrainOutcomeSync } from "./lib/quantBrainClient";
+import { startLivePositionWatcher } from "./lib/livePositionWatcher";
 
 initTelemetryStore();
 startQuantBrainOutcomeSync(exportAllOutcomes());
+startLivePositionWatcher();
 logger.info("Adaptive telemetry engine initialized");
 
 const app: Express = express();

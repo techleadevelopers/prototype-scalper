@@ -23,6 +23,11 @@ import {
   recentPerformanceRejects,
   summarizeRecentPerformance,
 } from "../lib/entryProtection";
+import {
+  registerLiveEntry,
+  updateWatcherCreds,
+  getLiveWatcherStats,
+} from "../lib/livePositionWatcher";
 
 const router = Router();
 
@@ -1518,6 +1523,7 @@ async function executeSingleOrder(
   }
 
   // Compute qty from mark price (use pre-fetched price hint if available via item)
+  let expectedEntryPrice = 0;
   let qty = item.quantity;
   if (!qty) {
     try {
@@ -1526,7 +1532,10 @@ async function executeSingleOrder(
       if (json.code === 0) {
         const d = (json.data as Record<string, string>) ?? {};
         const markPrice = parseFloat(d.lastPrice ?? "0");
-        if (markPrice > 0) qty = Math.floor((config.marginPerTrade * config.leverage) / markPrice * 1000) / 1000;
+        if (markPrice > 0) {
+          expectedEntryPrice = markPrice;
+          qty = Math.floor((config.marginPerTrade * config.leverage) / markPrice * 1000) / 1000;
+        }
       }
     } catch { /* fallthrough */ }
   }
@@ -1556,8 +1565,35 @@ async function executeSingleOrder(
       };
     }
     const order = ((data.data as Record<string, unknown>)?.order ?? {}) as Record<string, unknown>;
+    const placedOrderId = String(order.orderId ?? "");
+
+    // Register entry for autonomous outcome recording — watcher polls BingX
+    // every LIVE_WATCHER_POLL_MS and records the outcome when the position closes.
+    if (placedOrderId) {
+      updateWatcherCreds(creds);
+      const btcRegimeForEntry: import("../lib/adaptiveEngine").BtcRegime =
+        (item.btcChangePct ?? 0) >= config.btcRegimeThresholdPct ? "BULL" :
+        (item.btcChangePct ?? 0) <= -config.btcRegimeThresholdPct ? "BEAR" : "NEUTRAL";
+      registerLiveEntry({
+        entryOrderId: placedOrderId,
+        symbol,
+        positionSide,
+        side,
+        expectedEntryPrice,
+        qty: qty!,
+        leverage: config.leverage,
+        marginUsed: config.marginPerTrade,
+        btcRegime: btcRegimeForEntry,
+        hourUtc: currentHour,
+        entryTime: Date.now(),
+        expectedTpProfit: config.marginPerTrade * config.leverage * (config.takeProfitPct / 100),
+        takeProfitPct: config.takeProfitPct,
+        stopLossPct: config.stopLossPct,
+      });
+    }
+
     return {
-      index, symbol, side, placed: true, orderId: String(order.orderId ?? ""),
+      index, symbol, side, placed: true, orderId: placedOrderId,
       quantity: qty, gateRejects: [], observationMode: false,
       message: `Placed: ${side} ${qty} ${symbol}`,
       durationMs: Date.now() - t0,
@@ -1824,6 +1860,11 @@ router.post("/bot/order/bulk", async (req: Request, res: Response) => {
 
   req.log.info({ placed, total: orders.length, durationMs: summary.durationMs }, "bulk execution complete");
   res.json(summary);
+});
+
+/** GET /api/bot/watcher — live position watcher health and registry snapshot */
+router.get("/bot/watcher", (_req: Request, res: Response) => {
+  res.json(getLiveWatcherStats());
 });
 
 export default router;
