@@ -114,10 +114,18 @@ export const ClusterProfileSchema = z.object({
   ewmaSlippage: z.number(),
   realEv: z.number(),
   lastUpdated: z.number(),
-  // Campos adicionais
+  // Campos adicionais — computed incrementally, no O(n) scan needed
   sharpeRatio: z.number().optional(),
   sortinoRatio: z.number().optional(),
   maxDrawdown: z.number().optional(),
+  // Welford incremental variance state for Sharpe/Sortino (avoids storing all returns)
+  _wM2: z.number().optional(),
+  _wMean: z.number().optional(),
+  _wDownsideM2: z.number().optional(),
+  _wDownsideMean: z.number().optional(),
+  _wDownsideN: z.number().optional(),
+  _wPeak: z.number().optional(),
+  _wCumulative: z.number().optional(),
 });
 export type ClusterProfile = z.infer<typeof ClusterProfileSchema>;
 
@@ -200,6 +208,8 @@ function symbolKeyStr(symbol: string): string {
 }
 
 // ========== MÉTRICAS AVANÇADAS ==========
+// NOTE: All metrics use Welford's online algorithm (O(1) per trade, no array scans).
+// The old array-scan versions caused O(n²) freeze as trade history grew.
 
 function calculateSharpeRatio(returns: number[]): number {
   if (returns.length < 3) return 0;
@@ -233,6 +243,86 @@ function calculateMaxDrawdown(returns: number[]): number {
     if (drawdown > maxDrawdown) maxDrawdown = drawdown;
   }
   return maxDrawdown;
+}
+
+// Welford incremental state shape — stored per cluster profile
+interface WelfordState {
+  n: number;
+  mean: number;
+  M2: number;
+  downsideN: number;
+  downsideMean: number;
+  downsideM2: number;
+  peak: number;
+  cumulative: number;
+  maxDrawdown: number;
+}
+
+function welfordInitial(ret: number): WelfordState {
+  return {
+    n: 1,
+    mean: ret,
+    M2: 0,
+    downsideN: ret < 0 ? 1 : 0,
+    downsideMean: ret < 0 ? ret : 0,
+    downsideM2: 0,
+    peak: Math.max(0, ret),
+    cumulative: ret,
+    maxDrawdown: Math.max(0, -ret),
+  };
+}
+
+function welfordUpdate(state: WelfordState, ret: number): WelfordState {
+  const n = state.n + 1;
+  const delta = ret - state.mean;
+  const mean = state.mean + delta / n;
+  const delta2 = ret - mean;
+  const M2 = state.M2 + delta * delta2;
+
+  let { downsideN, downsideMean, downsideM2 } = state;
+  if (ret < 0) {
+    downsideN++;
+    const dd = ret - downsideMean;
+    downsideMean = downsideMean + dd / downsideN;
+    downsideM2 = downsideM2 + dd * (ret - downsideMean);
+  }
+
+  const cumulative = state.cumulative + ret;
+  const peak = Math.max(state.peak, cumulative);
+  const maxDrawdown = Math.max(state.maxDrawdown, peak - cumulative);
+
+  return { n, mean, M2, downsideN, downsideMean, downsideM2, peak, cumulative, maxDrawdown };
+}
+
+function welfordSharpe(state: WelfordState): number {
+  if (state.n < 3) return 0;
+  const variance = state.M2 / state.n;
+  const std = Math.sqrt(variance);
+  if (std === 0) return 0;
+  return (state.mean / std) * Math.sqrt(365);
+}
+
+function welfordSortino(state: WelfordState): number {
+  if (state.n < 3) return 0;
+  if (state.downsideN === 0) return 999;
+  const downsideVariance = state.downsideM2 / state.downsideN;
+  const downsideStd = Math.sqrt(downsideVariance);
+  if (downsideStd === 0) return 0;
+  return (state.mean / downsideStd) * Math.sqrt(365);
+}
+
+function welfordFromProfile(p: ClusterProfile): WelfordState {
+  return {
+    n: p.samples,
+    mean: p._wMean ?? 0,
+    M2: p._wM2 ?? 0,
+    downsideN: p._wDownsideN ?? 0,
+    downsideMean: p._wDownsideMean ?? 0,
+    downsideM2: p._wDownsideM2 ?? 0,
+    peak: p._wPeak ?? 0,
+    cumulative: p._wCumulative ?? 0,
+    maxDrawdown: p.maxDrawdown ?? 0,
+  };
 }
 
 // ========== SCORE FORMULAS ==========
@@ -541,7 +631,15 @@ export class AdaptiveEngine extends EventEmitter {
 
   saveState(): void {
     if (!this.dirty) return;
+    // Fire-and-forget async write — never block the event loop
+    void this._saveStateAsync();
+  }
 
+  private _saving = false;
+
+  private async _saveStateAsync(): Promise<void> {
+    if (this._saving) return; // coalesce concurrent saves
+    this._saving = true;
     try {
       const dir = path.dirname(STATE_PATH);
       if (!fs.existsSync(dir)) {
@@ -560,13 +658,16 @@ export class AdaptiveEngine extends EventEmitter {
         version: 2,
       };
 
-      fs.writeFileSync(STATE_PATH, JSON.stringify(state, null, 2));
+      // Async write — does not block the event loop during JSON serialization
+      const json = JSON.stringify(state);
+      await fs.promises.writeFile(STATE_PATH + ".tmp", json, "utf-8");
+      await fs.promises.rename(STATE_PATH + ".tmp", STATE_PATH);
       this.dirty = false;
 
-      // Backup periódico
+      // Backup periódico (async too)
       const now = Date.now();
-      if (now - this.lastBackupTime > 3600000) { // 1 hora
-        fs.writeFileSync(BACKUP_PATH, JSON.stringify(state, null, 2));
+      if (now - this.lastBackupTime > 3600000) {
+        await fs.promises.writeFile(BACKUP_PATH, json, "utf-8");
         this.lastBackupTime = now;
         console.log("[AdaptiveEngine] Backup saved");
       }
@@ -574,6 +675,8 @@ export class AdaptiveEngine extends EventEmitter {
       this.emit("saved");
     } catch (err) {
       console.error("[AdaptiveEngine] Failed to save state:", err);
+    } finally {
+      this._saving = false;
     }
   }
 
@@ -751,7 +854,7 @@ export class AdaptiveEngine extends EventEmitter {
       const priorityScore = computePriorityScore(winRate, realizedCapture, slHitRate, profitFactor);
       const toxicityScore = computeToxicityScore(winRate, realizedCapture, slHitRate, profitFactor);
 
-      const clusterReturns = [realPnl];
+      const wf = welfordInitial(realPnl);
 
       this.clusterProfiles.set(keyStr, {
         key: { symbol: outcome.symbol, positionSide: outcome.positionSide, hourUtc: outcome.hourUtc, btcRegime: outcome.btcRegime },
@@ -777,9 +880,16 @@ export class AdaptiveEngine extends EventEmitter {
         ewmaSlippage: slippage,
         realEv: outcome.realizedPnl - slippage,
         lastUpdated: Date.now(),
-        sharpeRatio: calculateSharpeRatio(clusterReturns),
-        sortinoRatio: calculateSortinoRatio(clusterReturns),
-        maxDrawdown: calculateMaxDrawdown(clusterReturns),
+        sharpeRatio: welfordSharpe(wf),
+        sortinoRatio: welfordSortino(wf),
+        maxDrawdown: wf.maxDrawdown,
+        _wMean: wf.mean,
+        _wM2: wf.M2,
+        _wDownsideN: wf.downsideN,
+        _wDownsideMean: wf.downsideMean,
+        _wDownsideM2: wf.downsideM2,
+        _wPeak: wf.peak,
+        _wCumulative: wf.cumulative,
       });
       return;
     }
@@ -818,15 +928,9 @@ export class AdaptiveEngine extends EventEmitter {
     const priorityScore = computePriorityScore(winRate, realizedCapture, slHitRate, profitFactor);
     const toxicityScore = computeToxicityScore(winRate, realizedCapture, slHitRate, profitFactor);
 
-    // Coleta returns para métricas
-    const clusterReturns = this.outcomes
-      .filter(o => clusterKeyStr({
-        symbol: o.symbol,
-        positionSide: o.positionSide,
-        hourUtc: o.hourUtc,
-        btcRegime: o.btcRegime,
-      }) === keyStr)
-      .map(o => o.realizedPnl);
+    // O(1) incremental Welford update — no array scan needed
+    const prevWf = welfordFromProfile(existing);
+    const wf = prevWf.n > 0 ? welfordUpdate(prevWf, realPnl) : welfordInitial(realPnl);
 
     this.clusterProfiles.set(keyStr, {
       ...existing,
@@ -852,9 +956,16 @@ export class AdaptiveEngine extends EventEmitter {
       ewmaSlippage,
       realEv,
       lastUpdated: Date.now(),
-      sharpeRatio: calculateSharpeRatio(clusterReturns),
-      sortinoRatio: calculateSortinoRatio(clusterReturns),
-      maxDrawdown: calculateMaxDrawdown(clusterReturns),
+      sharpeRatio: welfordSharpe(wf),
+      sortinoRatio: welfordSortino(wf),
+      maxDrawdown: wf.maxDrawdown,
+      _wMean: wf.mean,
+      _wM2: wf.M2,
+      _wDownsideN: wf.downsideN,
+      _wDownsideMean: wf.downsideMean,
+      _wDownsideM2: wf.downsideM2,
+      _wPeak: wf.peak,
+      _wCumulative: wf.cumulative,
     });
   }
 
@@ -881,8 +992,10 @@ export class AdaptiveEngine extends EventEmitter {
     const hourPnl = this.hourProfile();
     const sortedByPnl = hourPnl.filter((h) => h.samples >= 2).sort((a, b) => b.pnl - a.pnl);
 
-    // Coleta returns para métricas
-    const symbolReturns = this.outcomes.filter(o => o.symbol === symbol).map(o => o.realizedPnl);
+    // Aggregate Welford state from all cluster profiles — O(clusters), not O(outcomes)
+    const symSharpe = w((p) => p.sharpeRatio ?? 0);
+    const symSortino = w((p) => p.sortinoRatio ?? 0);
+    const symMaxDrawdown = Math.max(...relevant.map((p) => p.maxDrawdown ?? 0));
 
     this.symbolProfiles.set(symbolKeyStr(symbol), {
       symbol,
@@ -900,9 +1013,9 @@ export class AdaptiveEngine extends EventEmitter {
       worstHour: sortedByPnl[sortedByPnl.length - 1]?.hour ?? null,
       priorityScore,
       toxicityScore,
-      sharpeRatio: calculateSharpeRatio(symbolReturns),
-      sortinoRatio: calculateSortinoRatio(symbolReturns),
-      maxDrawdown: calculateMaxDrawdown(symbolReturns),
+      sharpeRatio: symSharpe,
+      sortinoRatio: symSortino,
+      maxDrawdown: symMaxDrawdown,
     });
   }
 

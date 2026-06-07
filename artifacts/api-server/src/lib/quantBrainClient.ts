@@ -59,6 +59,17 @@ const intelligenceEdgeCache = new Map<string, { value: QuantBrainEdgeResult; exp
 const intelligenceEdgeInflight = new Map<string, Promise<QuantBrainEdgeResult>>();
 const sidecarCache = new Map<string, { value: unknown; expiresAt: number; staleUntil: number }>();
 
+// Max entries per unbounded Map — evict oldest when exceeded to prevent memory leak
+const MAX_CACHE_ENTRIES = 500;
+
+function evictOldest<V extends { expiresAt: number }>(map: Map<string, V>): void {
+  if (map.size <= MAX_CACHE_ENTRIES) return;
+  // Sort by expiresAt ascending and delete the oldest third
+  const sorted = Array.from(map.entries()).sort((a, b) => a[1].expiresAt - b[1].expiresAt);
+  const toDelete = Math.ceil(sorted.length / 3);
+  for (let i = 0; i < toDelete; i++) map.delete(sorted[i][0]);
+}
+
 function quantBrainUrl(): string | null {
   const raw = process.env["QUANT_BRAIN_URL"]?.trim();
   return raw ? raw.replace(/\/+$/, "") : null;
@@ -198,6 +209,7 @@ async function getCachedJson<T>(
 
   try {
     const value = await getJson<T>(path, timeoutMs);
+    evictOldest(sidecarCache);
     sidecarCache.set(key, {
       value,
       expiresAt: now + INTELLIGENCE_SIDECAR_CACHE_TTL_MS,
@@ -237,6 +249,7 @@ async function getCachedIntelligenceEdge(input: QuantBrainEdgeInput): Promise<Qu
 
   const request = postJson<QuantBrainEdgeResult>("/edge/evaluate", input, INTELLIGENCE_TIMEOUT_MS)
     .then((value) => {
+      evictOldest(intelligenceEdgeCache);
       intelligenceEdgeCache.set(cacheKey, {
         value,
         expiresAt: Date.now() + INTELLIGENCE_EDGE_CACHE_TTL_MS,
@@ -303,6 +316,7 @@ export async function getQuantBrainRecentTrades(
   try {
     const params = new URLSearchParams({ source, limit: String(safeLimit) });
     const value = await getJson<TradeOutcome[]>(`/kb/trades/recent?${params.toString()}`, SUMMARY_TIMEOUT_MS);
+    evictOldest(recentTradesCache);
     recentTradesCache.set(cacheKey, { value, expiresAt: now + SUMMARY_CACHE_TTL_MS });
     return value;
   } catch {
@@ -330,9 +344,8 @@ export async function syncQuantBrainOutcome(
 async function flushPendingQuantBrainOutcomes(): Promise<void> {
   if (!quantBrainEnabled() || pendingOutcomes.size === 0) return;
   const batch = Array.from(pendingOutcomes.values()).slice(0, OUTCOME_SYNC_BATCH_SIZE);
-  for (const outcome of batch) {
-    await syncQuantBrainOutcome(outcome);
-  }
+  // Parallel flush — never wait 30s × N sequentially when QB is slow/down
+  await Promise.allSettled(batch.map((outcome) => syncQuantBrainOutcome(outcome)));
 }
 
 export function startQuantBrainOutcomeSync(initialOutcomes: TradeOutcome[] = []): void {

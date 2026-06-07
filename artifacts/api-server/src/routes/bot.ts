@@ -51,6 +51,8 @@ function sign(params: Record<string, string | number | undefined>, secretKey: st
   return createHmac("sha256", secretKey).update(query).digest("hex");
 }
 
+const BINGX_REQUEST_TIMEOUT_MS = Number(process.env["BINGX_REQUEST_TIMEOUT_MS"] ?? 8_000);
+
 async function bingxPost(
   path: string,
   params: Record<string, string | number | undefined>,
@@ -68,6 +70,7 @@ async function bingxPost(
   const res = await fetch(url, {
     method: "POST",
     headers: { "X-BX-APIKEY": apiKey },
+    signal: AbortSignal.timeout(BINGX_REQUEST_TIMEOUT_MS),
   });
   return res.json() as Promise<Record<string, unknown>>;
 }
@@ -86,7 +89,10 @@ async function bingxGet(
     .map(([k, v]) => `${k}=${encodeURIComponent(String(v))}`)
     .join("&");
   const url = `${BINGX_BASE}${path}?${qs}&signature=${signature}`;
-  const res = await fetch(url, { headers: { "X-BX-APIKEY": apiKey } });
+  const res = await fetch(url, {
+    headers: { "X-BX-APIKEY": apiKey },
+    signal: AbortSignal.timeout(BINGX_REQUEST_TIMEOUT_MS),
+  });
   return res.json() as Promise<Record<string, unknown>>;
 }
 
