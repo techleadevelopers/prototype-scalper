@@ -108,6 +108,252 @@ function getCredentials(req: Request): { apiKey: string; secretKey: string } | n
   return { apiKey: bingxApiKey, secretKey: bingxSecretKey };
 }
 
+// ── Capital Context — shared across bulk/autopilot cycles ─────────────────────
+// Pre-fetch once per cycle to avoid N×2 BingX calls in mass execution paths.
+
+interface CapitalContext {
+  openPositions: Record<string, unknown>[];
+  openPositionsCount: number;
+  marginUtilization: number;
+  equity: number;
+  // counts[symbol][side] = number of open positions on that side
+  countsBySide: Map<string, { LONG: number; SHORT: number }>;
+  fetchedAt: number;
+}
+
+async function fetchCapitalContext(
+  creds: { apiKey: string; secretKey: string },
+): Promise<CapitalContext> {
+  const [posData, balData] = await Promise.all([
+    bingxGet("/openApi/swap/v2/user/positions", {}, creds.apiKey, creds.secretKey).catch(() => null),
+    bingxGet("/openApi/swap/v2/user/balance", {}, creds.apiKey, creds.secretKey).catch(() => null),
+  ]);
+
+  let openPositions: Record<string, unknown>[] = [];
+  let equity = 1;
+  let usedMargin = 0;
+
+  if (posData?.code === 0) {
+    openPositions = ((posData.data as unknown[]) ?? []) as Record<string, unknown>[];
+    openPositions = openPositions.filter((p) => parseFloat(String(p.positionAmt ?? "0")) !== 0);
+  }
+  if (balData?.code === 0) {
+    const bal = ((balData.data as Record<string, unknown>)?.balance ?? {}) as Record<string, string>;
+    usedMargin = parseFloat(bal.usedMargin ?? "0");
+    equity = parseFloat(bal.equity ?? "1") || 1;
+  }
+
+  const countsBySide = new Map<string, { LONG: number; SHORT: number }>();
+  for (const p of openPositions) {
+    const sym = String(p.symbol ?? "").toUpperCase();
+    const side = String(p.positionSide ?? "").toUpperCase() as "LONG" | "SHORT";
+    if (!countsBySide.has(sym)) countsBySide.set(sym, { LONG: 0, SHORT: 0 });
+    const entry = countsBySide.get(sym)!;
+    if (side === "LONG") entry.LONG++;
+    else if (side === "SHORT") entry.SHORT++;
+  }
+
+  return {
+    openPositions,
+    openPositionsCount: openPositions.length,
+    marginUtilization: equity > 0 ? usedMargin / equity : 0,
+    equity,
+    countsBySide,
+    fetchedAt: Date.now(),
+  };
+}
+
+// ── Sniper Autopilot — server-side autonomous execution loop ──────────────────
+
+interface AutopilotCycleSummary {
+  cycle: number;
+  startedAt: number;
+  durationMs: number;
+  candidates: number;
+  attempted: number;
+  placed: number;
+  rejected: number;
+  btcChangePct: number;
+}
+
+interface AutopilotState {
+  running: boolean;
+  startedAt: number | null;
+  creds: { apiKey: string; secretKey: string } | null;
+  handle: NodeJS.Timeout | null;
+  totalCycles: number;
+  totalPlaced: number;
+  sessionLossUsd: number;
+  lastCycle: AutopilotCycleSummary | null;
+  history: AutopilotCycleSummary[];
+  stopReason: string | null;
+}
+
+const autopilot: AutopilotState = {
+  running: false,
+  startedAt: null,
+  creds: null,
+  handle: null,
+  totalCycles: 0,
+  totalPlaced: 0,
+  sessionLossUsd: 0,
+  lastCycle: null,
+  history: [],
+  stopReason: null,
+};
+
+function stopAutopilot(reason: string): void {
+  if (autopilot.handle) {
+    clearInterval(autopilot.handle);
+    autopilot.handle = null;
+  }
+  autopilot.running = false;
+  autopilot.creds = null;
+  autopilot.stopReason = reason;
+}
+
+async function runAutopilotCycle(): Promise<void> {
+  if (!autopilot.running || !autopilot.creds) return;
+
+  const config = getBotConfig();
+  const engine = getEngine();
+  const t0 = Date.now();
+  const cycleNum = ++autopilot.totalCycles;
+
+  // Fetch BTC regime + capital in parallel
+  let btcChangePct = 0;
+  const btcUrl = `${BINGX_PUBLIC_BASE}/openApi/swap/v2/quote/ticker?symbol=BTC-USDT&timestamp=${Date.now()}`;
+  const [btcResp, capitalCtx] = await Promise.all([
+    fetch(btcUrl, { signal: AbortSignal.timeout(3000) })
+      .then((r) => r.json() as Promise<Record<string, unknown>>)
+      .catch(() => null),
+    fetchCapitalContext(autopilot.creds).catch(() => null),
+  ]);
+
+  if (btcResp?.code === 0) {
+    const d = (btcResp.data as Record<string, string>) ?? {};
+    btcChangePct = parseFloat(d.priceChangePercent ?? "0");
+  }
+
+  if (!capitalCtx) {
+    return; // Skip cycle — cannot verify capital
+  }
+
+  // Session loss circuit-breaker
+  if (config.maxSessionLoss > 0 && autopilot.sessionLossUsd >= config.maxSessionLoss) {
+    stopAutopilot(`SESSION_LOSS_LIMIT: ${autopilot.sessionLossUsd.toFixed(2)} USD >= ${config.maxSessionLoss} USD`);
+    return;
+  }
+
+  // No room for more positions
+  if (capitalCtx.openPositionsCount >= config.maxConcurrentPositions) return;
+  if (capitalCtx.marginUtilization > config.maxMarginUtilization) return;
+
+  const symbols = config.allowedSymbols;
+  if (symbols.length === 0) return;
+
+  const btcRegime: import("../lib/adaptiveEngine").BtcRegime =
+    btcChangePct >= config.btcRegimeThresholdPct ? "BULL" :
+    btcChangePct <= -config.btcRegimeThresholdPct ? "BEAR" : "NEUTRAL";
+  const hourUtc = new Date().getUTCHours();
+
+  if (config.hourBlacklist.includes(hourUtc)) return;
+
+  // Fetch candle edges for all symbols in parallel
+  const candleEdges = await computeAllCandleEdges(symbols, "5m").catch(() =>
+    symbols.map((sym) => ({ symbol: sym, longScore: 0, shortScore: 0, error: "fetch failed" }))
+  );
+
+  // Score candidates
+  const candidates: Array<{
+    symbol: string;
+    side: "BUY" | "SELL";
+    positionSide: "LONG" | "SHORT";
+    combinedScore: number;
+    currentEv: number;
+    btcChangePct: number;
+  }> = [];
+
+  for (let i = 0; i < symbols.length; i++) {
+    const sym = symbols[i];
+    const candle = (candleEdges[i] as { longScore?: number; shortScore?: number; error?: string | null } | undefined);
+    if (!candle || (candle as { error?: string | null }).error) continue;
+
+    for (const ps of ["LONG", "SHORT"] as const) {
+      const clusterKey = { symbol: sym, positionSide: ps, hourUtc, btcRegime };
+      const combined = engine.combinedEdgeScore(
+        clusterKey,
+        engine.clusterProfile(clusterKey)?.ev ?? engine.symbolProfile(sym)?.ev ?? 0,
+        ps === "LONG" ? (candle.longScore ?? 0) : (candle.shortScore ?? 0),
+      );
+
+      if (combined < config.sniperMinCombinedScore) continue;
+
+      // Check position stacking limit
+      const symCounts = capitalCtx.countsBySide.get(sym) ?? { LONG: 0, SHORT: 0 };
+      const currentCount = symCounts[ps];
+      const limit = config.positionStackingEnabled ? config.maxPositionsPerSymbol : 1;
+      if (currentCount >= limit) continue;
+
+      // Check hedging constraint
+      const oppSide = ps === "LONG" ? "SHORT" : "LONG";
+      if (config.preventHedgedPositions && symCounts[oppSide] > 0) continue;
+
+      const profile = engine.symbolProfile(sym);
+      if (profile?.isToxic) continue;
+
+      candidates.push({
+        symbol: sym,
+        side: ps === "LONG" ? "BUY" : "SELL",
+        positionSide: ps,
+        combinedScore: combined,
+        currentEv: engine.clusterProfile(clusterKey)?.ev ?? 0,
+        btcChangePct,
+      });
+    }
+  }
+
+  // Sort by score, take top N
+  candidates.sort((a, b) => b.combinedScore - a.combinedScore);
+  const toFire = candidates.slice(0, config.sniperMaxCandidatesPerCycle);
+
+  // Respect max concurrent positions headroom
+  const headroom = config.maxConcurrentPositions - capitalCtx.openPositionsCount;
+  const firing = toFire.slice(0, Math.max(0, headroom));
+
+  let placed = 0;
+  let rejected = 0;
+
+  for (const c of firing) {
+    const result = await executeSingleOrder(
+      { symbol: c.symbol, side: c.side, positionSide: c.positionSide, currentEv: c.currentEv, btcChangePct: c.btcChangePct },
+      0,
+      autopilot.creds!,
+      config,
+      [],
+      capitalCtx,
+    );
+    if (result.placed) placed++;
+    else rejected++;
+  }
+
+  autopilot.totalPlaced += placed;
+
+  const summary: AutopilotCycleSummary = {
+    cycle: cycleNum,
+    startedAt: t0,
+    durationMs: Date.now() - t0,
+    candidates: candidates.length,
+    attempted: firing.length,
+    placed,
+    rejected,
+    btcChangePct,
+  };
+  autopilot.lastCycle = summary;
+  autopilot.history.push(summary);
+  if (autopilot.history.length > 100) autopilot.history.shift();
+}
+
 /** GET /api/bot/config — current bot configuration from ENV */
 router.get("/bot/config", (_req: Request, res: Response) => {
   res.json(getBotConfig());
@@ -121,6 +367,9 @@ router.patch("/bot/config/override", (req: Request, res: Response) => {
     "takeProfitPct", "stopLossPct", "evMinThreshold", "winRateMin", "profitFactorMin",
     "btcRegimeRequired", "allowCounterRegimeScalp", "btcRegimeThresholdPct", "allowedSymbols", "hourBlacklist",
     "orderType", "marginType", "allowExecution", "maxSessionLoss",
+    "maxPositionsPerSymbol", "positionStackingEnabled",
+    "sniperAutopilotIntervalSec", "sniperMaxCandidatesPerCycle", "sniperMinCombinedScore",
+    "preventHedgedPositions",
   ];
   const safe: Record<string, unknown> = {};
   for (const key of allowed) {
@@ -316,12 +565,37 @@ router.post("/bot/order", async (req: Request, res: Response) => {
       `CAPITAL_REJECT: ${openPositionsCount} open positions >= max ${config.maxConcurrentPositions}`,
     );
   }
-  if (
-    config.preventHedgedPositions
-    && openPositions.some((position) => String(position.symbol ?? "").toUpperCase() === symbol.toUpperCase())
-  ) {
-    gateRejects.push(`POSITION_CONFLICT_REJECT: ${symbol} already has an open position`);
+
+  // Position stacking / hedging gate
+  {
+    const symUpper = symbol.toUpperCase();
+    const symPositions = openPositions.filter(
+      (p) => String(p.symbol ?? "").toUpperCase() === symUpper,
+    );
+    // Count per side
+    const sameSideCount = symPositions.filter(
+      (p) => String(p.positionSide ?? "").toUpperCase() === positionSide,
+    ).length;
+    const oppSideCount = symPositions.filter(
+      (p) => String(p.positionSide ?? "").toUpperCase() !== positionSide,
+    ).length;
+
+    // Hedging block: existing opposite position
+    if (config.preventHedgedPositions && oppSideCount > 0) {
+      gateRejects.push(
+        `HEDGE_REJECT: ${symbol} already has ${oppSideCount} open ${positionSide === "LONG" ? "SHORT" : "LONG"} position(s)`,
+      );
+    }
+
+    // Stacking limit
+    const stackLimit = config.positionStackingEnabled ? config.maxPositionsPerSymbol : 1;
+    if (sameSideCount >= stackLimit) {
+      gateRejects.push(
+        `STACK_REJECT: ${symbol} ${positionSide} already has ${sameSideCount}/${stackLimit} position(s)`,
+      );
+    }
   }
+
   if (marginUtilization > config.maxMarginUtilization) {
     gateRejects.push(
       `MARGIN_REJECT: margin utilization ${(marginUtilization * 100).toFixed(1)}% > max ${(config.maxMarginUtilization * 100).toFixed(0)}%`,
@@ -1109,6 +1383,13 @@ router.post("/bot/mode/reset", (_req: Request, res: Response) => {
 });
 
 // ── Shared order executor (gate checks + BingX call) ─────────────────────────
+// capitalCtx — optional pre-fetched capital snapshot for mass/bulk execution.
+// If provided, skips the per-order positions+balance fetch (big latency win).
+
+const QB_SNIPER_TIMEOUT_MS = Math.max(
+  400,
+  Number(process.env["QB_SNIPER_TIMEOUT_MS"] ?? 600),
+);
 
 async function executeSingleOrder(
   item: BulkOrderItem,
@@ -1116,6 +1397,7 @@ async function executeSingleOrder(
   creds: { apiKey: string; secretKey: string },
   config: ReturnType<typeof getBotConfig>,
   preGateRejects: string[] = [],
+  capitalCtx?: CapitalContext,
 ): Promise<BulkOrderResult> {
   const t0 = Date.now();
   const { symbol, side, positionSide, btcChangePct } = item;
@@ -1145,45 +1427,72 @@ async function executeSingleOrder(
   }
 
   const feeDragReject = feeDragRejectReason(item.currentEv, config.marginPerTrade, config);
-  if (feeDragReject) {
-    gateRejects.push(feeDragReject);
+  if (feeDragReject) gateRejects.push(feeDragReject);
+
+  // ── Capital gate (use pre-fetched context if available) ───────────────────
+  const ctx = capitalCtx ?? await fetchCapitalContext(creds).catch(() => null);
+
+  if (ctx) {
+    if (ctx.openPositionsCount >= config.maxConcurrentPositions) {
+      gateRejects.push(`CAPITAL_REJECT: ${ctx.openPositionsCount} positions >= max ${config.maxConcurrentPositions}`);
+    }
+    if (ctx.marginUtilization > config.maxMarginUtilization) {
+      gateRejects.push(`MARGIN_REJECT: ${(ctx.marginUtilization * 100).toFixed(1)}% > max ${(config.maxMarginUtilization * 100).toFixed(0)}%`);
+    }
+    // Stacking / hedging
+    const symUpper = symbol.toUpperCase();
+    const counts = ctx.countsBySide.get(symUpper) ?? { LONG: 0, SHORT: 0 };
+    const sameSide = counts[positionSide];
+    const oppSide = counts[positionSide === "LONG" ? "SHORT" : "LONG"];
+    if (config.preventHedgedPositions && oppSide > 0) {
+      gateRejects.push(`HEDGE_REJECT: ${symbol} has ${oppSide} open ${positionSide === "LONG" ? "SHORT" : "LONG"} position(s)`);
+    }
+    const stackLimit = config.positionStackingEnabled ? config.maxPositionsPerSymbol : 1;
+    if (sameSide >= stackLimit) {
+      gateRejects.push(`STACK_REJECT: ${symbol} ${positionSide} at limit ${sameSide}/${stackLimit}`);
+    }
   }
 
-  // QB edge gate (shadow: log, enforce: block) — fire-and-forget in shadow to avoid bulk latency
+  // ── QB gate — hard 600ms cap so sniper is never held hostage ──────────────
   const qbMode = quantBrainGateMode();
   if (qbMode === "enforce") {
     try {
-      const sentiment = await getMarketSentiment(symbol).catch(() => null);
-      const qbResult = await evaluateQuantBrainEdge({
-        symbol, side, positionSide, hourUtc: currentHour,
-        btcChangePct, currentEv: item.currentEv, config,
-        sentimentContext: sentiment ? {
-          direction: sentiment.direction, confidence: sentiment.confidence,
-          biasRatio: sentiment.biasRatio, dominantSide: sentiment.dominantSide,
-          vwapDeviation: sentiment.indicators.vwapDeviation,
-          volumeDelta: sentiment.indicators.volumeDelta,
-          momentum24h: sentiment.indicators.momentum24h,
-        } : undefined,
-      });
+      const [sentiment, qbResult] = await Promise.all([
+        getMarketSentiment(symbol).catch(() => null),
+        Promise.race([
+          evaluateQuantBrainEdge({
+            symbol, side, positionSide, hourUtc: currentHour,
+            btcChangePct, currentEv: item.currentEv, config,
+          }),
+          new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error("QB_TIMEOUT")), QB_SNIPER_TIMEOUT_MS),
+          ),
+        ]),
+      ]);
+      void sentiment; // used only for QB enrichment below if needed
       if (!qbResult.allow) {
         gateRejects.push(...qbResult.gateRejects.map((r) => `QB_${r}`));
       }
-    } catch { /* QB errors never block bulk */ }
+    } catch {
+      // QB timeout or error: NEVER block — sniper fires on local edge
+    }
   } else {
-    // Shadow: non-blocking — evaluate in background for logging
-    getMarketSentiment(symbol).catch(() => null).then((sentiment) =>
-      evaluateQuantBrainEdge({
-        symbol, side, positionSide, hourUtc: currentHour,
-        btcChangePct, currentEv: item.currentEv, config,
-        sentimentContext: sentiment ? {
-          direction: sentiment.direction, confidence: sentiment.confidence,
-          biasRatio: sentiment.biasRatio, dominantSide: sentiment.dominantSide,
-          vwapDeviation: sentiment.indicators.vwapDeviation,
-          volumeDelta: sentiment.indicators.volumeDelta,
-          momentum24h: sentiment.indicators.momentum24h,
-        } : undefined,
-      })
-    ).catch(() => {});
+    // Shadow: fire-and-forget — never waits
+    Promise.resolve().then(() =>
+      getMarketSentiment(symbol).catch(() => null).then((sentiment) =>
+        evaluateQuantBrainEdge({
+          symbol, side, positionSide, hourUtc: currentHour,
+          btcChangePct, currentEv: item.currentEv, config,
+          sentimentContext: sentiment ? {
+            direction: sentiment.direction, confidence: sentiment.confidence,
+            biasRatio: sentiment.biasRatio, dominantSide: sentiment.dominantSide,
+            vwapDeviation: sentiment.indicators.vwapDeviation,
+            volumeDelta: sentiment.indicators.volumeDelta,
+            momentum24h: sentiment.indicators.momentum24h,
+          } : undefined,
+        }).catch(() => {})
+      )
+    );
   }
 
   // Observation mode short-circuit
@@ -1208,12 +1517,12 @@ async function executeSingleOrder(
     };
   }
 
-  // Compute qty from mark price
+  // Compute qty from mark price (use pre-fetched price hint if available via item)
   let qty = item.quantity;
   if (!qty) {
     try {
       const url = `${BINGX_BASE}/openApi/swap/v2/quote/ticker?symbol=${encodeURIComponent(symbol)}&timestamp=${Date.now()}`;
-      const json = (await (await fetch(url)).json()) as Record<string, unknown>;
+      const json = (await (await fetch(url, { signal: AbortSignal.timeout(3000) })).json()) as Record<string, unknown>;
       if (json.code === 0) {
         const d = (json.data as Record<string, string>) ?? {};
         const markPrice = parseFloat(d.lastPrice ?? "0");
@@ -1226,8 +1535,7 @@ async function executeSingleOrder(
     return {
       index, symbol, side, placed: false, orderId: null,
       quantity: null, gateRejects: ["QTY_REJECT: could not compute quantity"],
-      observationMode: false,
-      message: "Could not determine order quantity.",
+      observationMode: false, message: "Could not determine order quantity.",
       durationMs: Date.now() - t0,
     };
   }
@@ -1264,6 +1572,195 @@ async function executeSingleOrder(
   }
 }
 
+// ── Sniper: Mass execution endpoint ──────────────────────────────────────────
+
+/**
+ * POST /api/bot/sniper/mass
+ *
+ * Takes pre-scored scan candidates and fires them all in one low-latency
+ * burst. Key optimization: capital (positions + balance) is fetched once
+ * and shared across all orders — avoids N×2 BingX calls.
+ *
+ * Body: { candidates: Array<{ symbol, positionSide, combinedScore?, currentEv?, btcChangePct? }>, ordersPerSecond? }
+ */
+router.post("/bot/sniper/mass", async (req: Request, res: Response) => {
+  const creds = getCredentials(req);
+  if (!creds) { res.status(401).json({ error: "Not connected." }); return; }
+
+  const { candidates, ordersPerSecond = 10 } = req.body as {
+    candidates: Array<{
+      symbol: string;
+      positionSide: "LONG" | "SHORT";
+      combinedScore?: number;
+      currentEv?: number;
+      btcChangePct?: number;
+    }>;
+    ordersPerSecond?: number;
+  };
+
+  if (!Array.isArray(candidates) || candidates.length === 0) {
+    res.status(400).json({ error: "candidates must be a non-empty array" });
+    return;
+  }
+  if (candidates.length > 30) {
+    res.status(400).json({ error: "Max 30 candidates per mass request" });
+    return;
+  }
+
+  const config = getBotConfig();
+  const t0 = Date.now();
+
+  // Pre-fetch capital once for ALL orders
+  const capitalCtx = await fetchCapitalContext(creds).catch(() => null);
+
+  const rps = Math.min(Math.max(1, ordersPerSecond), 10);
+  const bucket = new TokenBucket(rps, rps);
+
+  // Sort by combinedScore descending; filter by sniperMinCombinedScore
+  const sorted = candidates
+    .filter((c) => (c.combinedScore ?? 1) >= config.sniperMinCombinedScore)
+    .sort((a, b) => (b.combinedScore ?? 0) - (a.combinedScore ?? 0));
+
+  // Headroom check
+  const currentOpen = capitalCtx?.openPositionsCount ?? 0;
+  const headroom = config.maxConcurrentPositions - currentOpen;
+  const toFire = sorted.slice(0, Math.max(0, headroom));
+
+  const results: BulkOrderResult[] = [];
+  const correlationRejects = buildBulkCorrelationRejects(
+    toFire.map((c) => ({
+      symbol: c.symbol,
+      side: c.positionSide === "LONG" ? "BUY" as const : "SELL" as const,
+      positionSide: c.positionSide,
+      btcChangePct: c.btcChangePct,
+    })),
+    maxCorrelatedBulkOrders(),
+  );
+
+  for (let i = 0; i < toFire.length; i++) {
+    await bucket.consume();
+    const c = toFire[i];
+    const result = await executeSingleOrder(
+      {
+        symbol: c.symbol,
+        side: c.positionSide === "LONG" ? "BUY" : "SELL",
+        positionSide: c.positionSide,
+        currentEv: c.currentEv,
+        btcChangePct: c.btcChangePct,
+      },
+      i,
+      creds,
+      config,
+      correlationRejects.get(i) ?? [],
+      capitalCtx ?? undefined,
+    );
+    results.push(result);
+  }
+
+  const placed = results.filter((r) => r.placed).length;
+  req.log.info({
+    total: candidates.length,
+    filtered: sorted.length,
+    headroom,
+    attempted: toFire.length,
+    placed,
+    durationMs: Date.now() - t0,
+  }, "sniper/mass execution complete");
+
+  res.json({
+    total: candidates.length,
+    filtered: sorted.length,
+    attempted: toFire.length,
+    placed,
+    rejected: toFire.length - placed,
+    skippedNoHeadroom: sorted.length - toFire.length,
+    skippedBelowScore: candidates.length - sorted.length,
+    durationMs: Date.now() - t0,
+    capitalSnapshot: capitalCtx ? {
+      openPositions: capitalCtx.openPositionsCount,
+      marginUtilization: parseFloat((capitalCtx.marginUtilization * 100).toFixed(1)),
+      equity: capitalCtx.equity,
+    } : null,
+    results,
+  });
+});
+
+// ── Sniper: Autopilot endpoints ───────────────────────────────────────────────
+
+/** POST /api/bot/sniper/autopilot/start — begin server-side autonomous scalp loop */
+router.post("/bot/sniper/autopilot/start", (req: Request, res: Response) => {
+  const creds = getCredentials(req);
+  if (!creds) { res.status(401).json({ error: "Not connected." }); return; }
+
+  if (autopilot.running) {
+    res.json({ started: false, reason: "Autopilot already running", state: { ...autopilot, handle: null, creds: null } });
+    return;
+  }
+
+  const config = getBotConfig();
+  const intervalMs = config.sniperAutopilotIntervalSec * 1000;
+
+  autopilot.running = true;
+  autopilot.startedAt = Date.now();
+  autopilot.creds = { ...creds };
+  autopilot.totalCycles = 0;
+  autopilot.totalPlaced = 0;
+  autopilot.sessionLossUsd = 0;
+  autopilot.lastCycle = null;
+  autopilot.history = [];
+  autopilot.stopReason = null;
+
+  // First cycle fires immediately, then on interval
+  runAutopilotCycle().catch((err) => req.log.warn({ err }, "autopilot cycle error"));
+  autopilot.handle = setInterval(() => {
+    runAutopilotCycle().catch(() => {});
+  }, intervalMs);
+
+  req.log.info({ intervalMs, sniperMinCombinedScore: config.sniperMinCombinedScore, maxCandidates: config.sniperMaxCandidatesPerCycle }, "sniper autopilot started");
+  res.json({
+    started: true,
+    intervalMs,
+    sniperMinCombinedScore: config.sniperMinCombinedScore,
+    sniperMaxCandidatesPerCycle: config.sniperMaxCandidatesPerCycle,
+    positionStackingEnabled: config.positionStackingEnabled,
+    maxPositionsPerSymbol: config.maxPositionsPerSymbol,
+  });
+});
+
+/** POST /api/bot/sniper/autopilot/stop — halt the autonomous loop */
+router.post("/bot/sniper/autopilot/stop", (req: Request, res: Response) => {
+  if (!autopilot.running) {
+    res.json({ stopped: false, reason: "Autopilot was not running" });
+    return;
+  }
+  stopAutopilot("MANUAL_STOP");
+  req.log.info({ totalCycles: autopilot.totalCycles, totalPlaced: autopilot.totalPlaced }, "sniper autopilot stopped");
+  res.json({ stopped: true, totalCycles: autopilot.totalCycles, totalPlaced: autopilot.totalPlaced });
+});
+
+/** GET /api/bot/sniper/autopilot/status — current autopilot state and cycle history */
+router.get("/bot/sniper/autopilot/status", (_req: Request, res: Response) => {
+  const config = getBotConfig();
+  res.json({
+    running: autopilot.running,
+    startedAt: autopilot.startedAt,
+    uptimeMs: autopilot.startedAt ? Date.now() - autopilot.startedAt : null,
+    totalCycles: autopilot.totalCycles,
+    totalPlaced: autopilot.totalPlaced,
+    sessionLossUsd: autopilot.sessionLossUsd,
+    stopReason: autopilot.stopReason,
+    lastCycle: autopilot.lastCycle,
+    recentHistory: autopilot.history.slice(-20),
+    config: {
+      intervalSec: config.sniperAutopilotIntervalSec,
+      maxCandidatesPerCycle: config.sniperMaxCandidatesPerCycle,
+      minCombinedScore: config.sniperMinCombinedScore,
+      positionStackingEnabled: config.positionStackingEnabled,
+      maxPositionsPerSymbol: config.maxPositionsPerSymbol,
+    },
+  });
+});
+
 /** POST /api/bot/order/bulk — rate-limited bulk execution for Aggressive mode
  *
  *  Accepts up to 50 orders in one request, executes them sequentially through
@@ -1299,11 +1796,18 @@ router.post("/bot/order/bulk", async (req: Request, res: Response) => {
   const results: BulkOrderResult[] = [];
   const correlationRejects = buildBulkCorrelationRejects(orders, maxCorrelatedBulkOrders());
 
-  req.log.info({ count: orders.length, rps, activeMode, correlationRejected: correlationRejects.size }, "bulk execution started");
+  // Pre-fetch capital once — all orders share the same snapshot
+  const capitalCtx = await fetchCapitalContext(creds).catch(() => undefined);
+
+  req.log.info({
+    count: orders.length, rps, activeMode,
+    correlationRejected: correlationRejects.size,
+    openPositions: capitalCtx?.openPositionsCount ?? "unknown",
+  }, "bulk execution started");
 
   for (let i = 0; i < orders.length; i++) {
     await bucket.consume(); // respect rate limit
-    const result = await executeSingleOrder(orders[i], i, creds, config, correlationRejects.get(i) ?? []);
+    const result = await executeSingleOrder(orders[i], i, creds, config, correlationRejects.get(i) ?? [], capitalCtx);
     results.push(result);
   }
 

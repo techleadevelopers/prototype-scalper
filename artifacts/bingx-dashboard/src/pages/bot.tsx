@@ -14,6 +14,10 @@ import {
   getGetBingXSummaryQueryKey,
   getGetBotConfigQueryKey,
   getGetBotModesQueryKey,
+  useGetSniperAutopilotStatus,
+  useStartSniperAutopilot,
+  useStopSniperAutopilot,
+  getSniperAutopilotStatusQueryKey,
 } from "@/api-client";
 import AppShell from "@/components/app-shell";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -27,6 +31,7 @@ import {
   Bot, ShieldCheck, ShieldOff, Zap, Target, DollarSign,
   Clock, AlertTriangle, CheckCircle, XCircle, ChevronRight,
   SlidersHorizontal, RotateCcw, Pencil, Info, Layers, Flame, Crosshair, Binoculars,
+  Play, Square, Activity, Timer, TrendingUp,
 } from "lucide-react";
 
 function Row({ label, value, mono = false, highlight, overridden }: {
@@ -131,6 +136,40 @@ export default function BotPage() {
   const resetMutation = useResetBotConfigOverrides();
   const setModeMutation = useSetBotMode();
   const resetModeMutation = useResetBotMode();
+
+  // ── Sniper Autopilot ──────────────────────────────────────────────────────
+  const { data: autopilotStatus, refetch: refetchAutopilot } = useGetSniperAutopilotStatus({
+    query: {
+      queryKey: getSniperAutopilotStatusQueryKey(),
+      refetchInterval: (q) => (q.state.data?.running ? 3000 : 8000),
+    },
+  });
+  const startAutopilotMutation = useStartSniperAutopilot();
+  const stopAutopilotMutation = useStopSniperAutopilot();
+
+  function handleStartAutopilot() {
+    startAutopilotMutation.mutate(undefined, {
+      onSuccess: (res) => {
+        refetchAutopilot();
+        if (res.started) {
+          toast({ title: "Autopilot iniciado", description: `Ciclos a cada ${(res.intervalMs ?? 0) / 1000}s · score ≥ ${res.sniperMinCombinedScore}` });
+        } else {
+          toast({ title: "Autopilot já rodando", description: res.reason, variant: "destructive" });
+        }
+      },
+      onError: () => toast({ title: "Erro ao iniciar autopilot", variant: "destructive" }),
+    });
+  }
+
+  function handleStopAutopilot() {
+    stopAutopilotMutation.mutate(undefined, {
+      onSuccess: (res) => {
+        refetchAutopilot();
+        toast({ title: "Autopilot parado", description: `${res.totalCycles} ciclos · ${res.totalPlaced} ordens colocadas` });
+      },
+      onError: () => toast({ title: "Erro ao parar autopilot", variant: "destructive" }),
+    });
+  }
 
   // ── Override form state (pre-filled from current config) ──────────────────
   const [overrideOpen, setOverrideOpen] = useState(false);
@@ -738,6 +777,173 @@ export default function BotPage() {
                 </CardContent>
               </Card>
             </div>
+
+            {/* ── Sniper Autopilot Panel ──────────────────────────────────── */}
+            {(() => {
+              const ap = autopilotStatus;
+              const isRunning = ap?.running ?? false;
+              const isBusy = startAutopilotMutation.isPending || stopAutopilotMutation.isPending;
+
+              function fmtUptime(ms: number | null) {
+                if (!ms) return "—";
+                const s = Math.floor(ms / 1000);
+                if (s < 60) return `${s}s`;
+                const m = Math.floor(s / 60);
+                if (m < 60) return `${m}m ${s % 60}s`;
+                return `${Math.floor(m / 60)}h ${m % 60}m`;
+              }
+
+              function fmtTime(ts: number | null) {
+                if (!ts) return "—";
+                return new Date(ts).toLocaleTimeString();
+              }
+
+              return (
+                <Card className={`border-2 transition-all ${isRunning ? "border-violet-500/50 bg-violet-500/5" : "border-border/30 bg-card/20"}`}>
+                  <CardHeader className="px-4 pt-4 pb-3">
+                    <div className="flex items-center justify-between flex-wrap gap-3">
+                      <CardTitle className="text-sm font-semibold flex items-center gap-2">
+                        <Activity className={`w-4 h-4 ${isRunning ? "text-violet-400 animate-pulse" : "text-muted-foreground"}`} />
+                        Sniper Autopilot
+                        <span className="text-[10px] font-normal text-muted-foreground ml-1">
+                          — loop server-side autônomo · dispara sem esperar QB
+                        </span>
+                        {isRunning && (
+                          <span className="text-[9px] font-bold px-2 py-0.5 rounded-full bg-violet-500/20 text-violet-300 uppercase tracking-wider animate-pulse">
+                            ATIVO
+                          </span>
+                        )}
+                      </CardTitle>
+                      <div className="flex items-center gap-2">
+                        {isRunning ? (
+                          <Button
+                            size="sm"
+                            className="h-8 px-4 bg-red-600 hover:bg-red-500 text-white font-bold text-xs"
+                            onClick={handleStopAutopilot}
+                            disabled={isBusy}
+                          >
+                            <Square className="w-3 h-3 mr-1.5" />
+                            Parar Autopilot
+                          </Button>
+                        ) : (
+                          <Button
+                            size="sm"
+                            className="h-8 px-4 bg-violet-600 hover:bg-violet-500 text-white font-bold text-xs"
+                            onClick={handleStartAutopilot}
+                            disabled={isBusy || !config.allowExecution}
+                            title={!config.allowExecution ? "SCALP_ALLOW_EXECUTION=true required" : undefined}
+                          >
+                            <Play className="w-3 h-3 mr-1.5" />
+                            Iniciar Autopilot
+                          </Button>
+                        )}
+                      </div>
+                    </div>
+                    {!config.allowExecution && (
+                      <p className="text-[10px] text-orange-400/80 mt-1">
+                        <AlertTriangle className="w-3 h-3 inline mr-1" />
+                        Requer <code className="font-mono">SCALP_ALLOW_EXECUTION=true</code> para iniciar
+                      </p>
+                    )}
+                  </CardHeader>
+                  <CardContent className="px-4 pb-4">
+                    {/* Stats row */}
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4">
+                      {[
+                        { icon: <Timer className="w-3.5 h-3.5" />, label: "Uptime", value: fmtUptime(ap?.uptimeMs ?? null), color: isRunning ? "text-violet-300" : "text-muted-foreground" },
+                        { icon: <Activity className="w-3.5 h-3.5" />, label: "Ciclos", value: ap?.totalCycles ?? 0, color: "text-foreground" },
+                        { icon: <TrendingUp className="w-3.5 h-3.5" />, label: "Ordens colocadas", value: ap?.totalPlaced ?? 0, color: ap?.totalPlaced ? "text-green-400" : "text-muted-foreground" },
+                        { icon: <DollarSign className="w-3.5 h-3.5" />, label: "Loss sessão", value: ap ? `${ap.sessionLossUsd.toFixed(2)} USDT` : "—", color: (ap?.sessionLossUsd ?? 0) > 0 ? "text-red-400" : "text-muted-foreground" },
+                      ].map((stat, i) => (
+                        <div key={i} className="flex flex-col gap-1 px-3 py-2.5 rounded-lg bg-muted/15 border border-border/20">
+                          <div className="flex items-center gap-1.5 text-muted-foreground">{stat.icon}<span className="text-[10px]">{stat.label}</span></div>
+                          <span className={`text-sm font-bold font-mono ${stat.color}`}>{String(stat.value)}</span>
+                        </div>
+                      ))}
+                    </div>
+
+                    {/* Config summary */}
+                    {ap && (
+                      <div className="flex flex-wrap gap-2 mb-4">
+                        {[
+                          `Intervalo: ${ap.config.intervalSec}s`,
+                          `Candidatos/ciclo: ${ap.config.maxCandidatesPerCycle}`,
+                          `Score mínimo: ${ap.config.minCombinedScore}`,
+                          `Stacking: ${ap.config.positionStackingEnabled ? `ON (max ${ap.config.maxPositionsPerSymbol}×)` : "OFF"}`,
+                        ].map((tag, i) => (
+                          <span key={i} className="text-[10px] font-mono px-2 py-1 rounded bg-muted/20 border border-border/20 text-muted-foreground">
+                            {tag}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+
+                    {/* Stop reason */}
+                    {ap?.stopReason && !isRunning && (
+                      <div className="flex items-center gap-2 mb-4 px-3 py-2 rounded-lg bg-red-500/5 border border-red-500/20">
+                        <XCircle className="w-3.5 h-3.5 text-red-400 shrink-0" />
+                        <span className="text-[11px] text-red-300">Parado: {ap.stopReason}</span>
+                      </div>
+                    )}
+
+                    {/* Last cycle */}
+                    {ap?.lastCycle && (
+                      <div className="mb-4 px-3 py-2.5 rounded-lg bg-muted/10 border border-border/20">
+                        <p className="text-[10px] text-muted-foreground font-semibold uppercase tracking-wider mb-2">Último Ciclo #{ap.lastCycle.cycle}</p>
+                        <div className="flex flex-wrap gap-3 text-[11px]">
+                          <span className="text-muted-foreground">Início: <span className="font-mono text-foreground">{fmtTime(ap.lastCycle.startedAt)}</span></span>
+                          <span className="text-muted-foreground">Duração: <span className="font-mono text-foreground">{ap.lastCycle.durationMs}ms</span></span>
+                          <span className="text-muted-foreground">Candidatos: <span className="font-mono text-foreground">{ap.lastCycle.candidates}</span></span>
+                          <span className="text-muted-foreground">Tentadas: <span className="font-mono text-foreground">{ap.lastCycle.attempted}</span></span>
+                          <span className="text-muted-foreground">Colocadas: <span className={`font-mono font-bold ${ap.lastCycle.placed > 0 ? "text-green-400" : "text-foreground"}`}>{ap.lastCycle.placed}</span></span>
+                          <span className="text-muted-foreground">Rejeitadas: <span className="font-mono text-foreground">{ap.lastCycle.rejected}</span></span>
+                          <span className="text-muted-foreground">BTC: <span className={`font-mono ${ap.lastCycle.btcChangePct >= 0 ? "text-green-400" : "text-red-400"}`}>{ap.lastCycle.btcChangePct >= 0 ? "+" : ""}{ap.lastCycle.btcChangePct.toFixed(2)}%</span></span>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Recent history table */}
+                    {ap && ap.recentHistory.length > 0 && (
+                      <div>
+                        <p className="text-[10px] text-muted-foreground font-semibold uppercase tracking-wider mb-2">Histórico (últimos {ap.recentHistory.length} ciclos)</p>
+                        <div className="overflow-x-auto">
+                          <table className="w-full text-[10px]">
+                            <thead>
+                              <tr className="border-b border-border/20">
+                                {["#", "Hora", "ms", "Cand.", "Tent.", "Colocadas", "Rejeit.", "BTC%"].map((h) => (
+                                  <th key={h} className="text-left py-1.5 pr-3 text-muted-foreground font-semibold uppercase tracking-wider">{h}</th>
+                                ))}
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {[...ap.recentHistory].reverse().map((c) => (
+                                <tr key={c.cycle} className="border-b border-border/10 hover:bg-muted/5">
+                                  <td className="py-1.5 pr-3 font-mono text-muted-foreground">{c.cycle}</td>
+                                  <td className="py-1.5 pr-3 font-mono">{fmtTime(c.startedAt)}</td>
+                                  <td className="py-1.5 pr-3 font-mono text-muted-foreground">{c.durationMs}</td>
+                                  <td className="py-1.5 pr-3 font-mono">{c.candidates}</td>
+                                  <td className="py-1.5 pr-3 font-mono">{c.attempted}</td>
+                                  <td className={`py-1.5 pr-3 font-mono font-bold ${c.placed > 0 ? "text-green-400" : "text-muted-foreground"}`}>{c.placed}</td>
+                                  <td className="py-1.5 pr-3 font-mono text-muted-foreground">{c.rejected}</td>
+                                  <td className={`py-1.5 pr-3 font-mono ${c.btcChangePct >= 0 ? "text-green-400" : "text-red-400"}`}>{c.btcChangePct >= 0 ? "+" : ""}{c.btcChangePct.toFixed(2)}%</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+                    )}
+
+                    {!ap && (
+                      <div className="flex items-center gap-2 text-muted-foreground text-xs py-2">
+                        <Skeleton className="h-4 w-4 rounded" />
+                        <span>Carregando status...</span>
+                      </div>
+                    )}
+                  </CardContent>
+                </Card>
+              );
+            })()}
 
             {/* ENV reference */}
             <Card className="border-border/30 bg-card/20">

@@ -58,6 +58,12 @@ export const BotConfigSchema = z.object({
   attachProtectionOrders: z.boolean().default(true),
   preventHedgedPositions: z.boolean().default(true),
   quantBrainGateMode: z.enum(["shadow", "enforce", "off"]).default("shadow"),
+  // ── Mass scalping / sniper stacking ──────────────────────────────────────
+  maxPositionsPerSymbol: z.number().min(1).max(20).default(1),
+  positionStackingEnabled: z.boolean().default(false),
+  sniperAutopilotIntervalSec: z.number().min(5).max(300).default(20),
+  sniperMaxCandidatesPerCycle: z.number().min(1).max(30).default(8),
+  sniperMinCombinedScore: z.number().min(0).max(1).default(0.20),
   loadedAt: z.string(),
   hasOverrides: z.boolean(),
   activeOverrides: z.array(z.string()),
@@ -345,6 +351,11 @@ function getRawConfig(): Omit<BotConfig, "loadedAt" | "hasOverrides" | "activeOv
     attachProtectionOrders: envBool("SCALP_ATTACH_PROTECTION_ORDERS", true),
     preventHedgedPositions: envBool("SCALP_PREVENT_HEDGED_POSITIONS", true),
     quantBrainGateMode:     env("QUANT_BRAIN_GATE_MODE", "shadow") as "shadow" | "enforce" | "off",
+    maxPositionsPerSymbol:       ov("maxPositionsPerSymbol",       envNum("SCALP_MAX_POSITIONS_PER_SYMBOL", 1)),
+    positionStackingEnabled:     ov("positionStackingEnabled",     envBool("SCALP_POSITION_STACKING_ENABLED", false)),
+    sniperAutopilotIntervalSec:  ov("sniperAutopilotIntervalSec",  envNum("SCALP_AUTOPILOT_INTERVAL_SEC", 20)),
+    sniperMaxCandidatesPerCycle: ov("sniperMaxCandidatesPerCycle", envNum("SCALP_AUTOPILOT_MAX_CANDIDATES", 8)),
+    sniperMinCombinedScore:      ov("sniperMinCombinedScore",      envNum("SCALP_SNIPER_MIN_COMBINED_SCORE", 0.20)),
   };
 }
 
