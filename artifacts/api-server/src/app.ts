@@ -40,14 +40,42 @@ app.use(
     },
   }),
 );
-app.use(cors({
-  credentials: true,
-  origin: true,
-}));
+const allowedOrigins = process.env.CORS_ORIGIN
+  ? process.env.CORS_ORIGIN.split(",").map((s) => s.trim()).filter(Boolean)
+  : [];
+
+app.use(
+  cors({
+    credentials: true,
+    origin: (origin, callback) => {
+      if (!origin) return callback(null, true);
+      if (allowedOrigins.length === 0 || allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+      callback(new Error("CORS: origin not allowed"));
+    },
+  }),
+);
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-const sessionSecret = process.env.SESSION_SECRET ?? "bingx-dashboard-secret-change-me";
+const SESSION_SECRET_DEFAULT = "bingx-dashboard-secret-change-me";
+const sessionSecret = process.env.SESSION_SECRET ?? SESSION_SECRET_DEFAULT;
+
+if (isProduction && sessionSecret === SESSION_SECRET_DEFAULT) {
+  logger.error(
+    "FATAL: SESSION_SECRET env var must be set in production. " +
+    "Set a strong random secret via the Replit Secrets panel.",
+  );
+  process.exit(1);
+}
+
+if (!isProduction && sessionSecret === SESSION_SECRET_DEFAULT) {
+  logger.warn(
+    "SESSION_SECRET is using the insecure dev default. " +
+    "Set SESSION_SECRET env var before deploying to production.",
+  );
+}
 
 app.use(
   session({
