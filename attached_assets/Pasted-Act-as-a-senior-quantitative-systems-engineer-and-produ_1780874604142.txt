@@ -1,0 +1,258 @@
+Act as a senior quantitative systems engineer and production trading-platform auditor.
+
+This repository is currently a research/demo environment using VST simulated capital. Do not enable real-money execution and do not claim guaranteed profitability.
+
+PRIMARY OBJECTIVE
+
+Build and validate a high-frequency “sniper scalp” research system that:
+
+1. Trades every eligible symbol in the configured target list.
+2. Supports multiple same-direction entries per symbol while the edge remains valid.
+3. Never opens LONG and SHORT exposure simultaneously on the same symbol.
+4. Targets short-duration trades and small net profits.
+5. Learns from every positive and negative demo outcome.
+6. Measures profitability after fees, spread, slippage and simulated funding.
+7. Proves the strategy statistically in demo before any real-money activation.
+
+IMPORTANT MODELING RULE
+
+Multiple entries for the same symbol and signal are correlated. Treat them as:
+
+- individual executions for execution-quality analysis;
+- one aggregated campaign for strategy-performance analysis.
+
+Never count ten stacked BTC entries as ten independent confirmations of edge.
+
+FIRST: AUDIT THE CURRENT IMPLEMENTATION
+
+Before changing code, inspect the backend, Quant Brain, database, telemetry, ML pipeline, job scheduler and frontend.
+
+Produce a concise gap report covering:
+
+- order lifecycle;
+- demo position lifecycle;
+- realized and unrealized PnL calculation;
+- fees, spread, slippage and funding;
+- entry-to-outcome correlation;
+- stacking and exposure limits;
+- concurrency and duplicate-order risks;
+- telemetry durability;
+- ML data leakage;
+- model calibration;
+- service failure behavior;
+- circuit breakers;
+- missing tests.
+
+Do not assume features exist because configuration variables or functions exist. Trace whether each feature is actually called in the runtime path.
+
+IMPLEMENTATION REQUIREMENTS
+
+1. Canonical demo trade lifecycle
+
+Persist every entry with:
+
+- trade_id;
+- campaign_id;
+- signal_id;
+- symbol and side;
+- entry time and price;
+- quantity, margin, leverage and notional;
+- edge features at decision time;
+- model name/version and probability;
+- regime, candle and indicator snapshot;
+- expected fees and slippage;
+- TP and SL;
+- exact rejection or execution reason.
+
+On closing, persist:
+
+- exit time, price and reason;
+- gross PnL;
+- entry and exit fees;
+- slippage;
+- funding;
+- net PnL;
+- MFE and MAE;
+- holding duration;
+- hit/miss label.
+
+Outcomes must be idempotent, durable and automatically linked to the original signal.
+
+2. Intelligent stacking
+
+Allocate entries across all eligible symbols based on edge strength, liquidity, volatility, execution cost and recent performance.
+
+Use configurable score tiers, but do not blindly add positions every cycle.
+
+Additional entries require:
+
+- persistent edge;
+- same direction;
+- acceptable marginal expected value;
+- cooldown or meaningful market-state change;
+- symbol and portfolio exposure capacity;
+- no duplicate signal execution.
+
+Track aggregate exposure and risk by symbol, side and campaign.
+
+3. Intelligent fallback hierarchy
+
+Implement explicit service states:
+
+- HEALTHY;
+- DEGRADED;
+- SHADOW_ONLY;
+- PAUSED.
+
+Fallback rules:
+
+- Quant Brain unavailable: demo execution may use a deterministic conservative baseline, clearly tagged as fallback.
+- Stale market data: block new entries.
+- Missing price, candle or protection data: fail closed.
+- Database unavailable: stop new entries rather than losing telemetry.
+- Model untrained or poorly calibrated: use baseline strategy only, with reduced stacking.
+- Elevated latency or API errors: reduce cycle frequency and concurrency.
+- Repeated losses or negative rolling expectancy: pause or reduce exposure.
+
+Never silently bypass a failed risk gate.
+
+4. Strategy memory
+
+Create separate memory horizons:
+
+- short-term: recent minutes/hours for regime and execution quality;
+- tactical: rolling 4-hour performance;
+- medium-term: several days by symbol, side and regime;
+- long-term: validated historical model training data.
+
+Memory must decay appropriately. Avoid permanent penalties from old regimes.
+
+Track:
+
+- win rate;
+- net expectancy;
+- Profit Factor;
+- drawdown;
+- consecutive losses;
+- fee drag;
+- slippage;
+- calibration error;
+- performance by symbol, side, regime and score bucket.
+
+Do not allow the system to change strategy parameters from tiny samples.
+
+5. Adaptive controls
+
+Every four hours, generate a performance decision:
+
+- continue;
+- reduce stacking;
+- restrict weak symbols;
+- raise entry threshold;
+- pause a direction or regime;
+- pause all new entries.
+
+Adaptation must use minimum sample sizes, confidence bounds and out-of-sample evidence. Never optimize only against the latest four-hour window.
+
+6. ML integrity
+
+Ensure:
+
+- chronological train/validation/test separation;
+- walk-forward validation;
+- no future-data leakage;
+- class-balance monitoring;
+- probability calibration;
+- baseline comparison;
+- model versioning;
+- reproducible features;
+- champion/challenger deployment;
+- automatic rollback when challenger performance degrades.
+
+AUC alone is insufficient. Evaluate net expectancy, Profit Factor, drawdown, calibration and performance after costs.
+
+7. Risk controls, including demo mode
+
+Implement:
+
+- per-entry risk;
+- per-symbol exposure;
+- campaign exposure;
+- portfolio exposure;
+- maximum correlated exposure;
+- maximum stacking depth;
+- daily and rolling drawdown;
+- consecutive-loss breaker;
+- stale-data breaker;
+- API-error breaker;
+- emergency global kill switch.
+
+Demo mode may be aggressive, but all risk decisions must be measured and logged.
+
+8. Concurrency and durability
+
+Audit and fix:
+
+- race conditions;
+- duplicate orders;
+- concurrent outcome updates;
+- lost writes;
+- unbounded memory queues;
+- overlapping scheduler cycles;
+- partial campaign state.
+
+Use atomic database operations, idempotency keys, bounded queues and transactional updates where appropriate.
+
+9. Observability
+
+Expose dashboards and APIs for:
+
+- PnL gross versus net;
+- fees and slippage;
+- open exposure by symbol;
+- campaign-level PnL;
+- individual execution PnL;
+- rolling 4-hour metrics;
+- model readiness;
+- fallback state;
+- rejection reasons;
+- circuit-breaker state;
+- data freshness;
+- job health.
+
+10. Testing
+
+Add tests for:
+
+- PnL accounting;
+- fee and slippage calculation;
+- LONG and SHORT outcomes;
+- TP and SL;
+- stacking limits;
+- campaign aggregation;
+- duplicate prevention;
+- concurrent writes;
+- fallback transitions;
+- stale data;
+- Quant Brain outage;
+- database outage;
+- rolling performance controls;
+- ML leakage prevention.
+
+Run type checking, unit tests, integration tests and build validation.
+
+DELIVERY FORMAT
+
+After implementation, report:
+
+1. Findings confirmed from code.
+2. Files changed.
+3. Behavioral changes.
+4. Database/schema changes.
+5. Tests executed and exact results.
+6. Remaining risks.
+7. Configuration required.
+8. Features intentionally not implemented.
+9. Evidence that real-money execution remains disabled.
+
+Do not hide failing tests, silently weaken safety gates or fabricate runtime validation.
