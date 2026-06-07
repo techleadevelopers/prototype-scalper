@@ -1,1 +1,1 @@
-- [Shadow ML Gaps Fix](shadow-ml-gaps.md) — root causes of 0/300 samples: priority="low" skipped by semaphore, run_immediately=False, 25s timeout, missing candle regime features
+- [Shadow ML heuristics](shadow-ml-gaps.md) — low-priority jobs starve silently with bounded semaphore; data-collection needs priority="normal" and run_immediately=True
