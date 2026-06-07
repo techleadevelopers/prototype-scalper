@@ -921,6 +921,15 @@ async def sniper_model_status_endpoint():
     sources = await kb.get_signal_source_summary()
     recent_shadow = await kb.get_recent_signal_outcomes(limit=10, source_type="shadow_sampler")
     samples = int(progress["samples"])
+    sampler_st = shadow_sampler_status()
+    cycles = int(sampler_st.get("cycles", 0) or 0)
+    recorded = int(sampler_st.get("recorded", 0) or 0)
+    interval = int(sampler_st.get("intervalSeconds", 60) or 60)
+    samples_per_hour = round((recorded / cycles) * (3600 / interval)) if cycles > 0 else 0
+    pending = int(pipeline.get("pending", 0) or 0)
+    samples_needed = max(0, 300 - samples - pending)
+    eta_hours = round(samples_needed / samples_per_hour, 2) if samples_per_hour > 0 else None
+
     return {
         **status,
         "samples": int(status.get("samples", samples) or samples),
@@ -933,9 +942,15 @@ async def sniper_model_status_endpoint():
         "trainingMode": "automatic_shadow",
         "signalPipeline": pipeline,
         "signalSources": sources,
-        "shadowSampler": shadow_sampler_status(),
+        "shadowSampler": sampler_st,
         "macroCandleRegime": candle_regime_status(),
         "recentShadowSignals": recent_shadow,
+        "learningVelocity": {
+            "samplesPerHour": samples_per_hour,
+            "etaHours": eta_hours,
+            "recordedTotal": recorded,
+            "cycles": cycles,
+        },
     }
 
 

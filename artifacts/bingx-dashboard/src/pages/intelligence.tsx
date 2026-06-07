@@ -388,6 +388,30 @@ export default function IntelligencePage() {
   const targetHit = Number(signalEdge?.context?.hit_configured ?? signalEdge?.symbolSide?.hit_configured ?? 0);
   const openDemoPnl = Number(demoAnalysis?.openUnrealizedPnl ?? 0);
 
+  const samplesPerHour = (() => {
+    const cycles = Number(sampler.cycles ?? 0);
+    const recorded = Number(sampler.recorded ?? 0);
+    const interval = Number(sampler.intervalSeconds ?? 60);
+    return cycles > 0 ? Math.round((recorded / cycles) * (3600 / interval)) : 0;
+  })();
+  const pendingSamples = Number((shadow.signalPipeline ?? {}).pending ?? 0);
+  const etaLabel = (() => {
+    if (shadow.available) return null;
+    if (trainingSamples + pendingSamples >= minimumTrainingSamples) return "<5 min";
+    if (samplesPerHour <= 0) return null;
+    const samplesNeeded = Math.max(0, minimumTrainingSamples - trainingSamples - pendingSamples);
+    const h = samplesNeeded / samplesPerHour;
+    if (h < 1 / 6) return "<10 min";
+    if (h < 1) return `~${Math.round(h * 60)} min`;
+    return `~${h.toFixed(1)} h`;
+  })();
+  const optimalThreshold = Number(shadow.optimalThreshold ?? 0);
+  const expectedValuePct = Number(shadow.expectedValuePct ?? 0);
+  const profitabilityVerified = Boolean(shadow.profitabilityVerified);
+  const simulatedWinRate = Number(shadow.simulatedWinRate ?? 0);
+  const breakevenWinRate = Number(shadow.breakevenWinRate ?? 0);
+  const dataQualityScore = Number((shadow.dataQuality as AnyRecord | undefined)?.score ?? 0);
+
   const lastUpdated = useMemo(() => {
     if (!quant?.checkedAt) return "--";
     return new Date(quant.checkedAt).toLocaleTimeString();
@@ -634,29 +658,111 @@ export default function IntelligencePage() {
                   <h2 className="text-sm font-semibold">Shadow ML</h2>
                   <StatusBadge
                     ok={Boolean(shadow.available)}
-                    on="Disponível"
+                    on={shadow.quality === "excellent" ? "Excelente" : shadow.quality === "good" ? "Bom" : "Disponível"}
                     off={trainingSamples < minimumTrainingSamples ? "Coletando" : "Sem modelo"}
                   />
                 </div>
                 <div className="space-y-3">
-                  <div className="flex justify-between text-xs"><span className="text-muted-foreground">Probabilidade</span><span className="font-mono">{(modelProbability * 100).toFixed(1)}%</span></div>
-                  <Progress value={shadow.available ? modelProbability * 100 : trainingProgress} />
-                  <div className="flex justify-between text-xs">
-                    <span className="text-muted-foreground">Amostras</span>
-                    <span className="font-mono">{trainingSamples}/{minimumTrainingSamples}</span>
+                  {/* Progress bar */}
+                  <div>
+                    <div className="mb-1 flex justify-between text-xs">
+                      <span className="text-muted-foreground">Amostras</span>
+                      <span className="font-mono">{trainingSamples}/{minimumTrainingSamples}</span>
+                    </div>
+                    <Progress value={shadow.available ? Math.min(100, modelProbability * 100) : trainingProgress} />
                   </div>
-                  <div className="flex justify-between text-xs">
-                    <span className="text-muted-foreground">Classes</span>
-                    <span className="font-mono">{shadow.hits ?? 0} hit · {shadow.misses ?? 0} miss</span>
+
+                  {/* Pipeline: pending → finalized → treináveis */}
+                  <div className="grid grid-cols-3 gap-1 rounded bg-muted/20 p-2 text-center">
+                    <div>
+                      <div className="font-mono text-xs font-semibold">{shadow.signalPipeline?.pending ?? 0}</div>
+                      <div className="text-[9px] text-muted-foreground">Pendentes</div>
+                    </div>
+                    <div>
+                      <div className="font-mono text-xs font-semibold">{shadow.signalPipeline?.finalized ?? 0}</div>
+                      <div className="text-[9px] text-muted-foreground">Finalizados</div>
+                    </div>
+                    <div>
+                      <div className="font-mono text-xs font-semibold">{trainingSamples}</div>
+                      <div className="text-[9px] text-muted-foreground">Treináveis</div>
+                    </div>
                   </div>
-                  <div className="flex justify-between text-xs">
-                    <span className="text-muted-foreground">Observados</span>
-                    <span className="font-mono">
-                      {shadow.signalPipeline?.observed ?? 0} · {shadow.signalPipeline?.pending ?? 0} pendentes
-                    </span>
-                  </div>
-                  <div className="flex justify-between text-xs"><span className="text-muted-foreground">AUC</span><span className="font-mono">{num(shadow.rocAuc, 3)}</span></div>
-                  <div className="flex justify-between text-xs"><span className="text-muted-foreground">Baseline</span><span className={shadow.improvesBaseline ? "text-green-400" : "text-amber-400"}>{shadow.improvesBaseline ? "SUPERADO" : "PENDENTE"}</span></div>
+
+                  {/* Pre-training: velocity + ETA */}
+                  {!shadow.available && (
+                    <>
+                      <div className="flex justify-between text-xs">
+                        <span className="text-muted-foreground">Velocidade</span>
+                        <span className="font-mono">{samplesPerHour > 0 ? `${samplesPerHour}/h` : "--"}</span>
+                      </div>
+                      {etaLabel && (
+                        <div className="flex justify-between text-xs">
+                          <span className="text-muted-foreground">ETA treino</span>
+                          <span className="font-mono text-amber-400">{etaLabel}</span>
+                        </div>
+                      )}
+                      <div className="flex justify-between text-xs">
+                        <span className="text-muted-foreground">Classes</span>
+                        <span className="font-mono">{shadow.hits ?? 0} hit · {shadow.misses ?? 0} miss</span>
+                      </div>
+                    </>
+                  )}
+
+                  {/* Post-training: profitability metrics */}
+                  {shadow.available && (
+                    <>
+                      <div className="flex justify-between text-xs">
+                        <span className="text-muted-foreground">AUC ROC</span>
+                        <span className="font-mono">{num(shadow.rocAuc, 3)}</span>
+                      </div>
+                      <div className="flex justify-between text-xs">
+                        <span className="text-muted-foreground">Threshold ótimo</span>
+                        <span className="font-mono">{optimalThreshold > 0 ? `${(optimalThreshold * 100).toFixed(0)}%` : "--"}</span>
+                      </div>
+                      <div className="flex justify-between text-xs">
+                        <span className="text-muted-foreground">EV simulado</span>
+                        <span className={`font-mono ${expectedValuePct > 0 ? "text-green-400" : expectedValuePct < 0 ? "text-red-400" : "text-muted-foreground"}`}>
+                          {optimalThreshold > 0 ? `${expectedValuePct >= 0 ? "+" : ""}${(expectedValuePct * 100).toFixed(3)}%` : "--"}
+                        </span>
+                      </div>
+                      <div className="flex justify-between text-xs">
+                        <span className="text-muted-foreground">Win rate / breakeven</span>
+                        <span className="font-mono">
+                          {simulatedWinRate > 0
+                            ? `${(simulatedWinRate * 100).toFixed(1)}% / ${(breakevenWinRate * 100).toFixed(1)}%`
+                            : "--"}
+                        </span>
+                      </div>
+                      <div className="flex justify-between text-xs">
+                        <span className="text-muted-foreground">Edge lucrativo</span>
+                        <span className={profitabilityVerified ? "font-semibold text-green-400" : "text-amber-400"}>
+                          {profitabilityVerified ? "✓ VERIFICADO" : "NÃO VERIFICADO"}
+                        </span>
+                      </div>
+                      <div className="flex justify-between text-xs">
+                        <span className="text-muted-foreground">Baseline</span>
+                        <span className={shadow.improvesBaseline ? "text-green-400" : "text-amber-400"}>
+                          {shadow.improvesBaseline ? "SUPERADO" : "PENDENTE"}
+                        </span>
+                      </div>
+                    </>
+                  )}
+
+                  {/* Data quality (always shown when > 0) */}
+                  {dataQualityScore > 0 && (
+                    <div className="flex items-center justify-between text-xs">
+                      <span className="text-muted-foreground">Qualidade dados</span>
+                      <div className="flex items-center gap-1.5">
+                        <div className="h-1.5 w-16 rounded-full bg-muted/40">
+                          <div
+                            className={`h-full rounded-full ${dataQualityScore >= 70 ? "bg-green-500" : dataQualityScore >= 40 ? "bg-amber-500" : "bg-red-500"}`}
+                            style={{ width: `${dataQualityScore}%` }}
+                          />
+                        </div>
+                        <span className="font-mono">{dataQualityScore}/100</span>
+                      </div>
+                    </div>
+                  )}
                 </div>
               </section>
 

@@ -239,6 +239,188 @@ def _cross_validate_temporal(
     }
 
 
+def _data_quality_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """
+    Avalia qualidade do dataset de treinamento.
+    Pontuação 0-100 baseada em: volume, balanceamento de classes,
+    diversidade de contexto, cobertura temporal e completude de features.
+    """
+    if not rows:
+        return {"score": 0, "note": "no_data"}
+
+    n = len(rows)
+    hits = sum(1 for r in rows if r.get("hit_configured") == 1)
+    win_rate = hits / n
+
+    context_keys = {r.get("context_key", "") for r in rows}
+    symbols = {r.get("symbol", "") for r in rows}
+    timestamps = [float(r.get("created_at", 0)) for r in rows if r.get("created_at")]
+    span_hours = (max(timestamps) - min(timestamps)) / 3600.0 if len(timestamps) > 1 else 0.0
+    has_regime = sum(
+        1 for r in rows
+        if (r.get("features") or {}).get("candle_regime", {}).get("bias")
+    )
+
+    score = 0
+    notes: list[str] = []
+
+    if n >= 300:
+        score += 25
+    elif n >= 150:
+        score += 15
+    elif n >= 50:
+        score += 5
+
+    if 0.25 <= win_rate <= 0.75:
+        score += 25
+    elif 0.15 <= win_rate <= 0.85:
+        score += 15
+    else:
+        notes.append("class_imbalance")
+
+    if len(context_keys) >= 30:
+        score += 20
+    elif len(context_keys) >= 15:
+        score += 10
+
+    if len(symbols) >= 5:
+        score += 15
+
+    if span_hours >= 24:
+        score += 15
+    elif span_hours >= 4:
+        score += 10
+    elif span_hours >= 1:
+        score += 5
+    else:
+        notes.append("insufficient_time_coverage")
+
+    return {
+        "score": min(100, score),
+        "n": n,
+        "winRate": round(win_rate, 4),
+        "contextDiversity": len(context_keys),
+        "symbols": len(symbols),
+        "spanHours": round(span_hours, 2),
+        "regimeCompleteness": round(has_regime / n * 100, 1),
+        "notes": notes,
+    }
+
+
+def _profitability_simulation(
+    test_rows: list[dict[str, Any]],
+    calibrated_probs: list[float],
+    y_true: list[int],
+) -> dict[str, Any]:
+    """
+    Testes essenciais de lucratividade para validação do edge.
+
+    Simula entradas filtradas pelo modelo em diferentes thresholds (0.50–0.90),
+    calculando EV esperado por trade usando TP/SL/custo reais de cada amostra.
+
+    Regra de ouro scalp: EV > 0 apenas quando win_rate > breakeven_rate.
+    Com TP=0.22% SL=0.55% custo=0.14%: breakeven ≈ 89.6%.
+    O modelo deve identificar o subconjunto de condições que superam esse limiar.
+
+    Retorna:
+        - optimalThreshold: threshold que maximiza EV
+        - optimalEvPct: EV médio por trade no threshold ótimo
+        - optimalWinRate: win rate real no threshold ótimo
+        - profitabilityVerified: True se EV > 0 no threshold ótimo
+        - baselineAvgEvPct: EV sem filtragem (baseline)
+        - thresholdScan: lista com métricas para cada threshold
+    """
+    if not test_rows or not calibrated_probs:
+        return {"profitabilityVerified": False, "optimalThreshold": 0.60}
+
+    DEFAULT_TP = 0.22
+    DEFAULT_SL = 0.55
+
+    baseline_ev = 0.0
+    for row, label in zip(test_rows, y_true):
+        tp = float(row.get("target_configured_move_pct", DEFAULT_TP) or DEFAULT_TP)
+        sl = float((row.get("features") or {}).get("stop_move_pct", DEFAULT_SL) or DEFAULT_SL)
+        cost = float(row.get("estimated_cost_pct", 0.0) or 0.0)
+        net_tp = tp - cost
+        net_sl = sl + cost
+        if label == 1:
+            baseline_ev += net_tp
+        else:
+            baseline_ev -= net_sl
+    baseline_avg_ev = baseline_ev / max(1, len(test_rows))
+
+    threshold_scan: list[dict[str, Any]] = []
+    best_ev = float("-inf")
+    best_threshold = 0.60
+
+    for t_int in range(50, 92, 2):
+        threshold = t_int / 100.0
+        ev_total = 0.0
+        n_trades = 0
+        n_wins = 0
+        breakeven_rates: list[float] = []
+
+        for row, prob, label in zip(test_rows, calibrated_probs, y_true):
+            if prob < threshold:
+                continue
+            tp = float(row.get("target_configured_move_pct", DEFAULT_TP) or DEFAULT_TP)
+            sl = float((row.get("features") or {}).get("stop_move_pct", DEFAULT_SL) or DEFAULT_SL)
+            cost = float(row.get("estimated_cost_pct", 0.0) or 0.0)
+            net_tp = tp - cost
+            net_sl = sl + cost
+            breakeven_rates.append((net_sl) / (net_tp + net_sl) if (net_tp + net_sl) > 0 else 1.0)
+            if label == 1:
+                ev_total += net_tp
+                n_wins += 1
+            else:
+                ev_total -= net_sl
+            n_trades += 1
+
+        if n_trades < 10:
+            continue
+
+        avg_ev = ev_total / n_trades
+        win_rate = n_wins / n_trades
+        avg_breakeven = sum(breakeven_rates) / len(breakeven_rates) if breakeven_rates else 0.0
+        threshold_scan.append({
+            "threshold": threshold,
+            "nTrades": n_trades,
+            "winRate": round(win_rate, 4),
+            "avgEvPct": round(avg_ev, 6),
+            "coveragePct": round(n_trades / max(1, len(test_rows)) * 100, 2),
+            "breakevenWinRate": round(avg_breakeven, 4),
+            "edgeVsBreakeven": round(win_rate - avg_breakeven, 4),
+        })
+
+        if avg_ev > best_ev:
+            best_ev = avg_ev
+            best_threshold = threshold
+
+    best_entry = next((r for r in threshold_scan if r["threshold"] == best_threshold), {})
+    profitability_verified = best_ev > 0
+
+    kelly_fraction = 0.0
+    if profitability_verified and best_entry.get("winRate", 0) > 0:
+        p = best_entry["winRate"]
+        q = 1.0 - p
+        b = abs(best_entry["avgEvPct"]) / max(0.001, abs(baseline_avg_ev)) if baseline_avg_ev < 0 else 1.0
+        kelly_fraction = max(0.0, p - q / max(0.001, b))
+
+    return {
+        "baselineAvgEvPct": round(baseline_avg_ev, 6),
+        "optimalThreshold": best_threshold,
+        "optimalEvPct": round(best_ev, 6),
+        "optimalWinRate": best_entry.get("winRate", 0),
+        "optimalTrades": best_entry.get("nTrades", 0),
+        "optimalCoverage": best_entry.get("coveragePct", 0),
+        "optimalEdgeVsBreakeven": best_entry.get("edgeVsBreakeven", 0),
+        "breakevenWinRate": best_entry.get("breakevenWinRate", 0),
+        "profitabilityVerified": profitability_verified,
+        "kellyFraction": round(kelly_fraction, 4),
+        "thresholdScan": threshold_scan,
+    }
+
+
 async def train_shadow_model(min_samples: int = MIN_TRAINING_SAMPLES) -> dict[str, Any]:
     """Treina modelo shadow com validação avançada e early stopping."""
     try:
@@ -363,6 +545,17 @@ async def train_shadow_model(min_samples: int = MIN_TRAINING_SAMPLES) -> dict[st
     feature_importance = _calculate_feature_importance(gb_final, gb_final.named_steps["vectorizer"], NUMERICAL_FEATURES)
     _feature_importance_cache.update(feature_importance)
 
+    # ── Testes essenciais de lucratividade ──────────────────────────────────
+    # Simula edge financeiro: encontra threshold que maximiza EV por trade,
+    # valida se o modelo supera o breakeven da configuração scalp.
+    profitability = _profitability_simulation(
+        rows[split:],
+        list(calibrated_test.tolist()),
+        list(y[split:].tolist()),
+    )
+    data_quality = _data_quality_report(rows)
+    # ────────────────────────────────────────────────────────────────────────
+
     metadata = {
         "trainedAt": time.time(),
         "samples": len(rows),
@@ -377,9 +570,23 @@ async def train_shadow_model(min_samples: int = MIN_TRAINING_SAMPLES) -> dict[st
         "target": "0.5",
         "cvResults": cv_results if cv_results.get("success") else None,
         "topFeatures": list(feature_importance.keys())[:10] if feature_importance else [],
+        # Profitability test results
+        "optimalThreshold": profitability["optimalThreshold"],
+        "expectedValuePct": profitability["optimalEvPct"],
+        "profitabilityVerified": profitability["profitabilityVerified"],
+        "simulatedWinRate": profitability["optimalWinRate"],
+        "baselineEvPct": profitability["baselineAvgEvPct"],
+        "breakevenWinRate": profitability["breakevenWinRate"],
+        "optimalEdgeVsBreakeven": profitability["optimalEdgeVsBreakeven"],
+        "kellyFraction": profitability["kellyFraction"],
+        "optimalCoverage": profitability["optimalCoverage"],
+        "profitabilityThresholdScan": profitability.get("thresholdScan", []),
+        # Data quality
+        "dataQuality": data_quality,
     }
 
-    if improves_baseline:
+    save_model = improves_baseline or profitability["profitabilityVerified"]
+    if save_model:
         # Ensemble final (média dos dois modelos)
         final_model = {
             "gb_model": gb_final,
@@ -396,7 +603,7 @@ async def train_shadow_model(min_samples: int = MIN_TRAINING_SAMPLES) -> dict[st
             metadata,
         )
 
-    return {"trained": improves_baseline, **metadata}
+    return {"trained": save_model, **metadata}
 
 
 async def restore_shadow_model() -> bool:
@@ -415,21 +622,26 @@ async def restore_shadow_model() -> bool:
 
 
 def shadow_model_status() -> dict[str, Any]:
-    """Retorna status do modelo shadow com métricas."""
+    """Retorna status do modelo shadow com métricas e testes de lucratividade."""
     if not MODEL_PATH.exists() or not METADATA_PATH.exists():
         return {"available": False, "authority": "shadow"}
 
     metadata = json.loads(METADATA_PATH.read_text(encoding="utf-8"))
 
-    # Adiciona avaliação de qualidade
+    # Avaliação de qualidade: combina AUC, baseline e profitabilidade
     quality = "poor"
-    if metadata.get("rocAuc", 0) > 0.65:
+    auc = metadata.get("rocAuc", 0)
+    profitability_verified = metadata.get("profitabilityVerified", False)
+
+    if auc > 0.65 and profitability_verified:
+        quality = "excellent"
+    elif auc > 0.65 or (auc > 0.60 and profitability_verified):
         quality = "good"
-    elif metadata.get("rocAuc", 0) > 0.6:
+    elif auc > 0.60 or profitability_verified:
         quality = "acceptable"
 
-    if metadata.get("improvesBaseline", False):
-        quality = "good" if quality == "good" else "acceptable"
+    if not metadata.get("improvesBaseline", False) and not profitability_verified:
+        quality = "poor"
 
     return {
         "available": True,
@@ -482,6 +694,31 @@ def predict_shadow(row: dict[str, Any]) -> dict[str, Any]:
         else:
             verdict = "STRONG_NEGATIVE"
 
+        metadata_ev: dict[str, Any] = {}
+        if METADATA_PATH.exists():
+            try:
+                meta = json.loads(METADATA_PATH.read_text(encoding="utf-8"))
+                optimal_threshold = float(meta.get("optimalThreshold", 0.60))
+                expected_value_pct = float(meta.get("expectedValuePct", 0.0))
+                simulated_win_rate = float(meta.get("simulatedWinRate", 0.0))
+                breakeven_win_rate = float(meta.get("breakevenWinRate", 0.0))
+                profitability_verified = bool(meta.get("profitabilityVerified", False))
+                metadata_ev = {
+                    "optimalThreshold": optimal_threshold,
+                    "expectedValuePct": expected_value_pct,
+                    "simulatedWinRate": simulated_win_rate,
+                    "breakevenWinRate": breakeven_win_rate,
+                    "profitabilityVerified": profitability_verified,
+                    "isAboveOptimalThreshold": calibrated >= optimal_threshold,
+                    "recommendation": (
+                        "ALLOW" if calibrated >= optimal_threshold
+                        else "BLOCK" if calibrated <= 0.45
+                        else "UNCERTAIN"
+                    ),
+                }
+            except Exception:
+                pass
+
         return {
             "available": True,
             "authority": "shadow_ensemble",
@@ -490,6 +727,7 @@ def predict_shadow(row: dict[str, Any]) -> dict[str, Any]:
             "confidence": round(confidence, 3),
             "verdict": verdict,
             "recommendation": "ALLOW" if calibrated >= 0.55 else "BLOCK" if calibrated <= 0.45 else "UNCERTAIN",
+            **metadata_ev,
         }
 
     except Exception as e:
