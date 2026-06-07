@@ -461,7 +461,7 @@ export default function DemoPage() {
         };
         symbols: Array<{
           symbol: string; trades: number; wins: number; losses: number;
-          winRate: number; totalPnl: number; totalFees: number;
+          winRate: number; totalPnl: number; totalFees: number; totalGrossPnl: number;
           avgHoldMs: number; maxDrawdown: number; lastTradeAt: number;
           tpCount: number; slCount: number;
           entries: Array<{
@@ -1498,6 +1498,190 @@ export default function DemoPage() {
   )}
 </Card>
         </div>
+
+        {/* ── Campaign Reporting ── */}
+        <Card className="border-border/30 bg-card/20">
+          <CardHeader className="px-5 pt-5 pb-3 border-b border-border/15">
+            <div className="flex items-center justify-between flex-wrap gap-3">
+              <div className="flex items-center gap-2">
+                <div className="p-1.5 rounded-lg bg-purple-500/10">
+                  <BarChart3 className="w-3.5 h-3.5 text-purple-400" />
+                </div>
+                <CardTitle className="text-sm font-semibold tracking-tight">Campaign Reporting</CardTitle>
+                {campaignData?.summary && (
+                  <span className="text-[10px] font-mono text-muted-foreground px-2 py-0.5 rounded bg-muted/20">
+                    {campaignData.summary.totalTrades} trades · {campaignData.summary.symbolCount} símbolo{campaignData.summary.symbolCount !== 1 ? "s" : ""}
+                  </span>
+                )}
+              </div>
+              <div className="flex items-center gap-2">
+                {campaignData?.summary && (
+                  <div className="flex items-center gap-3">
+                    <div className="text-center">
+                      <div className={`text-sm font-bold font-mono ${campaignData.summary.totalPnl >= 0 ? "text-green-400" : "text-red-400"}`}>
+                        {campaignData.summary.totalPnl >= 0 ? "+" : ""}{campaignData.summary.totalPnl.toFixed(4)}
+                      </div>
+                      <div className="text-[8px] text-muted-foreground uppercase">Net PnL</div>
+                    </div>
+                    <div className="text-center">
+                      <div className="text-sm font-bold font-mono text-amber-400">
+                        {(campaignData.summary.winRate * 100).toFixed(1)}%
+                      </div>
+                      <div className="text-[8px] text-muted-foreground uppercase">Win Rate</div>
+                    </div>
+                    <div className="text-center">
+                      <div className="text-sm font-bold font-mono text-red-400/80">
+                        -{campaignData.summary.maxDrawdown.toFixed(4)}
+                      </div>
+                      <div className="text-[8px] text-muted-foreground uppercase">Max DD</div>
+                    </div>
+                    <div className="text-center">
+                      <div className="text-sm font-bold font-mono text-muted-foreground">
+                        {campaignData.summary.totalFees.toFixed(4)}
+                      </div>
+                      <div className="text-[8px] text-muted-foreground uppercase">Fees</div>
+                    </div>
+                  </div>
+                )}
+                <Button variant="ghost" size="sm" className="h-7 w-7 p-0" onClick={() => refetchCampaign()}>
+                  <RefreshCw className="w-3 h-3" />
+                </Button>
+              </div>
+            </div>
+          </CardHeader>
+
+          {!demoConnected ? (
+            <div className="px-5 py-8 text-center text-[11px] text-muted-foreground">
+              Conecte a conta demo para ver o relatório de campanha.
+            </div>
+          ) : !campaignData || campaignData.symbols.length === 0 ? (
+            <div className="px-5 py-8 text-center">
+              <Layers className="w-8 h-8 text-muted-foreground/20 mx-auto mb-3" />
+              <p className="text-xs text-muted-foreground">Nenhum trade demo registrado ainda.</p>
+              <p className="text-[10px] text-muted-foreground/60 mt-1">Inicie o Sniper Autopilot para acumular dados.</p>
+            </div>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-[11px]">
+                <thead>
+                  <tr className="border-b border-border/15 bg-muted/5">
+                    {["Símbolo", "Trades", "W%", "Net PnL", "Gross", "Fees", "Drawdown", "TP", "SL", "Avg Hold", ""].map((h) => (
+                      <th key={h} className="px-3 py-2.5 text-left text-[9px] font-semibold text-muted-foreground uppercase tracking-wider whitespace-nowrap">
+                        {h}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-border/10">
+                  {campaignData.symbols.map((sym) => {
+                    const isExpanded = expandedSymbol === sym.symbol;
+                    const shortSym = sym.symbol.replace("-USDT", "").replace("-USD", "");
+                    return (
+                      <>
+                        <tr
+                          key={sym.symbol}
+                          className="hover:bg-muted/8 transition-colors cursor-pointer"
+                          onClick={() => setExpandedSymbol(isExpanded ? null : sym.symbol)}
+                        >
+                          <td className="px-3 py-2.5">
+                            <div className="flex items-center gap-2">
+                              {sym.symbol === campaignData.summary.bestSymbol && (
+                                <Award className="w-3 h-3 text-yellow-400 shrink-0" />
+                              )}
+                              <span className="font-bold">{shortSym}</span>
+                            </div>
+                          </td>
+                          <td className="px-3 py-2.5 font-mono">
+                            <span className="text-green-400">{sym.wins}W</span>
+                            <span className="text-muted-foreground mx-1">/</span>
+                            <span className="text-red-400">{sym.losses}L</span>
+                          </td>
+                          <td className="px-3 py-2.5 font-mono font-bold">
+                            <span className={sym.winRate >= 0.5 ? "text-green-400" : sym.winRate >= 0.4 ? "text-amber-400" : "text-red-400"}>
+                              {(sym.winRate * 100).toFixed(1)}%
+                            </span>
+                          </td>
+                          <td className="px-3 py-2.5 font-mono font-bold">
+                            <span className={sym.totalPnl >= 0 ? "text-green-400" : "text-red-400"}>
+                              {sym.totalPnl >= 0 ? "+" : ""}{sym.totalPnl.toFixed(4)}
+                            </span>
+                          </td>
+                          <td className="px-3 py-2.5 font-mono text-muted-foreground">
+                            {sym.totalGrossPnl >= 0 ? "+" : ""}{sym.totalGrossPnl.toFixed(4)}
+                          </td>
+                          <td className="px-3 py-2.5 font-mono text-red-400/70">{sym.totalFees.toFixed(4)}</td>
+                          <td className="px-3 py-2.5 font-mono text-red-400/80">-{sym.maxDrawdown.toFixed(4)}</td>
+                          <td className="px-3 py-2.5 font-mono text-green-400/80">{sym.tpCount}</td>
+                          <td className="px-3 py-2.5 font-mono text-red-400/80">{sym.slCount}</td>
+                          <td className="px-3 py-2.5 font-mono text-muted-foreground">{fmtHold(sym.avgHoldMs)}</td>
+                          <td className="px-3 py-2.5">
+                            {isExpanded
+                              ? <ChevronUp className="w-3.5 h-3.5 text-muted-foreground" />
+                              : <ChevronDown className="w-3.5 h-3.5 text-muted-foreground" />}
+                          </td>
+                        </tr>
+
+                        {isExpanded && sym.entries.length > 0 && (
+                          <tr key={`${sym.symbol}-entries`}>
+                            <td colSpan={11} className="p-0">
+                              <div className="bg-muted/5 border-l-2 border-purple-500/30">
+                                <div className="px-4 py-2 text-[9px] font-semibold text-muted-foreground uppercase tracking-wider border-b border-border/10">
+                                  Entradas individuais — {sym.entries.length} registros (últimos 100)
+                                </div>
+                                <div className="max-h-[260px] overflow-y-auto">
+                                  <table className="w-full text-[10px]">
+                                    <thead className="sticky top-0 bg-muted/10">
+                                      <tr className="border-b border-border/10">
+                                        {["Lado", "Entry", "Exit", "PnL", "Fee", "Motivo", "Regime", "Hold", "Est."].map((h) => (
+                                          <th key={h} className="px-3 py-1.5 text-left text-[8px] font-semibold text-muted-foreground uppercase">{h}</th>
+                                        ))}
+                                      </tr>
+                                    </thead>
+                                    <tbody className="divide-y divide-border/5">
+                                      {sym.entries.slice().reverse().map((e) => (
+                                        <tr key={e.id} className={`hover:bg-muted/10 transition-colors ${e.isWin ? "" : "opacity-80"}`}>
+                                          <td className="px-3 py-1.5">
+                                            <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded ${
+                                              e.positionSide === "LONG" ? "bg-green-500/15 text-green-400" : "bg-red-500/15 text-red-400"
+                                            }`}>{e.positionSide === "LONG" ? "▲L" : "▼S"}</span>
+                                          </td>
+                                          <td className="px-3 py-1.5 font-mono text-muted-foreground">{e.entryPrice.toFixed(2)}</td>
+                                          <td className="px-3 py-1.5 font-mono text-muted-foreground">{e.exitPrice.toFixed(2)}</td>
+                                          <td className="px-3 py-1.5 font-mono font-bold">
+                                            <span className={e.realizedPnl >= 0 ? "text-green-400" : "text-red-400"}>
+                                              {e.realizedPnl >= 0 ? "+" : ""}{e.realizedPnl.toFixed(4)}
+                                            </span>
+                                          </td>
+                                          <td className="px-3 py-1.5 font-mono text-muted-foreground/70">{e.fee.toFixed(4)}</td>
+                                          <td className="px-3 py-1.5">
+                                            <span className={`text-[8px] px-1 py-0.5 rounded font-mono ${
+                                              e.exitReason === "TAKE_PROFIT" ? "bg-green-500/15 text-green-400"
+                                              : e.exitReason === "STOP_LOSS" ? "bg-red-500/15 text-red-400"
+                                              : "bg-muted/20 text-muted-foreground"
+                                            }`}>{e.exitReason.replace("_", " ")}</span>
+                                          </td>
+                                          <td className="px-3 py-1.5 font-mono text-muted-foreground/70">{e.btcRegime}</td>
+                                          <td className="px-3 py-1.5 font-mono text-muted-foreground">{fmtHold(e.holdMs)}</td>
+                                          <td className="px-3 py-1.5">
+                                            {e.estimated && <span className="text-[8px] text-amber-400/70 font-mono">est</span>}
+                                          </td>
+                                        </tr>
+                                      ))}
+                                    </tbody>
+                                  </table>
+                                </div>
+                              </div>
+                            </td>
+                          </tr>
+                        )}
+                      </>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </Card>
 
         {/* How it works */}
         <Card className="border-border/20 bg-card/10">
