@@ -10,6 +10,9 @@ import strategyMemoryRouter from "./strategyMemory";
 import liveReadinessRouter from "./liveReadiness";
 import killSwitchRouter from "./killSwitch";
 import scoreCalibrationRouter from "./scoreCalibration";
+import incidentsRouter from "./incidents";
+import sniperGovernanceRouter from "./sniperGovernance";
+import policyRouter from "./policy";
 
 const router: IRouter = Router();
 
@@ -24,5 +27,8 @@ router.use(strategyMemoryRouter);
 router.use(liveReadinessRouter);
 router.use(killSwitchRouter);
 router.use(scoreCalibrationRouter);
+router.use(incidentsRouter);
+router.use(sniperGovernanceRouter);
+router.use(policyRouter);
 
 export default router;
