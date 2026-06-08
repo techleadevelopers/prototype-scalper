@@ -103,6 +103,9 @@ async def record_exit_outcome(
     btc_regime: str = "NEUTRAL",
     hour_utc: int = 0,
     campaign_id: str = "",
+    experiment_id: str = "",
+    experiment_arm: str = "",
+    policy_version: str = "",
     expected_duration_sec: float = 300,
 ) -> dict[str, Any]:
     """
@@ -143,6 +146,9 @@ async def record_exit_outcome(
         btc_regime=btc_regime,
         hour_utc=hour_utc,
         campaign_id=campaign_id,
+        experiment_id=experiment_id,
+        experiment_arm=experiment_arm,
+        policy_version=policy_version,
     )
 
     return {
