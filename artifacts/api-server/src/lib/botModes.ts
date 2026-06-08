@@ -78,6 +78,10 @@ export const BulkOrderResultSchema = z.object({
   message: z.string(),
   durationMs: z.number(),
   sizing: z.unknown().optional(),
+  protectionAttached: z.boolean().optional(),
+  riskMode: z.enum(["TP_SL_PROTECTED", "UNPROTECTED_HIGH_RISK"]).optional(),
+  protectionStopPrice: z.number().optional(),
+  protectionTakeProfitPrice: z.number().optional(),
 });
 export type BulkOrderResult = z.infer<typeof BulkOrderResultSchema>;
 
