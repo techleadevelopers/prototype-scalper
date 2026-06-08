@@ -5,6 +5,7 @@ import {
   createExecutionCredentials,
   credentialFingerprint,
   endpointForCredentials,
+  isLiveExecutionConfigured,
   type ExecutionCredentials,
 } from "../lib/executionSecurity";
 
@@ -91,10 +92,11 @@ router.post("/bingx/connect", async (req: Request, res: Response) => {
     // Connecting only verifies credentials and creates a browser session.
     // Real-money order routes independently enforce the live deployment,
     // configured account identity, and execution confirmation.
-    const resolvedAccountId =
-      accountId?.trim() ||
-      process.env.LIVE_ACCOUNT_ID?.trim() ||
-      `session-${credentialFingerprint(apiKey)}`;
+    const resolvedAccountId = accountId?.trim() || `session-${credentialFingerprint(apiKey)}`;
+    if (isLiveExecutionConfigured() && resolvedAccountId !== process.env.LIVE_ACCOUNT_ID?.trim()) {
+      res.status(403).json({ error: "Live credentials must declare the approved LIVE_ACCOUNT_ID." });
+      return;
+    }
     const credentials = createExecutionCredentials({
       environment: "live",
       accountId: resolvedAccountId,
