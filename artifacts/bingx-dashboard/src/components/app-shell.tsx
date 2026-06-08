@@ -223,7 +223,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   return (
     <div className="flex h-screen bg-background text-foreground overflow-hidden">
       {/* Sidebar */}
-      <aside className="w-56 shrink-0 flex flex-col border-r border-border/50 bg-card/30 backdrop-blur-sm overflow-y-auto">
+      <aside className="w-56 shrink-0 flex flex-col border-r border-border/50 bg-card/30 backdrop-blur-sm overflow-y-auto custom-scrollbar">
         {/* Brand */}
         <div className="flex items-center gap-2.5 px-4 py-4 border-b border-border/40 shrink-0">
           <div className="p-1.5 bg-primary/15 rounded-md">
