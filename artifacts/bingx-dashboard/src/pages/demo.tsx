@@ -536,6 +536,7 @@ export default function DemoPage() {
             autoFiredKeysRef.current.clear();
             toast({ title: "Demo VST ativado", description: `Auto-Fire ligado · Balance: ${data.balance ?? "?"} ${data.currency ?? "VST"}` });
             refetchStatus();
+            handleSniperStart();
           } else {
             toast({ title: "Falha ao conectar", description: data.error ?? "Verifique se sua conta BingX está conectada", variant: "destructive" });
           }

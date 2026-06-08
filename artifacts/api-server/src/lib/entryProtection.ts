@@ -90,7 +90,7 @@ export function candleConfirmationRejects(
       `CANDLE_CHOP_REJECT: score separation ${(sideScore - oppositeScore).toFixed(3)} < ${config.candleMinSeparation.toFixed(3)}`,
     );
   }
-  if (candle.emaCross === "FLAT" && candle.volumeRatio < 1.1) {
+  if (candle.emaCross === "FLAT" && candle.volumeRatio < 0.75) {
     rejects.push(`CANDLE_RANGE_REJECT: EMA flat with volume ratio ${candle.volumeRatio.toFixed(2)}`);
   }
 
