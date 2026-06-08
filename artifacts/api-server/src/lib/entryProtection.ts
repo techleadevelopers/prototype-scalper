@@ -74,6 +74,15 @@ export function candleConfirmationRejects(
   if (candle.error || candle.candleCount < 10) {
     return [`CANDLE_DATA_REJECT: ${candle.error ?? `only ${candle.candleCount} candles`}`];
   }
+  if (!candle.candleIsComplete) {
+    return ["CANDLE_INCOMPLETE_REJECT: latest feature candle is unfinished"];
+  }
+  if ((candle.freshnessMs ?? Number.POSITIVE_INFINITY) > 10 * 60_000) {
+    return [`CANDLE_STALE_REJECT: freshness ${candle.freshnessMs ?? "unknown"}ms`];
+  }
+  if ((candle.missingCandleCount ?? 0) > 0) {
+    return [`CANDLE_GAP_REJECT: ${candle.missingCandleCount} missing interval(s)`];
+  }
 
   const sideScore = positionSide === "LONG" ? candle.longScore : candle.shortScore;
   const oppositeScore = positionSide === "LONG" ? candle.shortScore : candle.longScore;
@@ -90,7 +99,7 @@ export function candleConfirmationRejects(
       `CANDLE_CHOP_REJECT: score separation ${(sideScore - oppositeScore).toFixed(3)} < ${config.candleMinSeparation.toFixed(3)}`,
     );
   }
-  if (candle.emaCross === "FLAT" && candle.volumeRatio < 0.75) {
+  if (candle.emaCross === "FLAT" && candle.volumeRatio < 1.1) {
     rejects.push(`CANDLE_RANGE_REJECT: EMA flat with volume ratio ${candle.volumeRatio.toFixed(2)}`);
   }
 
@@ -128,13 +137,13 @@ export function buildAttachedProtection(
       type: "STOP_MARKET",
       stopPrice,
       workingType: "MARK_PRICE",
-      stopGuaranteed: "false",
+      stopGuaranteed: false,
     }),
     takeProfit: JSON.stringify({
       type: "TAKE_PROFIT_MARKET",
       stopPrice: takeProfitPrice,
       workingType: "MARK_PRICE",
-      stopGuaranteed: "false",
+      stopGuaranteed: false,
     }),
   };
 }
