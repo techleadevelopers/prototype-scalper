@@ -1,0 +1,404 @@
+Act as a principal quantitative systems architect, ML engineer, and production trading auditor.
+
+CONTEXT
+
+The system operates exclusively on BingX VST/demo, using the same runtime behavior intended for future real execution.
+
+Keep:
+
+SCALP_ALLOW_EXECUTION=true
+DEMO_SNIPER_GLOBAL_MAX=50
+DEMO_SNIPER_PER_SYMBOL_MAX=10
+
+Do not enable or configure real-money credentials.
+
+MISSION
+
+Before optimizing stacking, audit and harden the complete contract between:
+
+1. Backend executor;
+2. Quant Brain intelligence service;
+3. BingX VST/demo lifecycle;
+4. Telemetry and campaign ledger;
+5. ML training and calibration pipeline.
+
+The financial objective is to discover and validate positive net expectancy. Do not promise or fabricate profitability.
+
+Audit the actual runtime path:
+
+market data
+→ features
+→ Quant Brain prediction
+→ backend gates
+→ campaign allocation
+→ BingX VST order
+→ fill and position
+→ TP/SL or closure
+→ realized PnL
+→ campaign outcome
+→ Quant Brain ingestion
+→ model training
+→ calibrated future prediction
+
+Do not assume integration exists because endpoints, functions or configuration variables exist. Prove every connection from active runtime code and runtime evidence.
+
+1. EXECUTOR ↔ QUANT BRAIN CONTRACT
+
+Document and validate the complete API contract:
+
+- request and response schemas;
+- symbol and side conventions;
+- timestamps and timezone;
+- feature version;
+- model version;
+- probability semantics;
+- score ranges;
+- confidence;
+- regime;
+- data age;
+- fallback status;
+- rejection reasons;
+- latency and timeout behavior.
+
+Reject malformed, stale or version-incompatible predictions.
+
+Never silently convert an unavailable prediction into probability zero.
+
+Add contract tests shared by both services.
+
+2. DECISION OWNERSHIP
+
+Define a single owner for every decision:
+
+Quant Brain:
+- market interpretation;
+- calibrated LONG/SHORT probability;
+- regime;
+- edge quality;
+- uncertainty;
+- model readiness.
+
+Backend executor:
+- final order authorization;
+- campaign state;
+- stacking;
+- exposure;
+- idempotency;
+- TP/SL;
+- service-state enforcement;
+- exchange reconciliation.
+
+Risk engine:
+- absolute veto over new entries.
+
+Quant Brain must never place orders directly.
+The executor must never treat an uncalibrated raw model score as proven edge.
+
+3. EDGE COMPOSITION
+
+Audit how the final edge is calculated from:
+
+- candle structure;
+- momentum;
+- trend;
+- volume;
+- volatility;
+- BTC global regime;
+- symbol-specific regime;
+- relative strength;
+- sentiment;
+- historical campaign performance;
+- model probability;
+- execution context.
+
+For every decision persist an explainable edge decomposition:
+
+final_score
+component_scores
+weights
+model_probability
+calibrated_probability
+uncertainty
+threshold
+decision
+rejection_reasons
+
+Detect duplicated information where correlated indicators are counted several times.
+
+4. LONG/SHORT CONSISTENCY
+
+Verify end to end:
+
+- whether a higher score means LONG, SHORT or generic confidence;
+- side-specific probability semantics;
+- order-side conversion;
+- position-side conversion;
+- TP/SL direction;
+- PnL sign;
+- outcome label;
+- ML target label.
+
+Add regression tests proving that no side inversion can occur between Quant Brain and BingX.
+
+5. MARKET DATA CONSISTENCY
+
+Verify that backend and Quant Brain do not make decisions from conflicting snapshots.
+
+Attach to each prediction:
+
+- market_event_id;
+- candle open and close time;
+- candle completion state;
+- source;
+- feature timestamp;
+- prediction timestamp;
+- latest price;
+- data age.
+
+Reject predictions generated from stale or incomplete critical data.
+
+Prevent duplicate execution from the same symbol, side, timeframe and completed candle.
+
+6. LATENCY AND EDGE EXPIRATION
+
+Measure:
+
+- market-data latency;
+- feature latency;
+- Quant Brain inference latency;
+- network latency;
+- backend gate latency;
+- BingX order latency;
+- total signal-to-order latency.
+
+Every signal must have:
+
+- created_at;
+- expires_at;
+- maximum permitted data age.
+
+Reject an edge after expiration.
+
+Measure whether profitable predictions become unprofitable because execution occurs too late.
+
+7. OUTCOME FEEDBACK LOOP
+
+Prove that every completed VST campaign produces exactly one strategy outcome.
+
+The outcome sent to Quant Brain must contain:
+
+- campaign_id;
+- original signal_id;
+- market_event_id;
+- symbol and side;
+- model and feature versions;
+- entry-time features;
+- stacked executions;
+- realized PnL;
+- commission;
+- net PnL;
+- MFE and MAE;
+- holding duration;
+- exit reason;
+- regime;
+- final label.
+
+Use idempotency so retries cannot create duplicated training samples.
+
+Never create one independent ML label for every correlated stacked order.
+
+8. EDGE QUALITY AUDIT
+
+Evaluate edge by:
+
+- symbol;
+- side;
+- regime;
+- timeframe;
+- score bucket;
+- model version;
+- stacking depth;
+- market session;
+- prediction age;
+- fallback versus ML.
+
+Report:
+
+- independent campaign count;
+- calibrated probability;
+- observed hit rate;
+- net expectancy;
+- Profit Factor;
+- drawdown;
+- confidence interval;
+- calibration error;
+- performance concentration.
+
+Identify edges that appear profitable only because of:
+
+- one symbol;
+- one direction;
+- one market regime;
+- a small sample;
+- duplicated campaigns;
+- look-ahead leakage;
+- extreme outlier trades.
+
+9. BASELINE AND ABLATION TESTS
+
+Create deterministic baselines:
+
+- candle-only baseline;
+- BTC-regime baseline;
+- one-entry baseline;
+- backend without Quant Brain;
+- Quant Brain without sentiment;
+- Quant Brain without historical-performance features.
+
+Run ablation studies to determine which components actually add out-of-sample value.
+
+Remove or reduce components that add complexity without improving validated expectancy.
+
+10. MODEL UNCERTAINTY
+
+The Quant Brain must return uncertainty, not only probability.
+
+Distinguish:
+
+- strong evidence;
+- weak evidence;
+- insufficient data;
+- out-of-distribution context;
+- model unavailable;
+- uncalibrated model.
+
+Aggressive stacking must require both:
+
+- high calibrated edge;
+- low enough uncertainty.
+
+A high raw score with high uncertainty must not unlock ten entries.
+
+11. FALLBACK BEHAVIOR
+
+Validate:
+
+HEALTHY:
+- validated Quant Brain controls edge scoring.
+
+DEGRADED:
+- reduced stacking and concurrency.
+
+SHADOW_ONLY:
+- deterministic backend baseline may execute conservative VST campaigns;
+- Quant Brain predictions are recorded but cannot increase stacking.
+
+PAUSED:
+- no new entries;
+- monitoring, TP/SL, reconciliation, outcome delivery and learning continue.
+
+Test every state across both services.
+
+12. FAILURE MODES
+
+Test:
+
+- Quant Brain timeout;
+- malformed prediction;
+- stale prediction;
+- incompatible feature version;
+- backend restart;
+- Quant Brain restart;
+- duplicate outcome delivery;
+- missing outcome acknowledgement;
+- database slowdown;
+- queue overflow;
+- concurrent training and inference;
+- model artifact corruption;
+- partially unavailable market data.
+
+No failure may produce an unprotected position or silently bypass a risk gate.
+
+13. MASS-PROCESSING AUDIT
+
+Stress-test:
+
+- all configured symbols simultaneously;
+- 50 open executions;
+- 10 executions in one symbol;
+- concurrent predictions and outcomes;
+- overlapping monitor cycles;
+- delayed BingX responses;
+- outcome retry storms;
+- continuous accelerated traffic.
+
+Measure:
+
+- p50/p95/p99 latency;
+- throughput;
+- CPU;
+- memory;
+- queue depth;
+- database pool usage;
+- timeout rate;
+- prediction age at execution;
+- duplicate and lost-event counts.
+
+Inference, TP/SL monitoring and reconciliation must have priority over training.
+
+14. PROFIT-SEEKING IMPROVEMENTS
+
+After confirming correctness, identify improvements in this order:
+
+1. Remove false and duplicated edge.
+2. Improve probability calibration.
+3. Reject stale signals.
+4. Improve regime specialization.
+5. Improve symbol selection.
+6. Improve entry timing.
+7. Stop stacking when edge decays.
+8. Improve exit timing through shadow challengers.
+9. Allocate more exposure only to validated contexts.
+10. Reduce exposure to statistically weak contexts.
+
+Do not increase leverage, stacking or trade frequency to hide negative expectancy.
+
+15. TESTS
+
+Add:
+
+- shared backend/QB contract tests;
+- side-consistency tests;
+- feature-version tests;
+- stale-edge tests;
+- signal-expiration tests;
+- duplicate-market-event tests;
+- outcome idempotency tests;
+- exactly-one-campaign-label tests;
+- latency-budget tests;
+- inference-under-training-load tests;
+- baseline and ablation tests;
+- edge-calibration tests;
+- failure-state integration tests.
+
+16. FINAL DELIVERY
+
+Return:
+
+1. Integration architecture and runtime data flow.
+2. Confirmed backend/QB contract gaps.
+3. Confirmed edge-quality gaps.
+4. Side, timestamp and version inconsistencies.
+5. Files and schemas changed.
+6. Exact test results.
+7. Latency and load-test results.
+8. Outcome-delivery evidence.
+9. Calibration and ablation results.
+10. Components that genuinely improve edge.
+11. Components that should be removed or remain shadow-only.
+12. Remaining financial and operational risks.
+13. Confirmation that execution remains restricted to BingX VST/demo.
+
+Do not fabricate PnL, edge, samples or load-test evidence.
+Do not claim profitability from unit tests.
+Do not enable real-money credentials.
