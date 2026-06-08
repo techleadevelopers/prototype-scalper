@@ -12,7 +12,6 @@ import SettingsPage from "@/pages/settings";
 import BotPage from "@/pages/bot";
 import DemoPage from "@/pages/demo";
 import IntelligencePage from "@/pages/intelligence";
-import PipelinePage from "@/pages/pipeline";
 
 const queryClient = new QueryClient();
 
@@ -27,7 +26,6 @@ function Router() {
       <Route path="/intelligence" component={IntelligencePage} />
       <Route path="/bot" component={BotPage} />
       <Route path="/demo" component={DemoPage} />
-      <Route path="/pipeline" component={PipelinePage} />
       <Route path="/settings" component={SettingsPage} />
       <Route component={NotFound} />
     </Switch>
