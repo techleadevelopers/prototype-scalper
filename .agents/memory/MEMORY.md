@@ -3,3 +3,4 @@
 - [Live Position Watcher](live-position-watcher.md) — autonomous outcome recording pipeline; hooks into executeSingleOrder; polls BingX every 15s; deduplicates by recordedIds Set
 - [Demo Sniper Autopilot](demo-sniper-autopilot.md) — score-tiered multi-asset VST placement; sniperOpenTrades (module Map keyed by orderId) is separate from session demoOpenTrades; campaign endpoint aggregates isDemo outcomes by symbol
 - [Demo Sniper Validation Loop](demo-sniper-validation.md) — G1–G19 gap fixes; demoTradeStore owns JSONL source-of-truth; campaign-level (not per-entry) QB outcomes; setDataDir enables test isolation
+- [Judge-Coach QB Architecture](judge-coach-architecture.md) — dual-layer QB split; Judge=fatal blocks only (profile-independent); Coach=scoring/ranking/learning (never blocks); demo_learning_aggressive ignores WR/PF/EV/sentiment blocks

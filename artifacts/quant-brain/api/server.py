@@ -869,7 +869,10 @@ async def recommend_entry_endpoint(body: dict, days: int = Query(30, ge=1, le=36
 
 @app.post("/edge/evaluate")
 async def evaluate_edge_endpoint(body: dict):
-    """Authoritative edge gate: backend sends pending entry context, Quant Brain returns allow/reject."""
+    """
+    Authoritative edge gate (Judge Sniper + Coach Ranker dual layer).
+    Judge blocks fatal conditions only; Coach scores and ranks.
+    """
     if "symbol" not in body:
         raise HTTPException(400, "Required field: symbol")
     try:
@@ -894,6 +897,89 @@ async def evaluate_edge_endpoint(body: dict):
             "mode": "degraded_error",
             "error": f"{type(exc).__name__}: {exc}",
         }
+
+
+@app.post("/cycle/rank")
+async def rank_cycle_candidates(body: dict):
+    """
+    Coach Ranker batch endpoint.
+
+    Receives all sniper cycle candidates in one request, runs Judge + Coach
+    on each, and returns them sorted by executionPriority (highest first).
+
+    Request body:
+      candidates  — list of entry contexts (same schema as /edge/evaluate body)
+      config      — shared bot config (applied to all candidates)
+      btcRegime   — current BTC regime string (optional)
+      btcChangePct — BTC price change % (optional)
+      hourUtc     — current UTC hour (optional)
+
+    Response:
+      ranked      — list of {symbol, positionSide, allow, executionPriority,
+                             judgeSniper, coachRanker, gateRejects, score, aggressiveScore}
+      totalCandidates — int
+      allowed     — int
+      blocked     — int
+    """
+    candidates_raw = body.get("candidates")
+    if not candidates_raw or not isinstance(candidates_raw, list):
+        raise HTTPException(400, "Required field: candidates (non-empty list)")
+
+    shared_config = body.get("config") or {}
+    shared_btc_regime = body.get("btcRegime")
+    shared_btc_change = body.get("btcChangePct")
+    shared_hour = body.get("hourUtc")
+
+    async def _evaluate_one(candidate: dict) -> dict:
+        merged = {**candidate}
+        if shared_config and "config" not in merged:
+            merged["config"] = shared_config
+        elif shared_config:
+            merged["config"] = {**shared_config, **(merged.get("config") or {})}
+        if shared_btc_regime and "btcRegime" not in merged:
+            merged["btcRegime"] = shared_btc_regime
+        if shared_btc_change is not None and "btcChangePct" not in merged:
+            merged["btcChangePct"] = shared_btc_change
+        if shared_hour is not None and "hourUtc" not in merged:
+            merged["hourUtc"] = shared_hour
+        try:
+            result = await asyncio.wait_for(evaluate_edge_gate(merged), timeout=20)
+        except asyncio.TimeoutError:
+            result = {
+                "allow": True, "gateRejects": [], "score": 0.0,
+                "aggressiveScore": 0.0, "executionPriority": 0.0,
+                "authority": "quant-brain-degraded", "mode": "degraded_timeout",
+                "symbol": merged.get("symbol", ""), "positionSide": merged.get("positionSide", ""),
+            }
+        except Exception as exc:
+            result = {
+                "allow": True, "gateRejects": [], "score": 0.0,
+                "aggressiveScore": 0.0, "executionPriority": 0.0,
+                "authority": "quant-brain-degraded", "mode": "degraded_error",
+                "error": f"{type(exc).__name__}: {exc}",
+                "symbol": merged.get("symbol", ""), "positionSide": merged.get("positionSide", ""),
+            }
+        return result
+
+    results = await asyncio.gather(*[_evaluate_one(c) for c in candidates_raw])
+
+    allowed_results = [r for r in results if r.get("allow", True)]
+    blocked_results = [r for r in results if not r.get("allow", True)]
+
+    ranked = sorted(
+        allowed_results,
+        key=lambda r: float(r.get("executionPriority", r.get("score", 0.0))),
+        reverse=True,
+    )
+
+    return {
+        "ranked": ranked,
+        "blocked": blocked_results,
+        "totalCandidates": len(results),
+        "allowed": len(allowed_results),
+        "blockedCount": len(blocked_results),
+        "mode": "judge-coach-dual-layer-v1",
+    }
 
 
 # ========== SIGNALS ==========
