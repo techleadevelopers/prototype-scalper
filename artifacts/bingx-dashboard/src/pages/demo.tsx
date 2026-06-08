@@ -1161,162 +1161,141 @@ export default function DemoPage() {
     </div>
   ) : (
     <div className="flex-1 overflow-y-auto min-h-0 custom-scrollbar">
-      <div className="p-3 space-y-2">
+      <div className="divide-y divide-border/5">
         {scanSymbols.map((s, i) => {
           const key = `${s.symbol}-${s.positionSide}`;
           const isReady = s.isCandidate;
           const isToxic = s.isToxic;
           const isGatePass = s.gatePass && !isReady;
-          const up = s.priceChangePct >= 0;
-          const base = s.symbol.replace("-USDT", "").replace("-USD", "").toLowerCase();
-          const short = s.symbol.replace("-USDT", "").replace("-USD", "");
-
-          /* sparkline */
-          const volatility = Math.min(11, Math.max(4, Math.abs(s.priceChangePct) * 1.1));
-          const trendStep = up ? -0.38 : 0.38;
-          const sparkY = Array.from({ length: 20 }, (_, idx) => {
-            const base2 = 20 + idx * trendStep;
-            const jag = (idx % 2 === 0 ? -1 : 1) * volatility * 0.72 + (idx % 5 === 0 ? -1 : 0.45) * volatility * 0.38;
-            return Math.min(28, Math.max(3, base2 + Math.sin(idx * 2.35) * volatility * 0.35 + jag));
-          });
-          const sparkPoints = sparkY.map((y, idx) => `${(idx / (sparkY.length - 1)) * 100},${y}`).join(" ");
-          const sparkArea = `0,32 ${sparkPoints} 100,32`;
-          const chartColor = up ? "#22c55e" : "#ef4444";
-          const chartGlow = up ? "drop-shadow(0 0 4px rgba(34,197,94,0.6))" : "drop-shadow(0 0 4px rgba(239,68,68,0.6))";
-
-          /* border accent */
-          const borderAccent = isToxic
-            ? "border-red-500/30"
-            : isReady
-            ? "border-green-500/30 shadow-[0_0_12px_rgba(34,197,94,0.08)]"
-            : isGatePass
-            ? "border-yellow-500/20"
-            : "border-border/20";
-
-          const bgAccent = isReady
-            ? "bg-gradient-to-r from-green-500/5 via-card/60 to-card/40"
-            : "bg-card/40";
-
+          
           return (
             <div
               key={`${key}-${i}`}
-              className={`rounded-xl border ${borderAccent} ${bgAccent} overflow-hidden transition-all duration-200 hover:brightness-110`}
+              className={`group px-5 py-3 transition-all duration-150 hover:bg-muted/10 ${
+                isReady && "bg-gradient-to-r from-green-500/5 to-transparent"
+              }`}
             >
-              {/* top section */}
-              <div className="flex items-center gap-3 px-3 py-2.5">
-                {/* Token icon */}
-                <div className={`w-8 h-8 rounded-full flex items-center justify-center shrink-0 ${
-                  isToxic ? "bg-red-500/15" : isReady ? "bg-green-500/10" : "bg-muted/20"
-                }`}>
-                  <img
-                    src={`https://cdn.jsdelivr.net/gh/spothq/cryptocurrency-icons@master/32/color/${base}.png`}
-                    alt={base}
-                    width={20}
-                    height={20}
-                    className="rounded-full"
-                    onError={(e) => {
-                      (e.currentTarget as HTMLImageElement).style.display = "none";
-                      const fb = e.currentTarget.nextSibling as HTMLElement | null;
-                      if (fb) fb.style.display = "flex";
-                    }}
-                  />
-                  <span className="hidden text-[9px] font-bold uppercase w-5 h-5 items-center justify-center">
-                    {base.slice(0, 2).toUpperCase()}
-                  </span>
-                </div>
-
-                {/* Name + direction */}
-                <div className="w-[68px] shrink-0">
-                  <p className="text-[13px] font-bold font-mono leading-none">{short}</p>
-                  <span className={`inline-block mt-1 text-[9px] font-bold px-1.5 py-0.5 rounded ${
-                    s.positionSide === "LONG" ? "bg-green-500/15 text-green-400" : "bg-red-500/15 text-red-400"
-                  }`}>
-                    {s.positionSide}
-                  </span>
-                </div>
-
-                {/* 24h change + sparkline */}
-                <div className="flex-1 min-w-0 flex flex-col gap-0.5">
-                  <div className="flex items-center gap-1">
-                    <span className={`text-[11px] font-mono font-bold ${up ? "text-green-400" : "text-red-400"}`}>
-                      {up ? "+" : ""}{s.priceChangePct.toFixed(2)}%
-                    </span>
-                    <svg viewBox="0 0 12 12" width="10" height="10">
-                      <path fill={chartColor} d={up
-                        ? "M6,3 L10,9 L2,9 Z"
-                        : "M6,9 L10,3 L2,3 Z"} />
-                    </svg>
-                    <span className="text-[8px] text-muted-foreground">24h</span>
+              <div className="flex items-center justify-between">
+                {/* Left side - Symbol & Side */}
+                <div className="flex items-center gap-3 min-w-[140px]">
+                  <div className={`w-2 h-2 rounded-full transition-all ${
+                    isToxic ? "bg-red-500" : isReady ? "bg-green-400 animate-pulse" : isGatePass ? "bg-yellow-500" : "bg-muted-foreground/30"
+                  }`} />
+                  <div className="flex items-center gap-2">
+                    {(() => {
+                      const base = s.symbol.replace("-USDT", "").replace("-USD", "").toLowerCase();
+                      const icons: Record<string, string> = {
+                        btc: "https://cryptologos.cc/logos/bitcoin-btc-logo.svg",
+                        eth: "https://cryptologos.cc/logos/ethereum-eth-logo.svg",
+                        sol: "https://cryptologos.cc/logos/solana-sol-logo.svg",
+                        vvv: "https://cryptologos.cc/logos/vvv-vvv-logo.svg",
+                      };
+                      const iconUrl = icons[base];
+                      return iconUrl ? (
+                        <img src={iconUrl} alt={base} className="w-5 h-5" onError={(e) => (e.target as HTMLImageElement).style.display = 'none'} />
+                      ) : (
+                        <div className="w-5 h-5 rounded-full bg-muted/20 flex items-center justify-center">
+                          <span className="text-[9px] font-bold">{base.slice(0, 2).toUpperCase()}</span>
+                        </div>
+                      );
+                    })()}
+                    <div>
+                      <p className="text-sm font-mono font-semibold">{s.symbol.replace("-USDT", "")}</p>
+                      <div className="flex items-center gap-1 mt-0.5">
+                        <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded ${
+                          s.positionSide === "LONG" ? "bg-green-500/15 text-green-400" : "bg-red-500/15 text-red-400"
+                        }`}>
+                          {s.positionSide === "LONG" ? "LONG" : "SHORT"}
+                        </span>
+                        {s.samples > 0 && (
+                          <span className="text-[8px] text-muted-foreground">{s.samples} trades</span>
+                        )}
+                      </div>
+                    </div>
                   </div>
-                  {/* sparkline */}
-                  <svg viewBox="0 0 100 32" preserveAspectRatio="none" className="w-full h-7 overflow-visible">
-                    <defs>
-                      <linearGradient id={`fill-${key}`} x1="0" y1="0" x2="0" y2="1">
-                        <stop offset="0%" stopColor={chartColor} stopOpacity="0.30" />
-                        <stop offset="100%" stopColor={chartColor} stopOpacity="0" />
-                      </linearGradient>
-                    </defs>
-                    <polygon points={sparkArea} fill={`url(#fill-${key})`} />
-                    <polyline
-                      points={sparkPoints}
-                      fill="none"
-                      stroke={chartColor}
-                      strokeWidth="1.5"
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      vectorEffect="non-scaling-stroke"
-                      style={{ filter: chartGlow }}
-                    />
-                    <circle cx="100" cy={sparkY[sparkY.length - 1]} r="2" fill={chartColor}
-                      vectorEffect="non-scaling-stroke" style={{ filter: chartGlow }} />
-                  </svg>
                 </div>
 
-                {/* EV + action */}
-                <div className="flex flex-col items-end gap-1.5 shrink-0">
+                {/* Center - Metrics */}
+                <div className="hidden md:flex items-center gap-6">
                   <div className="text-right">
-                    <p className={`text-[11px] font-mono font-bold ${s.ev >= 0.0001 ? "text-green-400" : s.ev <= -0.0001 ? "text-red-400" : "text-muted-foreground"}`}>
+                    <p className={`text-sm font-mono font-bold tabular-nums ${
+                      s.priceChangePct >= 0 ? "text-green-400" : "text-red-400"
+                    }`}>
+                      {s.priceChangePct >= 0 ? "+" : ""}{s.priceChangePct.toFixed(2)}%
+                    </p>
+                    <p className="text-[8px] text-muted-foreground uppercase tracking-wider">24h</p>
+                  </div>
+                  <div className="text-right">
+                    <p className="text-sm font-mono font-bold tabular-nums">
+                      {s.samples > 0 ? `${Math.round(s.priorityScore * 100)}` : "—"}
+                    </p>
+                    <p className="text-[8px] text-muted-foreground uppercase tracking-wider">PRIORITY</p>
+                  </div>
+                  <div className="text-right">
+                    <p className={`text-sm font-mono font-bold tabular-nums ${
+                      s.ev >= 0 ? "text-green-400" : "text-red-400"
+                    }`}>
                       {s.ev > 0 ? "+" : ""}{s.ev.toFixed(4)}
                     </p>
-                    <p className="text-[7px] text-muted-foreground uppercase tracking-wider">EV</p>
+                    <p className="text-[8px] text-muted-foreground uppercase tracking-wider">EV</p>
                   </div>
+                </div>
+
+                {/* Right side - Action */}
+                <div className="flex items-center gap-3">
                   {isToxic ? (
-                    <div className="flex items-center gap-1 px-2 py-1 rounded-lg bg-red-500/10 border border-red-500/20">
+                    <div className="flex items-center gap-1.5 px-2 py-1 rounded-md bg-red-500/10">
                       <Shield className="w-3 h-3 text-red-400" />
-                      <span className="text-[9px] font-bold text-red-400">TOXIC</span>
+                      <span className="text-[9px] font-medium text-red-400">TOXIC</span>
                     </div>
                   ) : isReady ? (
                     <Button
                       size="sm"
-                      onClick={() => fireDemoOrder(s.symbol, s.positionSide as "LONG" | "SHORT", s.ev, s.ewmaWinRate, true, s.lastPrice)}
+                      onClick={() => fireDemoOrder(
+                        s.symbol,
+                        s.positionSide as "LONG" | "SHORT",
+                        s.ev,
+                        s.ewmaWinRate,
+                        true,
+                        s.lastPrice,
+                      )}
                       disabled={firingSet.has(key) || autoFire}
-                      className="h-7 px-3 text-[10px] font-bold bg-gradient-to-r from-primary to-primary/80 hover:from-primary/90 hover:to-primary shadow-md shadow-primary/25 active:scale-95 transition-all"
+                      className="h-8 px-4 text-[11px] font-bold transition-all duration-200 bg-gradient-to-r from-primary to-primary/80 hover:from-primary/90 hover:to-primary shadow-lg shadow-primary/20 hover:shadow-xl hover:shadow-primary/30 active:scale-95"
                     >
-                      {firingSet.has(key) ? <Loader2 className="w-3 h-3 animate-spin" /> : <><Zap className="w-3 h-3 mr-1" />EXECUTE</>}
+                      {firingSet.has(key) ? (
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      ) : (
+                        <>
+                          <Zap className="w-3.5 h-3.5 mr-1.5" />
+                          EXECUTE
+                        </>
+                      )}
                     </Button>
                   ) : isGatePass ? (
-                    <div className="flex items-center gap-1 px-2 py-1 rounded-lg bg-yellow-500/10 border border-yellow-500/20">
+                    <div className="flex items-center gap-1.5 px-2 py-1 rounded-md bg-yellow-500/10">
                       <Clock className="w-3 h-3 text-yellow-400" />
-                      <span className="text-[9px] font-bold text-yellow-400">WAIT</span>
+                      <span className="text-[9px] font-medium text-yellow-400">WAITING</span>
                     </div>
                   ) : (
-                    <div className="flex items-center gap-1 px-2 py-1 rounded-lg bg-muted/15 border border-border/20">
-                      <XCircle className="w-3 h-3 text-muted-foreground/50" />
-                      <span className="text-[9px] text-muted-foreground/60">BLOCK</span>
+                    <div className="flex items-center gap-1.5 px-2 py-1 rounded-md bg-muted/20">
+                      <XCircle className="w-3 h-3 text-muted-foreground" />
+                      <span className="text-[9px] text-muted-foreground">BLOCKED</span>
                     </div>
                   )}
                 </div>
               </div>
 
-              {/* bottom bar — priority score */}
+              {/* Progress bar for priority score */}
               {s.samples > 0 && (
-                <div className="h-0.5 w-full bg-border/10">
-                  <div
-                    className={`h-full transition-all duration-700 ${
-                      isToxic ? "bg-red-500" : isReady ? "bg-gradient-to-r from-green-500 to-emerald-400" : "bg-primary/30"
-                    }`}
-                    style={{ width: `${Math.min(100, Math.max(0, s.priorityScore * 100))}%` }}
-                  />
+                <div className="mt-2 ml-12">
+                  <div className="h-0.5 w-full bg-border/20 rounded-full overflow-hidden">
+                    <div 
+                      className={`h-full rounded-full transition-all duration-500 ${
+                        isToxic ? "bg-red-500" : isReady ? "bg-gradient-to-r from-green-500 to-emerald-500" : "bg-primary/40"
+                      }`}
+                      style={{ width: `${Math.min(100, Math.max(0, s.priorityScore * 100))}%` }}
+                    />
+                  </div>
                 </div>
               )}
             </div>
