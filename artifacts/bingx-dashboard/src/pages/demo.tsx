@@ -1135,7 +1135,7 @@ export default function DemoPage() {
           </div>
 
        {/* ── CENTER PANEL — scanner ── */}
-<Card className="bg-card/30 border-border/40 flex flex-col max-h-[750px]">
+<Card className="bg-card/30 border-border/40 flex flex-col max-h-[525px]">
   <CardHeader className="px-5 pt-5 pb-3 border-b border-border/15 shrink-0">
     <div className="flex items-center justify-between">
       <div className="flex items-center gap-2">
@@ -1370,7 +1370,7 @@ export default function DemoPage() {
 </Card>
 
 {/* ── RIGHT PANEL — log ── */}
-<Card className="bg-card/30 border-border/40 flex flex-col max-h-[750px]">
+<Card className="bg-card/30 border-border/40 flex flex-col max-h-[525px]">
   <CardHeader className="px-4 pt-4 pb-3 border-b border-border/20 shrink-0">
     <div className="flex items-center justify-between">
       <CardTitle className="text-sm font-semibold flex items-center gap-2">
