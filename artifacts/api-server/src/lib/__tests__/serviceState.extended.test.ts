@@ -4,6 +4,12 @@
  *   - updateVstEquity() equity-relative circuit breakers
  *   - isFallbackMode() / isMonitoringAllowed()
  *   - State transition history correctness
+ *
+ * Thresholds (aggressive demo phase defaults):
+ *   CONSECUTIVE_LOSS_DEGRADED = 8   (was 4)
+ *   CONSECUTIVE_LOSS_PAUSE    = 15  (was 8)
+ *   ROLLING_LOSS_PCT_DEGRADED = -5% (was -2%)
+ *   ROLLING_LOSS_PCT_PAUSE    = -10%(was -5%)
  */
 import { describe, it, expect, beforeEach } from "vitest";
 import {
@@ -37,7 +43,8 @@ describe("isEntryAllowed — HEALTHY", () => {
 
 describe("isEntryAllowed — DEGRADED", () => {
   beforeEach(() => {
-    for (let i = 0; i < 4; i++) recordTradeLoss(-5);
+    // DEGRADED threshold is now 8 consecutive losses
+    for (let i = 0; i < 8; i++) recordTradeLoss(-5);
   });
   it("state is DEGRADED", () => {
     expect(getServiceState().state).toBe("DEGRADED");
@@ -85,7 +92,8 @@ describe("isFallbackMode", () => {
     expect(isFallbackMode()).toBe(false);
   });
   it("is false in DEGRADED", () => {
-    for (let i = 0; i < 4; i++) recordTradeLoss(-5);
+    // DEGRADED threshold is now 8 consecutive losses
+    for (let i = 0; i < 8; i++) recordTradeLoss(-5);
     expect(isFallbackMode()).toBe(false);
   });
   it("is true in SHADOW_ONLY", () => {
@@ -126,19 +134,19 @@ describe("equity-relative circuit breakers", () => {
     expect(getServiceState().vstEquity).toBe(1000);
   });
 
-  it("DEGRADED when rolling loss exceeds ROLLING_LOSS_PCT_DEGRADED (−2% default)", () => {
+  it("DEGRADED when rolling loss exceeds ROLLING_LOSS_PCT_DEGRADED (−5% default)", () => {
     // Record a loss FIRST so _rollingLossPnl is negative,
     // then call updateVstEquity which recomputes and triggers threshold.
-    recordTradeLoss(-21); // _rollingLossPnl = -21
-    updateVstEquity(1000); // -21/1000 = -2.1% ≤ -2% DEGRADED threshold
+    recordTradeLoss(-51); // _rollingLossPnl = -51
+    updateVstEquity(1000); // -51/1000 = -5.1% ≤ -5% DEGRADED threshold
     const snap = getServiceState();
     expect(["DEGRADED", "PAUSED"]).toContain(snap.state);
   });
 
-  it("PAUSED when rolling loss exceeds ROLLING_LOSS_PCT_PAUSE (−5% default)", () => {
-    // Set equity to $1000; a −5% loss = −$50 should trigger PAUSED
+  it("PAUSED when rolling loss exceeds ROLLING_LOSS_PCT_PAUSE (−10% default)", () => {
+    // Set equity to $1000; a −10% loss = −$100 triggers PAUSED
     updateVstEquity(1000);
-    recordTradeLoss(-51); // exceeds 5% of 1000 = 50
+    recordTradeLoss(-101); // exceeds 10% of 1000 = 100
     const snap = getServiceState();
     expect(snap.state).toBe("PAUSED");
     expect(snap.reason).toBe("EQUITY_LOSS_LIMIT");
@@ -149,26 +157,26 @@ describe("equity-relative circuit breakers", () => {
     recordTradeLoss(-40); // 40/2000 = 2%
     const snap = getServiceState();
     expect(snap.rollingLossPct).not.toBeNull();
-    // rollingLossPct should be around −2%
+    // rollingLossPct should be around −2% (well inside both thresholds)
     expect(snap.rollingLossPct!).toBeLessThan(0);
     expect(snap.rollingLossPct!).toBeGreaterThan(-10);
   });
 
   it("PAUSED reason is EQUITY_LOSS_LIMIT when equity threshold exceeded", () => {
+    // −10% of 500 = −50; use −51 to exceed PAUSED threshold
     updateVstEquity(500);
-    recordTradeLoss(-30); // 30/500 = 6% > 5% threshold
+    recordTradeLoss(-51); // 51/500 = 10.2% > 10% PAUSED threshold
     expect(getServiceState().reason).toBe("EQUITY_LOSS_LIMIT");
   });
 
   it("win clears rolling loss state and can restore to HEALTHY", () => {
-    // 4 losses → DEGRADED; then win restores
-    for (let i = 0; i < 4; i++) recordTradeLoss(-5);
+    // 8 losses → DEGRADED (new threshold); then win restores
+    for (let i = 0; i < 8; i++) recordTradeLoss(-5);
     expect(getServiceState().state).toBe("DEGRADED");
     recordTradeWin();
     expect(getServiceState().consecutiveLosses).toBe(0);
-    // After clearing consecutive losses, rolling loss may still be negative
-    // but state should improve
-    expect(getServiceState().state).not.toBe("PAUSED");
+    // State resets to HEALTHY on win after consecutive-loss DEGRADED
+    expect(getServiceState().state).toBe("HEALTHY");
   });
 });
 

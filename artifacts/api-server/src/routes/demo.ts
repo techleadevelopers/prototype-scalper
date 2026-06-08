@@ -47,6 +47,7 @@ import {
   updateVstEquity,
   checkDataFreshness,
   resetServiceState,
+  getConsecutiveLosses,
 } from "../lib/serviceState";
 
 // Initialise persistent demo trade store on module load, then restore runtime state
@@ -1609,12 +1610,34 @@ const demoSniper: DemoSniperState = {
   cycleHistory: [],
 };
 
+/**
+ * Base tier from signal score, then reduced proportionally when in a losing streak.
+ *
+ * Loss streak multipliers (applied after DEGRADED threshold is reached):
+ *   0–3 consecutive losses:   full tier (multiplier 1.0)
+ *   4–7 consecutive losses:   × 0.75 — mild caution
+ *   8–11 consecutive losses:  × 0.50 — DEGRADED-range, halve stacking
+ *   12–14 consecutive losses: × 0.25 — approaching PAUSE, minimal new exposure
+ *   ≥15 consecutive losses:   tier is irrelevant — PAUSED blocks entries upstream
+ *
+ * Always returns ≥1 when the base tier is ≥1 so a high-confidence signal
+ * can still fire once even during a drawdown phase.
+ */
 function scoreTierMaxEntries(score: number): number {
+  let base: number;
   if (score < 0.60) return 0;
-  if (score < 0.70) return 1;
-  if (score < 0.80) return 3;
-  if (score < 0.90) return 5;
-  return 10;
+  else if (score < 0.70) base = 1;
+  else if (score < 0.80) base = 3;
+  else if (score < 0.90) base = 5;
+  else base = 10;
+
+  const streak = getConsecutiveLosses();
+  let mult = 1.0;
+  if (streak >= 12) mult = 0.25;
+  else if (streak >= 8) mult = 0.50;
+  else if (streak >= 4) mult = 0.75;
+
+  return mult < 1.0 ? Math.max(1, Math.floor(base * mult)) : base;
 }
 
 async function runDemoSniperCycle(): Promise<void> {

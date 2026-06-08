@@ -58,15 +58,19 @@ const QB_FAILURE_DEGRADED_THRESHOLD = parseInt(process.env["QB_FAILURE_DEGRADED"
 const QB_FAILURE_SHADOW_THRESHOLD = parseInt(process.env["QB_FAILURE_SHADOW"] ?? "8", 10);
 const API_ERROR_DEGRADED_THRESHOLD = parseInt(process.env["API_ERROR_DEGRADED"] ?? "5", 10);
 const API_ERROR_SHADOW_THRESHOLD = parseInt(process.env["API_ERROR_SHADOW"] ?? "15", 10);
-const CONSECUTIVE_LOSS_PAUSE_THRESHOLD = parseInt(process.env["CONSECUTIVE_LOSS_PAUSE"] ?? "8", 10);
-const CONSECUTIVE_LOSS_DEGRADED_THRESHOLD = parseInt(process.env["CONSECUTIVE_LOSS_DEGRADED"] ?? "4", 10);
-// Absolute USD fallback (secondary safeguard)
-const ROLLING_LOSS_PAUSE_USD = parseFloat(process.env["ROLLING_LOSS_PAUSE_USD"] ?? "-50");
-// Equity-relative primary circuit breaker (% of VST equity, negative value)
-const ROLLING_LOSS_PCT_PAUSE = parseFloat(process.env["ROLLING_LOSS_PCT_PAUSE"] ?? "-5");  // −5% of equity
-const ROLLING_LOSS_PCT_DEGRADED = parseFloat(process.env["ROLLING_LOSS_PCT_DEGRADED"] ?? "-2"); // −2%
+// Aggressive demo phase: higher consecutive-loss tolerance before degrading / pausing
+const CONSECUTIVE_LOSS_PAUSE_THRESHOLD = parseInt(process.env["CONSECUTIVE_LOSS_PAUSE"] ?? "15", 10);
+const CONSECUTIVE_LOSS_DEGRADED_THRESHOLD = parseInt(process.env["CONSECUTIVE_LOSS_DEGRADED"] ?? "8", 10);
+// Absolute USD fallback — disabled by default for VST (equity-relative breakers are primary).
+// Set ROLLING_LOSS_PAUSE_USD to a meaningful negative value to re-enable (e.g. -500).
+const ROLLING_LOSS_PAUSE_USD = parseFloat(process.env["ROLLING_LOSS_PAUSE_USD"] ?? "-999999");
+// Equity-relative primary circuit breakers (% of VST equity, negative values)
+const ROLLING_LOSS_PCT_PAUSE = parseFloat(process.env["ROLLING_LOSS_PCT_PAUSE"] ?? "-10");    // −10% → PAUSED
+const ROLLING_LOSS_PCT_DEGRADED = parseFloat(process.env["ROLLING_LOSS_PCT_DEGRADED"] ?? "-5"); // −5% → DEGRADED
 const STALE_DATA_SHADOW_MS = parseInt(process.env["STALE_DATA_SHADOW_MS"] ?? "90000", 10); // 90s
 const FAILURE_WINDOW_MS = 5 * 60 * 1000; // 5-min rolling window for failure counts
+// Rolling loss window — auto-resets after this duration even without a winning trade
+const ROLLING_LOSS_WINDOW_MS = parseInt(process.env["ROLLING_LOSS_WINDOW_MS"] ?? String(4 * 60 * 60 * 1000), 10); // 4 h
 
 // ========== STATE ==========
 
@@ -79,6 +83,7 @@ let _apiErrors = 0;
 let _apiErrorTimes: number[] = [];
 let _consecutiveLosses = 0;
 let _rollingLossPnl = 0;
+let _rollingWindowStart = Date.now();           // start of the 4-hour rolling-loss window
 let _vstEquity: number | null = null;           // latest VST account balance
 let _rollingLossPct: number | null = null;      // rolling loss as % of equity
 let _lastBtcPriceAt: number | null = null;
@@ -228,21 +233,39 @@ export function updateVstEquity(equity: number): void {
 }
 
 export function recordTradeLoss(pnl: number): void {
+  // Auto-reset rolling loss window after the configured duration (default 4 h).
+  // This allows recovery from a bad streak without requiring a manual reset.
+  if (Date.now() - _rollingWindowStart > ROLLING_LOSS_WINDOW_MS) {
+    _rollingLossPnl = 0;
+    _rollingLossPct = 0;
+    _rollingWindowStart = Date.now();
+    logger.info({ windowMs: ROLLING_LOSS_WINDOW_MS }, "[serviceState] rolling-loss window expired — accumulator reset");
+  }
+
   _consecutiveLosses++;
   _rollingLossPnl += pnl;
 
-  // Recompute equity-relative loss if equity is known
+  // Equity-relative circuit breakers (primary)
   if (_vstEquity && _vstEquity > 0) {
     _rollingLossPct = (_rollingLossPnl / _vstEquity) * 100;
     if (_rollingLossPct <= ROLLING_LOSS_PCT_PAUSE) {
       transition("PAUSED", "EQUITY_LOSS_LIMIT");
       return;
     }
+    if (_rollingLossPct <= ROLLING_LOSS_PCT_DEGRADED) {
+      transition("DEGRADED", "ROLLING_NEGATIVE_EV");
+    }
   }
 
-  // Absolute USD fallback (secondary safeguard)
-  if (_consecutiveLosses >= CONSECUTIVE_LOSS_PAUSE_THRESHOLD || _rollingLossPnl <= ROLLING_LOSS_PAUSE_USD) {
-    transition("PAUSED", _rollingLossPnl <= ROLLING_LOSS_PAUSE_USD ? "ROLLING_NEGATIVE_EV" : "CONSECUTIVE_LOSSES");
+  // Absolute USD fallback (disabled by default — ROLLING_LOSS_PAUSE_USD defaults to -999999)
+  if (_rollingLossPnl <= ROLLING_LOSS_PAUSE_USD) {
+    transition("PAUSED", "ROLLING_NEGATIVE_EV");
+    return;
+  }
+
+  // Consecutive-loss gates
+  if (_consecutiveLosses >= CONSECUTIVE_LOSS_PAUSE_THRESHOLD) {
+    transition("PAUSED", "CONSECUTIVE_LOSSES");
   } else if (_consecutiveLosses >= CONSECUTIVE_LOSS_DEGRADED_THRESHOLD) {
     transition("DEGRADED", "CONSECUTIVE_LOSSES");
   }
@@ -252,9 +275,19 @@ export function recordTradeWin(): void {
   _consecutiveLosses = 0;
   _rollingLossPnl = 0;
   _rollingLossPct = 0;
-  if (_state === "DEGRADED" && _reason === "CONSECUTIVE_LOSSES") {
+  _rollingWindowStart = Date.now();
+  // Recover from any loss-induced DEGRADED state — both consecutive-loss and rolling-EV
+  // triggers should clear when a winning campaign closes. Does NOT auto-recover from
+  // infrastructure DEGRADED (QB_TIMEOUT, API_ERROR, STALE_DATA — those need their own signals).
+  const lossReasons: Set<ServiceStateReason> = new Set(["CONSECUTIVE_LOSSES", "ROLLING_NEGATIVE_EV"]);
+  if (_state === "DEGRADED" && _reason !== null && lossReasons.has(_reason)) {
     resetServiceState("MANUAL_RESET");
   }
+}
+
+/** Returns the current consecutive-loss streak count (number of campaigns). */
+export function getConsecutiveLosses(): number {
+  return _consecutiveLosses;
 }
 
 export function recordBtcPriceUpdate(): void {
@@ -291,6 +324,8 @@ export function resetServiceState(reason: ServiceStateReason = "MANUAL_RESET"): 
   _consecutiveLosses = 0;
   _rollingLossPnl = 0;
   _rollingLossPct = 0;
+  _rollingWindowStart = Date.now();
+  _vstEquity = null;
   _qbFailureTimes = [];
   _qbFailures = 0;
   _apiErrorTimes = [];

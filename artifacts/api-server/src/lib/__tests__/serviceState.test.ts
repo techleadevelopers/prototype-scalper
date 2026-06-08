@@ -1,5 +1,12 @@
 /**
  * Unit tests for the service state machine.
+ *
+ * Thresholds (aggressive demo phase defaults):
+ *   CONSECUTIVE_LOSS_DEGRADED = 8
+ *   CONSECUTIVE_LOSS_PAUSE    = 15
+ *   ROLLING_LOSS_PCT_DEGRADED = -5%
+ *   ROLLING_LOSS_PCT_PAUSE    = -10%
+ *   ROLLING_LOSS_PAUSE_USD    = -999999 (disabled)
  */
 import { describe, it, expect, beforeEach } from "vitest";
 import {
@@ -15,6 +22,7 @@ import {
   recordBtcPriceUpdate,
   pauseExecution,
   resetServiceState,
+  getConsecutiveLosses,
 } from "../serviceState";
 
 // Reset to HEALTHY before every test
@@ -69,38 +77,44 @@ describe("QB failure tracking", () => {
 });
 
 describe("consecutive loss circuit breaker", () => {
-  it("stays HEALTHY below degraded threshold (3 losses)", () => {
-    recordTradeLoss(-5);
-    recordTradeLoss(-5);
-    recordTradeLoss(-5);
+  it("stays HEALTHY below degraded threshold (7 losses)", () => {
+    for (let i = 0; i < 7; i++) recordTradeLoss(-5);
     expect(getServiceState().state).toBe("HEALTHY");
   });
 
-  it("transitions to DEGRADED at 4+ consecutive losses", () => {
-    for (let i = 0; i < 4; i++) recordTradeLoss(-5);
+  it("transitions to DEGRADED at 8+ consecutive losses", () => {
+    for (let i = 0; i < 8; i++) recordTradeLoss(-5);
     expect(getServiceState().state).toBe("DEGRADED");
   });
 
-  it("transitions to PAUSED at 8+ consecutive losses", () => {
-    for (let i = 0; i < 8; i++) recordTradeLoss(-5);
+  it("transitions to PAUSED at 15+ consecutive losses", () => {
+    for (let i = 0; i < 15; i++) recordTradeLoss(-5);
     expect(getServiceState().state).toBe("PAUSED");
     expect(isExecutionAllowed()).toBe(false);
   });
 
-  it("triggers PAUSED on rolling loss exceeding USD threshold", () => {
-    // ROLLING_LOSS_PAUSE_USD default = -50, single -60 loss triggers pause
+  it("USD threshold is disabled — a single -60 loss does NOT trigger PAUSED", () => {
+    // ROLLING_LOSS_PAUSE_USD defaults to -999999 (disabled) for VST phase
     recordTradeLoss(-60);
-    expect(getServiceState().state).toBe("PAUSED");
-    expect(getServiceState().reason).toBe("ROLLING_NEGATIVE_EV");
+    expect(getServiceState().state).toBe("HEALTHY");
   });
 
   it("resets consecutive loss count on a win", () => {
-    for (let i = 0; i < 4; i++) recordTradeLoss(-5);
+    for (let i = 0; i < 8; i++) recordTradeLoss(-5);
     expect(getServiceState().state).toBe("DEGRADED");
     recordTradeWin();
     expect(getServiceState().consecutiveLosses).toBe(0);
     // State resets to HEALTHY on win after consecutive-loss DEGRADED
     expect(getServiceState().state).toBe("HEALTHY");
+  });
+
+  it("getConsecutiveLosses() tracks the streak", () => {
+    expect(getConsecutiveLosses()).toBe(0);
+    recordTradeLoss(-5);
+    recordTradeLoss(-5);
+    expect(getConsecutiveLosses()).toBe(2);
+    recordTradeWin();
+    expect(getConsecutiveLosses()).toBe(0);
   });
 });
 
