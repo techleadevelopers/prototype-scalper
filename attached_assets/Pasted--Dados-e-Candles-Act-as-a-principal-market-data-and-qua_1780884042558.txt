@@ -1,0 +1,374 @@
+. Dados e Candles
+Act as a principal market-data and quantitative data-quality engineer.
+
+Audit the complete market-data pipeline used by the Backend and Quant Brain.
+
+Investigate:
+
+- candle source, timestamps and timezone;
+- completed versus unfinished candles;
+- duplicate, missing, stale and out-of-order candles;
+- reconnect and historical backfill;
+- symbol and timeframe normalization;
+- conflicting snapshots between Backend and Quant Brain;
+- indicator warm-up periods;
+- NaN, Infinity and impossible values;
+- training/inference feature parity;
+- duplicate execution from the same candle.
+
+Implement:
+
+- canonical market_event_id;
+- candle completion flag;
+- freshness and gap detection;
+- deduplication;
+- stale-data gates;
+- feature timestamp validation;
+- data-quality metrics and incidents.
+
+Add tests for duplicate, stale, incomplete, missing and out-of-order candles, reconnect recovery and timestamp violations.
+
+Report confirmed runtime gaps, files changed, exact test results and remaining data-quality risks.
+2. IA Shadow e Aprendizado
+Act as a principal ML validation engineer.
+
+Audit the complete Shadow ML lifecycle:
+
+entry-time observation
+→ pending sample
+→ reconciled VST campaign outcome
+→ final label
+→ training dataset
+→ chronological validation
+→ calibrated shadow prediction
+
+Investigate:
+
+- why samples remain at 0/300;
+- pending observations that never close;
+- duplicated or missing outcomes;
+- hit/miss class creation;
+- campaign versus execution samples;
+- future-data leakage;
+- class imbalance;
+- feature and label versioning;
+- model-readiness transitions;
+- whether every closed campaign reaches Quant Brain exactly once.
+
+Multiple stacked entries from one continuous signal must create one independent strategy label.
+
+Implement idempotent outcome ingestion, pending-sample reconciliation, dataset fingerprints and readiness diagnostics.
+
+Add tests for delayed labels, duplicate outcomes, unresolved campaigns, class imbalance, restart recovery and leakage.
+
+Do not lower the training threshold merely to make the dashboard look ready.
+3. Calibração e Qualidade do Edge
+Act as a principal quantitative model-calibration researcher.
+
+Audit whether model probabilities represent real observed campaign frequencies.
+
+Evaluate by:
+
+- score bucket;
+- symbol;
+- LONG/SHORT;
+- regime;
+- model version;
+- prediction age;
+- fallback versus ML.
+
+Measure:
+
+- Brier score;
+- Expected Calibration Error;
+- calibration slope and intercept;
+- PR-AUC and ROC-AUC;
+- net VST expectancy;
+- Profit Factor;
+- drawdown;
+- confidence intervals;
+- performance concentration.
+
+Compare:
+
+- raw probability;
+- Platt calibration;
+- isotonic calibration;
+- deterministic baseline.
+
+Use chronological out-of-sample evaluation. Calibration and evaluation must not use the same samples.
+
+Detect edge that exists only in one symbol, direction, regime or small sample.
+
+Return which scores are validated, uncertain, uncalibrated or statistically unsupported.
+4. Drift e Mudança de Mercado
+Act as a principal ML drift and market-regime engineer.
+
+Build independent monitoring for:
+
+DATA DRIFT:
+- feature distribution;
+- missingness;
+- volatility;
+- volume;
+- symbol universe;
+- prediction age.
+
+CONCEPT DRIFT:
+- predicted versus observed probability;
+- campaign expectancy;
+- Profit Factor;
+- calibration degradation;
+- regime and direction performance.
+
+Implement configurable PSI, Jensen-Shannon divergence, Brier score, calibration error and rolling expectancy monitoring.
+
+Define deterministic transitions:
+
+HEALTHY
+DEGRADED
+SHADOW_ONLY
+PAUSED
+
+Use hysteresis so states do not oscillate.
+
+Drift may reduce stacking or return ML to shadow mode, but it must not interrupt TP/SL monitoring, reconciliation or learning.
+
+Add synthetic and historical drift tests and report the exact thresholds selected.
+5. Modo Agressivo e Stacking
+Act as a principal quantitative portfolio and campaign-allocation engineer.
+
+Audit aggressive VST stacking across all configured symbols.
+
+Entry 1 is exploratory. Entries 2–10 require:
+
+- same direction;
+- persistent or stronger calibrated edge;
+- low enough uncertainty;
+- new completed candle or meaningful state change;
+- cooldown;
+- available campaign and portfolio capacity;
+- no duplicate signal or market event;
+- acceptable campaign drawdown.
+
+Prohibit martingale, loss doubling and blind averaging down.
+
+Measure marginal results for every stacking depth:
+
+- incremental PnL;
+- marginal expectancy;
+- additional drawdown;
+- edge at insertion;
+- contribution to campaign outcome;
+- MFE and MAE;
+- correlation-adjusted exposure.
+
+Create control groups:
+
+- one entry;
+- maximum three entries;
+- maximum five entries;
+- aggressive maximum ten entries.
+
+Prove whether each additional depth adds value out of sample.
+6. Integração Backend ↔ Quant Brain
+Act as a principal distributed quantitative systems architect.
+
+Audit the active contract between Backend and Quant Brain.
+
+Validate:
+
+- request and response schemas;
+- symbol and side conventions;
+- probability meaning;
+- score ranges;
+- uncertainty;
+- model and feature versions;
+- timestamps and data age;
+- timeouts and retries;
+- fallback semantics;
+- outcome acknowledgements;
+- idempotency.
+
+Trace:
+
+market_event_id
+→ signal_id
+→ prediction
+→ campaign_id
+→ client_order_id
+→ exchange_order_id
+→ campaign outcome
+→ ML sample
+
+Add shared contract tests.
+
+Test malformed responses, stale predictions, incompatible versions, service restarts, duplicate outcomes and timeouts.
+
+Never convert an unavailable prediction silently into zero probability or valid edge.
+7. Executor, Ordens e Reconciliação
+Act as a principal exchange-execution and financial-reconciliation engineer.
+
+Audit the BingX VST order lifecycle:
+
+requested
+→ accepted
+→ partially filled
+→ filled
+→ aggregated position
+→ partially closed
+→ fully closed
+→ PnL reconciled
+
+Investigate:
+
+- unknown order states;
+- blind retries;
+- duplicate placement;
+- server restart during placement;
+- aggregated stacked positions;
+- partial fills and closes;
+- TP/SL attachment and direction;
+- manual closures;
+- missing exchange identifiers;
+- position-side inversion.
+
+Use idempotent client_order_id values.
+
+Never retry placement blindly after a timeout. Query exchange state first.
+
+Add mathematical invariants for quantities, exposure, direction, PnL and exactly one campaign outcome.
+
+Run failure-injection tests for delayed, duplicated and missing BingX responses.
+8. PnL e Contabilidade
+Act as a principal financial-ledger and PnL validation engineer.
+
+Create one canonical source of truth for VST financial accounting.
+
+Reconcile:
+
+- initial equity;
+- current equity;
+- reserved and released margin;
+- gross realized PnL;
+- exchange commission;
+- net realized PnL;
+- unrealized PnL;
+- campaign PnL;
+- execution PnL.
+
+Required invariants:
+
+campaign_pnl = sum(execution_pnl)
+remaining_quantity = opened_quantity - closed_quantity
+net_pnl = gross_pnl - exchange_commission
+one final outcome per campaign
+
+Use values reported by BingX VST whenever available.
+
+Do not simulate complex pre-trade slippage. Record execution-price deviation only after execution.
+
+Add tests for LONG, SHORT, partial closure, stacking, commission, restart recovery, duplicate events and reconciliation differences.
+9. Processamento em Massa
+Act as a principal performance and reliability engineer.
+
+Stress-test the complete system under aggressive VST research load:
+
+- all configured symbols;
+- 50 simultaneous entries;
+- 10 entries per symbol;
+- overlapping market, sniper and monitor cycles;
+- concurrent predictions and outcomes;
+- database slowdown;
+- Quant Brain restart;
+- API restart;
+- training during inference;
+- retry storms.
+
+Measure:
+
+- p50/p95/p99 latency;
+- CPU and memory;
+- event-loop delay;
+- queue depth;
+- database pool usage;
+- timeout rate;
+- duplicate and lost events;
+- prediction age at execution.
+
+Implement bounded queues, backpressure, job locks, retry budgets, batch writes and priority scheduling.
+
+Priority order:
+
+1. Position protection and monitoring.
+2. Reconciliation.
+3. Inference.
+4. New entries.
+5. Training.
+6. Analytics and retention.
+
+Prove that training and logging cannot starve position protection.
+10. Teste Estratégico e Promoção
+Act as a principal quantitative experimentation and model-governance engineer.
+
+Build champion/challenger governance for:
+
+- deterministic baseline;
+- current champion;
+- ML challenger;
+- stacking-policy challenger;
+- early-exit shadow challenger.
+
+Require:
+
+- immutable model artifacts;
+- feature, label and policy versions;
+- chronological walk-forward validation;
+- purge gaps where labels overlap;
+- independent campaign samples;
+- confidence intervals;
+- multiple symbols, sides and regimes;
+- out-of-sample net VST expectancy;
+- controlled drawdown;
+- baseline comparison.
+
+Promotion must be evidence-based and reversible.
+
+Automatically return a degraded challenger to shadow mode when calibration, expectancy or operational reliability deteriorates.
+
+Never optimize against the final test set.
+11. Segurança e Configuração Demo/Real
+Act as a principal trading-platform security engineer.
+
+Audit whether VST/demo and future real execution are structurally separated.
+
+Verify:
+
+- credential source;
+- account identity;
+- environment identity;
+- endpoint selection;
+- startup validation;
+- secret redaction;
+- authorization;
+- configuration changes;
+- audit history.
+
+The application must refuse startup if environment and credentials disagree.
+
+Real-money activation must require an explicit, separate configuration and must never occur because of a default value, copied environment file or fallback.
+
+Add tests proving demo credentials cannot route to real execution and secrets cannot appear in logs, APIs or errors.
+Ordem recomendada
+
+1. Dados
+2. Shadow ML
+3. Backend ↔ Quant Brain
+4. Executor e reconciliação
+5. PnL
+6. Calibração
+7. Drift
+8. Stacking agressivo
+9. Processamento em massa
+10. Governança
+11. Segurança

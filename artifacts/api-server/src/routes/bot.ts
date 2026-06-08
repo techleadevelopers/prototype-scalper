@@ -550,6 +550,8 @@ router.post("/bot/order", async (req: Request, res: Response) => {
         volumeDelta: sentimentForQb.indicators.volumeDelta,
         momentum24h: sentimentForQb.indicators.momentum24h,
       } : undefined,
+      marketEventId: candle.marketEventId,
+      featureVersion: candle.candleOpenTimeMs ? String(candle.candleOpenTimeMs) : undefined,
     };
     const qbResult = await evaluateQuantBrainEdge(qbInput);
     const qbMode = quantBrainGateMode();

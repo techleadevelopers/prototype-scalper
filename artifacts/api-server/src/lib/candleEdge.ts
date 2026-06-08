@@ -26,6 +26,7 @@
  */
 
 import { EventEmitter } from "events";
+import { createHash } from "crypto";
 import { z } from "zod";
 
 // ========== CONSTANTS ==========
@@ -79,6 +80,11 @@ export const CandleEdgeSchema = z.object({
   suggestedSide: EdgeSideSchema,
   fetchedAt: z.number(),
   error: z.string().optional(),
+  // Candle completion provenance — prevent live-candle repainting
+  candleOpenTimeMs: z.number().optional(),
+  candleCloseTimeMs: z.number().optional(),
+  candleIsComplete: z.boolean().optional(),
+  marketEventId: z.string().optional(),
   // NOVOS CAMPOS
   macdLine: z.number().optional(),
   macdSignal: z.number().optional(),
@@ -430,6 +436,27 @@ function computeScores(
     shortScore: clamp01(Math.max(continuationShort, contrarianShort)),
     reversalScore,
   };
+}
+
+// ========== INTERVAL UTILITIES ==========
+
+function intervalToMs(interval: CandleInterval): number {
+  const map: Record<CandleInterval, number> = {
+    "1m": 60_000,
+    "3m": 180_000,
+    "5m": 300_000,
+    "15m": 900_000,
+    "30m": 1_800_000,
+    "1h": 3_600_000,
+  };
+  return map[interval] ?? 300_000;
+}
+
+function makeMarketEventId(symbol: string, interval: CandleInterval, candleOpenTimeMs: number): string {
+  return createHash("sha256")
+    .update(`${symbol}|${interval}|${candleOpenTimeMs}`)
+    .digest("hex")
+    .slice(0, 16);
 }
 
 // ========== SYMBOL NORMALIZATION ==========

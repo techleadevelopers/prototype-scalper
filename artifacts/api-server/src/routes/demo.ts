@@ -1127,6 +1127,8 @@ router.post("/demo/order", async (req: Request, res: Response) => {
       currentWinRate,
       currentProfitFactor,
       config,
+      marketEventId: candle.marketEventId,
+      featureVersion: candle.candleOpenTimeMs ? String(candle.candleOpenTimeMs) : undefined,
     }).then((edge) => {
       if (edge.error && edge.error !== "missing QUANT_BRAIN_URL") {
         req.log.warn({ error: edge.error, symbol, positionSide }, "quant brain edge unavailable");
@@ -1149,6 +1151,8 @@ router.post("/demo/order", async (req: Request, res: Response) => {
       currentWinRate,
       currentProfitFactor,
       config,
+      marketEventId: candle.marketEventId,
+      featureVersion: candle.candleOpenTimeMs ? String(candle.candleOpenTimeMs) : undefined,
     });
     quantBrainEdge = edge;
     if (edge.error && edge.error !== "missing QUANT_BRAIN_URL") {
