@@ -53,6 +53,33 @@ export interface LiveTradeEntry {
   expectedTpProfit: number;
   takeProfitPct: number;
   stopLossPct: number;
+  riskTier?: "MICRO" | "SCOUT" | "BASE" | "BOOST" | "AGGRESSIVE" | "MAX_SNIPER";
+  sizeMultiplier?: number;
+  sizeReason?: string;
+  recommendedMargin?: number;
+  recommendedLeverage?: number;
+  maxLossIfStop?: number;
+  notional?: number;
+  signalId?: string;
+  marketEventId?: string;
+  predictionId?: string;
+  featureVersion?: string;
+  signalCreatedAt?: number;
+  qbEvaluatedAt?: number;
+  orderRequestedAt?: number;
+  orderSentAt?: number;
+  orderAckAt?: number;
+  positionConfirmedAt?: number;
+  protectionAttachedAt?: number;
+  spreadBps?: number;
+  spreadAtSignal?: number;
+  spreadAtEntry?: number;
+  orderType?: string;
+  playbook?: string;
+  readinessScopeId?: string;
+  promotionState?: "DEMO_ONLY" | "SHADOW_LIVE" | "MICRO_LIVE" | "LIMITED_LIVE" | "STANDARD_LIVE" | "SUSPENDED";
+  stackingDepth?: number;
+  exitPolicy?: string;
 }
 
 interface BingXRawOrder {
@@ -388,6 +415,39 @@ async function pollCycle(): Promise<void> {
             expectedExitPrice: exitPrice > 0 ? exitPrice : undefined,
           },
         );
+        outcome.signalId = entry.signalId;
+        outcome.marketEventId = entry.marketEventId;
+        outcome.predictionId = entry.predictionId;
+        outcome.featureVersion = entry.featureVersion;
+        outcome.expectedEntryPrice = entry.expectedEntryPrice;
+        outcome.markPriceBeforeOrder = entry.expectedEntryPrice;
+        outcome.actualAvgEntryPrice = outcome.entryPrice;
+        outcome.actualExitPrice = outcome.exitPrice;
+        outcome.signalCreatedAt = entry.signalCreatedAt;
+        outcome.qbEvaluatedAt = entry.qbEvaluatedAt;
+        outcome.orderRequestedAt = entry.orderRequestedAt;
+        outcome.orderSentAt = entry.orderSentAt;
+        outcome.orderAckAt = entry.orderAckAt;
+        outcome.positionConfirmedAt = entry.positionConfirmedAt ?? outcome.entryTime;
+        outcome.positionClosedAt = outcome.exitTime;
+        outcome.monitorDetectedCloseAt = Date.now();
+        outcome.protectionAttachedAt = entry.protectionAttachedAt;
+        outcome.spreadBps = entry.spreadBps;
+        outcome.spreadAtSignal = entry.spreadAtSignal;
+        outcome.spreadAtEntry = entry.spreadAtEntry;
+        outcome.orderType = entry.orderType;
+        outcome.playbook = entry.playbook;
+        outcome.readinessScopeId = entry.readinessScopeId;
+        outcome.promotionState = entry.promotionState;
+        outcome.stackingDepth = entry.stackingDepth;
+        outcome.exitPolicy = entry.exitPolicy;
+        outcome.riskTier = entry.riskTier;
+        outcome.sizeMultiplier = entry.sizeMultiplier;
+        outcome.sizeReason = entry.sizeReason;
+        outcome.recommendedMargin = entry.recommendedMargin;
+        outcome.recommendedLeverage = entry.recommendedLeverage;
+        outcome.maxLossIfStop = entry.maxLossIfStop;
+        outcome.notional = entry.notional;
 
         recordTradeOutcome(outcome);
         recordedIds.add(entry.entryOrderId);
