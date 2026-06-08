@@ -199,9 +199,15 @@ function normalizeTelemetryOutcome(outcome: TradeOutcome): NormalizedTrade {
     promotionState?: PromotionState;
     stackingDepth?: number;
     exitPolicy?: string;
+    context?: string;
   };
-  const score = outcome.recommendedMargin ? outcome.recommendedMargin / Math.max(outcome.marginUsed, 0.0001) : undefined;
-  const isLive = outcome.source === "bingx-live" || outcome.sourceType === "live" || outcome.isDemo === false;
+  const score = outcome.aggressiveScore
+    ?? outcome.calibratedScore
+    ?? outcome.calibratedProbability
+    ?? outcome.mlProbability
+    ?? undefined;
+  const isShadow = outcome.sourceType === "shadow";
+  const isLive = !isShadow && (outcome.source === "bingx-live" || outcome.sourceType === "live" || outcome.isDemo === false);
   return {
     symbol: outcome.symbol.toUpperCase(),
     positionSide: outcome.positionSide,
@@ -209,7 +215,7 @@ function normalizeTelemetryOutcome(outcome: TradeOutcome): NormalizedTrade {
     playbook: asPlaybook(maybe.playbook ?? outcome.strategyVersion ?? outcome.featureVersion),
     btcRegime: outcome.btcRegime,
     scoreBucket: scoreBucket(score),
-    context: String(outcome.sourceType ?? (isLive ? "LIVE_EXECUTION" : DEFAULT_CONTEXT)).toUpperCase(),
+    context: String(maybe.context ?? DEFAULT_CONTEXT).toUpperCase(),
     stackingDepth: Math.max(1, maybe.stackingDepth ?? outcome.entryCount ?? 1),
     exitPolicy: String(maybe.exitPolicy ?? DEFAULT_EXIT_POLICY).toUpperCase(),
     positionSizingTier: String(outcome.riskTier ?? DEFAULT_TIER).toUpperCase(),
@@ -221,7 +227,7 @@ function normalizeTelemetryOutcome(outcome: TradeOutcome): NormalizedTrade {
     entryTime: outcome.entryTime,
     exitTime: outcome.exitTime,
     isLive,
-    isShadow: outcome.sourceType === "shadow",
+    isShadow,
     sideMismatch: sideForPosition(outcome.positionSide) !== outcome.side,
     executionDelayMs: Math.max(0, (outcome.positionConfirmedAt ?? outcome.orderAckAt ?? outcome.entryTime) - (outcome.signalCreatedAt ?? outcome.orderRequestedAt ?? outcome.entryTime)),
   };
@@ -362,6 +368,7 @@ function degradeState(base: PromotionState, metrics: ReadinessMetrics): Promotio
 
 function promotionState(score: number, metrics: ReadinessMetrics): PromotionState {
   if (metrics.pipelineIntegrity < 0.65) return "SUSPENDED";
+  if (metrics.demoTrades < envNum("LIVE_READINESS_MIN_DEMO_TRADES", 20)) return "DEMO_ONLY";
   if (score >= 0.90 && metrics.demoTrades >= envNum("LIVE_READINESS_STANDARD_TRADES", 80) && metrics.liveTrades >= 30) {
     return degradeState("STANDARD_LIVE", metrics);
   }
@@ -369,7 +376,6 @@ function promotionState(score: number, metrics: ReadinessMetrics): PromotionStat
     return degradeState("LIMITED_LIVE", metrics);
   }
   if (score >= envNum("LIVE_READINESS_APPROVAL_SCORE", 0.72)) return degradeState("MICRO_LIVE", metrics);
-  if (metrics.demoTrades >= Math.floor(envNum("LIVE_READINESS_MIN_DEMO_TRADES", 20) * 0.5)) return "SHADOW_LIVE";
   return "DEMO_ONLY";
 }
 
@@ -541,7 +547,12 @@ export function evaluateLiveReadinessForOrder(input: {
     scope.symbol === symbol &&
     scope.side === input.order.positionSide &&
     scope.playbook === asPlaybook(input.order.playbook ?? DEFAULT_PLAYBOOK) &&
-    (input.order.btcRegime ? scope.regime === input.order.btcRegime : true),
+    (input.order.btcRegime ? scope.regime === input.order.btcRegime : true) &&
+    (input.order.context ? scope.context === input.order.context.toUpperCase() : true) &&
+    (input.order.stackingDepth ? scope.stackingDepth === input.order.stackingDepth : true) &&
+    (input.order.exitPolicy ? scope.exitPolicy === input.order.exitPolicy.toUpperCase() : true) &&
+    (input.order.positionSizingTier ? scope.positionSizingTier === input.order.positionSizingTier.toUpperCase() : true) &&
+    (input.order.score == null ? true : scope.scoreBucket === scoreBucket(input.order.score)),
   );
   const scope = candidates
     .filter((candidate) => score >= candidate.allowedScoreMin)
