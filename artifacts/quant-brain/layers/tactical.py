@@ -383,7 +383,22 @@ def get_snapshot_history(symbol: str, window_seconds: int = 300) -> list[dict]:
     if not sym.endswith("-USDT"):
         sym = f"{sym}-USDT"
     cutoff = time.time() - window_seconds
-    return [x for x in _snap_buffer[sym] if x.get("timestamp", 0) >= cutoff]
+    in_memory = [x for x in _snap_buffer[sym] if x.get("timestamp", 0) >= cutoff]
+    if in_memory:
+        return in_memory
+    # After a restart the in-memory deque is empty.  Fall back to the persisted
+    # feature_snapshots DB so that signal finalization can still run.
+    try:
+        import asyncio
+        hours_needed = max(1, int(window_seconds / 3600) + 1)
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # Can't block — return empty; caller should use async fallback
+            return []
+        rows = loop.run_until_complete(kb.get_feature_history(sym, hours=hours_needed))
+        return [r for r in rows if r.get("timestamp", 0) >= cutoff]
+    except Exception:
+        return []
 
 
 def get_all_snapshot_history(window_seconds: int = 300) -> dict[str, list[dict]]:
@@ -516,6 +531,8 @@ async def _process_snapshot(snap: MarketSnapshot):
     if int(snap.timestamp) % 30 < 5:
         await kb.save_feature_snapshot(sym, {
             "price": snap.price,
+            "bid": snap.bid,
+            "ask": snap.ask,
             "price_change_pct": snap.price_change_pct,
             "volume_ratio": snap.volume_ratio,
             "oi_change_pct": snap.oi_change_pct,

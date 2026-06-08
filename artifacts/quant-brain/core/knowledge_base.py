@@ -411,10 +411,21 @@ async def init_db():
             "ask_depth_5": "REAL",
             "book_imbalance": "REAL",
             "cvd": "REAL",
+            "bid": "REAL",
+            "ask": "REAL",
         }
         for name, definition in feature_migrations.items():
             if name not in feature_columns:
                 await db.execute(f"ALTER TABLE feature_snapshots ADD COLUMN {name} {definition}")
+
+        # Migrações para signal_outcomes
+        signal_columns = await table_columns("signal_outcomes", DB_PATH)
+        signal_migrations = {
+            "market_event_id": "TEXT",
+        }
+        for name, definition in signal_migrations.items():
+            if name not in signal_columns:
+                await db.execute(f"ALTER TABLE signal_outcomes ADD COLUMN {name} {definition}")
 
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_signal_decision_group "
@@ -533,17 +544,20 @@ async def _update_daily_metrics(db: Any, symbol: str, side: str, pnl_pct: float,
 
 
 async def save_feature_snapshot(symbol: str, features: dict):
-    """Salva snapshot de features com campos avançados."""
+    """Salva snapshot de features com campos avançados, incluindo bid/ask para
+    que o fallback de sinal_learning possa reconstruir preços executáveis."""
     async with connect(DB_PATH) as db:
         await db.execute(
             """INSERT INTO feature_snapshots
-               (symbol, timestamp, price, price_change_pct, volume_ratio,
+               (symbol, timestamp, price, bid, ask, price_change_pct, volume_ratio,
                 oi_change_pct, funding_rate, rsi, ema_cross, atr_pct,
                 spread_bps, btc_regime, bid_depth_5, ask_depth_5, book_imbalance, cvd)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 symbol, time.time(),
                 features.get("price", 0),
+                features.get("bid") or features.get("price", 0),
+                features.get("ask") or features.get("price", 0),
                 features.get("price_change_pct", 0),
                 features.get("volume_ratio", 1),
                 features.get("oi_change_pct", 0),
@@ -1307,6 +1321,12 @@ async def get_recent_insights(limit: int = 5) -> list[dict]:
 
 
 async def get_feature_history(symbol: str, hours: int = 24) -> list[dict]:
+    """Return feature snapshot history compatible with signal_learning price lookups.
+
+    Each returned dict is guaranteed to have ``price``, ``bid``, and ``ask`` fields
+    so that ``_nearest_price`` and ``_executable_price`` work correctly even when
+    the DB rows pre-date the bid/ask columns.
+    """
     since = time.time() - hours * 3600
     async with connect(DB_PATH) as db:
         db.row_factory = Row
@@ -1316,7 +1336,18 @@ async def get_feature_history(symbol: str, hours: int = 24) -> list[dict]:
                ORDER BY timestamp ASC""",
             (symbol, since)
         )).fetchall()
-        return [dict(r) for r in rows]
+        result = []
+        for r in rows:
+            d = dict(r)
+            # Guarantee bid/ask presence for _executable_price fallback.
+            # bid/ask columns were added via migration; older rows may be NULL.
+            price = float(d.get("price") or 0)
+            if not d.get("bid"):
+                d["bid"] = price
+            if not d.get("ask"):
+                d["ask"] = price
+            result.append(d)
+        return result
 
 
 async def get_recent_observations(symbol: str = None, hours: int = 48, limit: int = 50) -> list[dict]:
