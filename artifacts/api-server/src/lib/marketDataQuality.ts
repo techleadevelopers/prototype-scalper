@@ -1,3 +1,6 @@
+import fs from "fs";
+import path from "path";
+
 export type MarketDataIncidentType =
   | "DUPLICATE"
   | "GAP"
@@ -63,6 +66,44 @@ const metrics = {
 };
 const recentIncidents: MarketDataIncident[] = [];
 const executionClaims = new Map<string, number>();
+const EXECUTION_CLAIMS_PATH = process.env["MARKET_EVENT_CLAIMS_PATH"]
+  ?? path.join(process.cwd(), "data", "market-event-claims.json");
+
+function pruneExecutionClaims(nowMs = Date.now(), retentionMs = 86_400_000): void {
+  for (const [key, claimedAt] of executionClaims) {
+    if (nowMs - claimedAt > retentionMs) executionClaims.delete(key);
+  }
+}
+
+function persistExecutionClaims(): void {
+  try {
+    fs.mkdirSync(path.dirname(EXECUTION_CLAIMS_PATH), { recursive: true });
+    const tmp = `${EXECUTION_CLAIMS_PATH}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(Array.from(executionClaims.entries())), "utf8");
+    fs.renameSync(tmp, EXECUTION_CLAIMS_PATH);
+  } catch {
+    // Claims remain in memory; next mutation retries persistence.
+  }
+}
+
+function loadExecutionClaims(): void {
+  try {
+    if (!fs.existsSync(EXECUTION_CLAIMS_PATH)) return;
+    const parsed = JSON.parse(fs.readFileSync(EXECUTION_CLAIMS_PATH, "utf8")) as unknown;
+    if (!Array.isArray(parsed)) return;
+    for (const item of parsed) {
+      if (Array.isArray(item) && typeof item[0] === "string" && Number.isFinite(item[1])) {
+        executionClaims.set(item[0], Number(item[1]));
+      }
+    }
+    pruneExecutionClaims();
+    persistExecutionClaims();
+  } catch {
+    executionClaims.clear();
+  }
+}
+
+loadExecutionClaims();
 
 export function normalizeMarketSymbol(symbol: string): string {
   const compact = symbol.trim().toUpperCase().replace(/[_/]/g, "-");
@@ -207,9 +248,7 @@ export function claimMarketEventExecution(
   nowMs: number = Date.now(),
   retentionMs: number = 86_400_000,
 ): boolean {
-  for (const [key, claimedAt] of executionClaims) {
-    if (nowMs - claimedAt > retentionMs) executionClaims.delete(key);
-  }
+  pruneExecutionClaims(nowMs, retentionMs);
   const key = `${marketEventId}|${positionSide}`;
   if (executionClaims.has(key)) {
     metrics.duplicateExecutions++;
@@ -223,6 +262,7 @@ export function claimMarketEventExecution(
     return false;
   }
   executionClaims.set(key, nowMs);
+  persistExecutionClaims();
   return true;
 }
 
@@ -231,6 +271,7 @@ export function releaseMarketEventExecution(
   positionSide: "LONG" | "SHORT",
 ): void {
   executionClaims.delete(`${marketEventId}|${positionSide}`);
+  persistExecutionClaims();
 }
 
 export function getMarketDataQualityStatus() {
@@ -238,6 +279,7 @@ export function getMarketDataQualityStatus() {
     metrics: { ...metrics },
     incidents: [...recentIncidents],
     activeExecutionClaims: executionClaims.size,
+    activeExecutionClaimKeys: Array.from(executionClaims.keys()),
   };
 }
 
@@ -245,4 +287,5 @@ export function resetMarketDataQualityState(): void {
   for (const key of Object.keys(metrics) as Array<keyof typeof metrics>) metrics[key] = 0;
   recentIncidents.length = 0;
   executionClaims.clear();
+  persistExecutionClaims();
 }
