@@ -1752,6 +1752,7 @@ async function runDemoSniperCycle(): Promise<void> {
     score: number;
     tier: number;
     currentOpen: number;
+    marketEventId?: string;
   }
 
   const candidates: ScoredCandidate[] = [];
@@ -1782,6 +1783,7 @@ async function runDemoSniperCycle(): Promise<void> {
       const currentOpen = openCounts.get(posKey) ?? 0;
       if (currentOpen >= Math.min(tier, DEMO_SNIPER_PER_SYMBOL_MAX)) continue;
 
+      const edge = candleEdges[i] as { marketEventId?: string } | undefined;
       candidates.push({
         symbol: sym,
         positionSide: ps,
@@ -1789,6 +1791,7 @@ async function runDemoSniperCycle(): Promise<void> {
         score: combinedScore,
         tier,
         currentOpen,
+        marketEventId: edge?.marketEventId,
       });
     }
   }
@@ -1800,6 +1803,9 @@ async function runDemoSniperCycle(): Promise<void> {
   let placed = 0;
   let skipped = 0;
   let globalHeadroom = DEMO_SNIPER_GLOBAL_MAX - globalOpen;
+  // Per-cycle dedup: skip any candidate whose candle event was already processed
+  // this cycle (prevents double-firing on the same closed candle).
+  const cycleProcessedEventIds = new Set<string>();
 
   for (const c of candidates) {
     if (globalHeadroom <= 0) break;
@@ -1815,6 +1821,11 @@ async function runDemoSniperCycle(): Promise<void> {
       if (globalHeadroom <= 0) break;
 
       // ── Per-entry entry-allowed check ──────────────────────────────────────
+      // Dedup: skip if this candle event was already processed this cycle.
+      if (c.marketEventId && cycleProcessedEventIds.has(`${c.symbol}:${c.positionSide}:${c.marketEventId}`)) {
+        skipped++;
+        break;
+      }
       // SHADOW_ONLY: only first entry per campaign allowed.
       // Resolve campaign BEFORE fetching price (no network call yet).
       const entryNow = Date.now();
@@ -1904,6 +1915,9 @@ async function runDemoSniperCycle(): Promise<void> {
           closedAt: null,
         }).catch(() => {});
 
+        if (c.marketEventId) {
+          cycleProcessedEventIds.add(`${c.symbol}:${c.positionSide}:${c.marketEventId}`);
+        }
         demoSniper.totalPlaced++;
         placed++;
         globalHeadroom--;

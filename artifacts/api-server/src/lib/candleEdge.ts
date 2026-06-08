@@ -549,10 +549,15 @@ export async function computeCandleEdge(
       throw new Error(`Insufficient candles: ${candles.length}`);
     }
 
-    const closes = candles.map((c) => c.close);
-    const highs = candles.map((c) => c.high);
-    const lows = candles.map((c) => c.low);
-    const volumes = candles.map((c) => c.volume);
+    // Use all-but-last (completed) candles for indicator computation to avoid
+    // live-candle repainting. The last candle in the BingX response is still
+    // forming and its OHLCV values change every tick.
+    const indicatorCandles = candles.length >= 2 ? candles.slice(0, -1) : candles;
+
+    const closes = indicatorCandles.map((c) => c.close);
+    const highs = indicatorCandles.map((c) => c.high);
+    const lows = indicatorCandles.map((c) => c.low);
+    const volumes = indicatorCandles.map((c) => c.volume);
 
     const ema9vals = ema(closes, 9);
     const ema21vals = ema(closes, 21);
@@ -581,7 +586,7 @@ export async function computeCandleEdge(
     const atrPct = lastClose > 0 ? (atrVal / lastClose) * 100 : 0;
     const volatilityRegime = detectVolatilityRegime(atrPct);
 
-    const lastCandle = candles[candles.length - 1];
+    const lastCandle = indicatorCandles[indicatorCandles.length - 1];
     const priorClose = closes[Math.max(0, closes.length - 4)];
     const lastCandleMovePct = lastCandle.open > 0
       ? ((lastCandle.close - lastCandle.open) / lastCandle.open) * 100
@@ -608,10 +613,16 @@ export async function computeCandleEdge(
     const suggestedSide: EdgeSide = longScore > shortScore && longScore > 0.35 ? "LONG" :
                                     shortScore > longScore && shortScore > 0.35 ? "SHORT" : "NEUTRAL";
 
+    // Candle completion provenance
+    const candleOpenTimeMs = lastCandle.openTime;
+    const intMs = intervalToMs(interval);
+    const candleCloseTimeMs = candleOpenTimeMs + intMs;
+    const marketEventId = makeMarketEventId(symbol, interval, candleOpenTimeMs);
+
     const edge: CandleEdge = {
       symbol,
       interval,
-      candleCount: candles.length,
+      candleCount: indicatorCandles.length,
       lastClose,
       ema9: ema9val,
       ema21: ema21val,
@@ -628,6 +639,11 @@ export async function computeCandleEdge(
       shortScore,
       suggestedSide,
       fetchedAt: Date.now(),
+      // Candle completion provenance
+      candleOpenTimeMs,
+      candleCloseTimeMs,
+      candleIsComplete: true,
+      marketEventId,
       // NOVOS CAMPOS
       macdLine,
       macdSignal: signalLine,
