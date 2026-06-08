@@ -457,10 +457,14 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
     # conservative: full defensive gating (original behaviour).
     risk_profile = str(
         config.get("riskProfile")
+        or config.get("decisionProfile")
         or payload.get("riskProfile")
+        or payload.get("decisionProfile")
         or "balanced"
     ).lower()
-    is_aggressive = risk_profile in ("aggressive", "sniper_max")
+    # demo_learning_aggressive: maximum learning velocity, only fatal hard-blocks fire
+    is_aggressive = risk_profile in ("aggressive", "sniper_max", "demo_learning_aggressive")
+    is_demo_learning = risk_profile == "demo_learning_aggressive"
     score_penalties: float = 0.0
 
     # ── Signal expiry check (contract v2) ──────────────────────────────────────
@@ -597,6 +601,12 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
     ):
         gate_rejects.append("LOSS_STREAK_KILL_SWITCH: consecutive loss limit reached")
 
+    # Hard block: sniper direction conflicts with requested position side (always fatal, all profiles)
+    if sniper["decision"] == "ALLOW_LONG" and position_side != "LONG":
+        gate_rejects.append(f"SNIPER_SIDE_MISMATCH: sniper recommends LONG but entry is {position_side}")
+    elif sniper["decision"] == "ALLOW_SHORT" and position_side != "SHORT":
+        gate_rejects.append(f"SNIPER_SIDE_MISMATCH: sniper recommends SHORT but entry is {position_side}")
+
     if sniper["decision"].startswith("BLOCK_"):
         gate_rejects.append(f"SNIPER_{sniper['decision']}: {','.join(sniper['reasons'])}")
     elif sniper["decision"] == "WAIT":
@@ -652,15 +662,16 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
     net_ev_usdt = hit_probability * net_target_usdt - (1 - hit_probability) * loss_usdt
     _ev_samples = effective_stats.get("samples", 0)
     if is_aggressive:
-        # In aggressive mode: only hard-block if large confirmed sample AND strongly negative EV.
-        # Otherwise let the score penalty system handle it.
-        if _ev_samples >= 30 and net_ev_usdt < -0.50:
+        # Sample-count based EV rules (0-50: learn, 50-150: penalise, 150+: hard-block if toxic)
+        if _ev_samples >= 150 and net_ev_usdt < -0.50:
             gate_rejects.append(
                 f"NET_EV_REJECT: expected value {net_ev_usdt:.4f} USDT "
-                f"(hard-block: {_ev_samples} samples, strongly negative)"
+                f"(150+ samples, confirmed negative)"
             )
-        elif _ev_samples >= signal_edge["minSamples"] and net_ev_usdt < 0:
-            score_penalties += 0.06  # EV negative but not yet confirmed catastrophe
+        elif _ev_samples >= 50 and net_ev_usdt < 0:
+            # 50-149 samples: proportional score penalty, not hard block
+            score_penalties += min(0.15, abs(net_ev_usdt) * 0.30)
+        # 0-49 samples: pure learning mode — no EV penalty at all
     else:
         if _ev_samples >= signal_edge["minSamples"] and net_ev_usdt <= 0:
             gate_rejects.append(f"NET_EV_REJECT: expected value {net_ev_usdt:.4f} USDT")
@@ -706,14 +717,17 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
     samples = int(stats.get("samples", 0) or 0)
     _realized_min = recommendation.get("minSamplesForLiveGate", 8)
     if is_aggressive:
-        # In aggressive mode: only block if large sample AND score is genuinely toxic
-        if samples >= 20 and not recommendation.get("shadowRecommendation") and float(recommendation.get("score", 1.0)) < 0.25:
+        # Sample-count based realized-edge rules (0-50: learn, 50-150: penalise, 150+: hard-block if toxic)
+        if samples >= 150 and not recommendation.get("shadowRecommendation") and float(recommendation.get("score", 1.0)) < 0.25:
             gate_rejects.append(
                 f"REALIZED_EDGE_REJECT: score {recommendation.get('score', 0):.4f} "
-                f"(hard-block: {samples} samples, toxic)"
+                f"(150+ samples, confirmed toxic)"
             )
-        elif samples >= _realized_min and not recommendation.get("shadowRecommendation"):
-            score_penalties += 0.05  # Not blocking, but reducing ranking
+        elif samples >= 50 and not recommendation.get("shadowRecommendation"):
+            # 50-149 samples: proportional ranking penalty
+            realized_score = float(recommendation.get("score", 0.5))
+            score_penalties += max(0.0, (0.5 - realized_score) * 0.20)
+        # 0-49 samples: pure learning mode — no realized-edge penalty
     else:
         if samples >= _realized_min and not recommendation.get("shadowRecommendation"):
             gate_rejects.append(f"REALIZED_EDGE_REJECT: score {recommendation.get('score', 0):.4f}")

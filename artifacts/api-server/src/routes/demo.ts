@@ -3,7 +3,7 @@ import { createHmac, randomUUID } from "crypto";
 import type { Request, Response } from "express";
 import { getBotConfig } from "../lib/botConfig";
 import { getEngine, recordTradeOutcome, updateTradeOutcome } from "../lib/telemetryStore";
-import { evaluateQuantBrainEdge, quantBrainGateMode, syncQuantBrainOutcome } from "../lib/quantBrainClient";
+import { evaluateQuantBrainEdge, quantBrainGateMode, syncQuantBrainOutcome, reportSignalLifecycle } from "../lib/quantBrainClient";
 import type { BtcRegime, TradeOutcome } from "../lib/adaptiveEngine";
 import { feeDragRejectReason } from "../lib/executionRisk";
 import { buildTelemetryState } from "./telemetry";
@@ -63,7 +63,7 @@ void initDemoTradeStore().then(() => {
         positionSide: storeEntry.positionSide,
         quantity: storeEntry.qty,
         entryPrice: storeEntry.entryPrice,
-        expectedEntryPrice: storeEntry.expectedEntryPrice,
+        expectedEntryPrice: storeEntry.expectedEntryPrice ?? undefined,
         entryTime: storeEntry.entryTime,
         hourUtc: storeEntry.hourUtc,
         btcRegime: storeEntry.btcRegime as BtcRegime,
@@ -788,6 +788,14 @@ async function closeTriggeredDemoPositions(
         if (!result.synced && result.error !== "missing QUANT_BRAIN_URL") {
           req.log.warn({ error: result.error, outcomeId: outcome.id }, "quant brain sync skipped");
         }
+      });
+      reportSignalLifecycle({
+        eventType: closeSignal.exitReason === "TP" ? "tp_hit" : "sl_hit",
+        symbol: position.symbol,
+        side: entry.positionSide,
+        isDemo: true,
+        riskProfile: config.decisionProfile,
+        metadata: { orderId: entry.orderId, realizedPnl: realized.realizedPnl, exitReason: closeSignal.exitReason },
       });
       enqueueDemoPnlReconciliation(req, creds, outcome, balanceBefore, grossPnl);
       closed.push({
@@ -1629,9 +1637,17 @@ const demoSniper: DemoSniperState = {
  */
 function scoreTierMaxEntries(score: number): number {
   let base: number;
-  if (score < 0.60) return 0;
-  else if (score < 0.70) base = 1;
-  else if (score < 0.80) base = 3;
+  // Tiers aligned with aggressiveScore spec:
+  // < 0.45 → no entry (hard reject)
+  // 0.45–0.55 → 1 entry (learning)
+  // 0.55–0.68 → 2 entries (allow)
+  // 0.68–0.78 → 3 entries (priority)
+  // 0.78–0.90 → 5 entries (aggressive stacking)
+  // ≥ 0.90   → 10 entries (burst)
+  if (score < 0.45) return 0;
+  else if (score < 0.55) base = 1;
+  else if (score < 0.68) base = 2;
+  else if (score < 0.78) base = 3;
   else if (score < 0.90) base = 5;
   else base = 10;
 
@@ -1831,7 +1847,10 @@ async function runDemoSniperCycle(): Promise<void> {
       const entryNow = Date.now();
       const campaignIdPreview = resolveCampaignId(c.symbol, c.positionSide, entryNow);
       const campaignAlreadyHasEntry = getCampaignOpenCount(campaignIdPreview) > 0 || c.currentOpen > 0;
-      if (!isEntryAllowed(campaignAlreadyHasEntry)) { skipped++; break; }
+      if (!isEntryAllowed(campaignAlreadyHasEntry)) {
+        reportSignalLifecycle({ eventType: "duplicate_rejected", symbol: c.symbol, side: c.positionSide, score: c.score, isDemo: true, riskProfile: config.decisionProfile, metadata: { campaignAlreadyHasEntry } });
+        skipped++; break;
+      }
 
       const fallback = isFallbackMode();
 
@@ -1862,11 +1881,16 @@ async function runDemoSniperCycle(): Promise<void> {
           secretKey,
         );
 
-        if (!isBingXSuccess(data)) { skipped++; continue; }
+        if (!isBingXSuccess(data)) {
+          reportSignalLifecycle({ eventType: "api_error", symbol: c.symbol, side: c.positionSide, score: c.score, isDemo: true, riskProfile: config.decisionProfile, metadata: { error: String((data as { msg?: string })?.msg ?? "bingx_error") } });
+          skipped++; continue;
+        }
 
         const order = (data.data as Record<string, unknown>)?.order as Record<string, unknown>;
         const orderId = String(order?.orderId ?? `sniper-${Date.now()}-${c.symbol}-${c.positionSide}`);
         const entryPrice = parseFloat(String(order?.avgPrice ?? "")) || price;
+
+        reportSignalLifecycle({ eventType: "order_placed", symbol: c.symbol, side: c.positionSide, score: c.score, isDemo: true, riskProfile: config.decisionProfile, metadata: { orderId, price: entryPrice, tier: c.tier } });
 
         const entryTime = Date.now();
         sniperOpenTrades.set(orderId, {
@@ -1884,6 +1908,7 @@ async function runDemoSniperCycle(): Promise<void> {
           marginUsed: config.marginPerTrade,
           expectedTpProfit: config.marginPerTrade * config.leverage * (config.takeProfitPct / 100),
         });
+        reportSignalLifecycle({ eventType: "position_opened", symbol: c.symbol, side: c.positionSide, score: c.score, isDemo: true, riskProfile: config.decisionProfile, metadata: { orderId, entryPrice, leverage: config.leverage, margin: config.marginPerTrade } });
 
         // Persist to durable trade store — idempotent, survives server restarts
         void persistOpenTrade({
@@ -1965,7 +1990,7 @@ async function runDemoSniperMonitor(): Promise<void> {
         positionSide: storeEntry.positionSide,
         quantity: storeEntry.qty,
         entryPrice: storeEntry.entryPrice,
-        expectedEntryPrice: storeEntry.expectedEntryPrice,
+        expectedEntryPrice: storeEntry.expectedEntryPrice ?? undefined,
         entryTime: storeEntry.entryTime,
         hourUtc: storeEntry.hourUtc,
         btcRegime: storeEntry.btcRegime as BtcRegime,

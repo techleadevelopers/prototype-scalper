@@ -1,0 +1,163 @@
+8. Objetivo
+O sniper deve concentrar fogo onde há melhor oportunidade agora.
+
+Não queremos operar todos os símbolos igualmente. Queremos aumentar exposição nos símbolos quentes e reduzir nos símbolos ruins, sem desligar o aprendizado.
+
+
+**Prompt 5: Adaptive Aggression Controller**
+
+```md
+# Implementar Adaptive Aggression Controller
+
+Objetivo:
+Controlar automaticamente a agressividade do sniper conforme o desempenho recente. O bot deve acelerar quando está performando bem e reduzir quando o ambiente está ruim, sem precisar intervenção manual.
+
+## 1. Criar módulo `aggression_controller.py`
+
+Responsabilidade:
+Gerar parâmetros dinâmicos para o ciclo sniper:
+
+- maxCandidatesThisCycle
+- maxPositionsThisCycle
+- marginMultiplier
+- stackingAllowed
+- minAggressiveScore
+- cooldownMultiplier
+- symbolConcentrationLimit
+- allowBurstMode
+
+Retorno:
+
+```json
+{
+  "aggressionState": "BOOST",
+  "maxCandidatesThisCycle": 8,
+  "marginMultiplier": 1.25,
+  "minAggressiveScore": 0.55,
+  "stackingAllowed": true,
+  "allowBurstMode": true,
+  "reason": "recent_profit_factor_high_drawdown_low"
+}
+2. Estados de agressividade
+Criar estados:
+
+PAUSED: não abrir novas posições
+DEFENSIVE: poucas entradas, score mínimo alto
+NORMAL: operação padrão
+BOOST: mais entradas e stacking moderado
+MAX_SNIPER: modo agressivo de oportunidade forte
+3. Regras
+BOOST
+Ativar se:
+
+profit factor recente > 1.3
+win rate recente aceitável
+drawdown baixo
+slippage aceitável
+Coach Ranker separando bem score alto vs baixo
+MAX_SNIPER
+Ativar se:
+
+vários símbolos HOT
+execução boa
+momentum de mercado forte
+últimos trades positivos
+drawdown controlado
+DEFENSIVE
+Ativar se:
+
+sequência de perdas
+drawdown aumentando
+slippage alto
+score alto não performa melhor que score baixo
+PAUSED
+Ativar se:
+
+maxSessionLoss atingido
+execução quebrada
+API instável
+dados stale
+drawdown extremo
+4. Ajustes dinâmicos
+Exemplo:
+
+DEFENSIVE:
+  maxCandidatesThisCycle = 2
+  marginMultiplier = 0.5
+  minAggressiveScore = 0.68
+  stackingAllowed = false
+
+NORMAL:
+  maxCandidatesThisCycle = 5
+  marginMultiplier = 1.0
+  minAggressiveScore = 0.58
+  stackingAllowed = true
+
+BOOST:
+  maxCandidatesThisCycle = 8
+  marginMultiplier = 1.25
+  minAggressiveScore = 0.55
+  stackingAllowed = true
+
+MAX_SNIPER:
+  maxCandidatesThisCycle = 10+
+  marginMultiplier = 1.5
+  minAggressiveScore = 0.52
+  stackingAllowed = true
+5. Integração
+Integrar com:
+
+Coach Ranker
+Symbol Rotation
+Execution Auditor
+Exit Intelligence
+backend /api/bot/sniper/mass
+Demo VST sniper monitor
+Fluxo:
+
+Symbol Rotation define melhores símbolos.
+Coach Ranker ranqueia candidatos.
+Aggression Controller define quantos executar.
+Execution Auditor penaliza execução ruim.
+Exit Intelligence controla saída/stacking.
+6. Métricas usadas
+recent win rate
+recent profit factor
+recent PnL USDT
+drawdown atual
+consecutive losses
+execution slippage
+score bucket performance
+symbol rotation health
+open position pressure
+API/data health
+7. Relatório
+Criar endpoint:
+
+/aggression/status
+Mostrar:
+
+aggressionState
+motivo
+parâmetros aplicados
+últimas mudanças de estado
+impacto no número de trades
+impacto no PnL
+quando entrou/saiu de BOOST/MAX_SNIPER
+8. Objetivo
+O sniper deve respirar sozinho:
+
+acelerar quando o ambiente paga
+reduzir quando o ambiente está ruim
+voltar a acelerar quando melhora
+Isso permite operação em massa sem ficar fixo em uma configuração única.
+
+
+Ordem completa:
+
+```txt
+1. Judge Sniper + Coach Ranker
+2. Exit Intelligence + Post-Trade Learning
+3. Latency / Slippage / Execution Auditor
+4. Adaptive Symbol Rotation
+5. Adaptive Aggression Controller

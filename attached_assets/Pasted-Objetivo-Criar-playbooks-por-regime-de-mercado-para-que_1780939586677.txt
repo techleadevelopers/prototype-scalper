@@ -1,0 +1,198 @@
+Objetivo:
+Criar playbooks por regime de mercado para que o sniper escolha a estratégia certa conforme o ambiente atual.
+
+Nem todo scalp funciona em todo mercado. O bot precisa saber quando usar:
+- momentum breakout
+- pullback continuation
+- range scalp
+- liquidity sweep reversal
+- news/momentum burst
+- BTC-led alt follow
+- alt solo pump
+- avoid/chop mode
+
+## 1. Criar módulo `regime_playbook.py`
+
+Responsabilidade:
+Classificar o regime atual e escolher o playbook de execução.
+
+Inputs:
+- BTC regime
+- BTC volatility
+- BTC trend strength
+- alt/BTC correlation
+- symbol momentum
+- volume/OI
+- spread/liquidity
+- candle context 1m/5m/15m
+- recent PnL by setup
+- symbol rotation state
+- market breadth
+- funding
+- news/sentiment context
+
+Retorno:
+
+```json
+{
+  "regime": "ALT_MOMENTUM_BURST",
+  "playbook": "MOMENTUM_BREAKOUT_SCALP",
+  "allowedSetups": ["BREAKOUT_LONG", "FOLLOW_THROUGH_LONG"],
+  "blockedSetups": ["MEAN_REVERSION_SHORT"],
+  "scoreAdjustments": {
+    "momentumBonus": 0.12,
+    "counterTrendPenalty": 0.18
+  },
+  "recommendedTpPct": 0.32,
+  "recommendedSlPct": 0.42,
+  "maxPositions": 8,
+  "stackingBias": "ALLOW_IF_SCORE_STRONG"
+}
+2. Regimes mínimos
+Implementar:
+
+BTC_TREND_UP
+favorecer longs alinhados
+permitir alt follow-through
+reduzir shorts contra tendência
+BTC_TREND_DOWN
+favorecer shorts
+permitir alt weakness
+reduzir longs contra tendência
+BTC_CHOP
+reduzir breakout falso
+favorecer range scalp curto
+exigir volume real
+ALT_MOMENTUM_BURST
+permitir sniper agressivo
+permitir stacking
+TP pode ser maior
+timeout curto se não andar rápido
+LOW_LIQUIDITY
+reduzir size
+aumentar score mínimo
+evitar market order ruim
+HIGH_VOLATILITY_CHAOS
+reduzir size
+operar só setups muito fortes
+evitar stacking profundo
+NEWS_SPIKE
+permitir burst se momentum confirma
+usar stop/exit mais rápido
+monitorar slippage
+RECOVERY_AFTER_DRAWDOWN
+operar menor até estabilizar
+3. Playbooks
+Criar playbooks:
+
+MOMENTUM_BREAKOUT_SCALP
+Usar quando:
+
+volume subindo
+OI não contra
+candle rompe range
+BTC alinhado ou neutro
+PULLBACK_CONTINUATION
+Usar quando:
+
+tendência maior clara
+preço volta para VWAP/EMA
+rejeita contra tendência
+RANGE_QUICK_SCALP
+Usar quando:
+
+BTC chop
+spread baixo
+range limpo
+TP curto
+LIQUIDITY_SWEEP_REVERSAL
+Usar quando:
+
+varre high/low
+volta rápido
+volume confirma reversão
+BTC_LEAD_ALT_FOLLOW
+Usar quando:
+
+BTC move forte
+alt ainda atrasada
+correlação histórica boa
+AVOID_MODE
+Usar quando:
+
+dados ruins
+liquidez ruim
+execução ruim
+regime caótico
+4. Integração com Coach Ranker
+Coach Ranker deve receber:
+
+regime
+playbook
+allowedSetups
+scoreAdjustments
+Exemplo:
+
+Se playbook = MOMENTUM_BREAKOUT_SCALP:
+  aumentar peso de momentum/volume
+  reduzir peso de mean reversion
+
+Se playbook = RANGE_QUICK_SCALP:
+  reduzir TP
+  bloquear chasing de breakout fraco
+5. Integração com Exit Intelligence
+Exit deve adaptar:
+
+MOMENTUM_BREAKOUT: deixar correr se momentum continuar
+RANGE_SCALP: fechar rápido no TP
+NEWS_SPIKE: trailing mais apertado
+CHAOS: breakeven rápido
+LOW_LIQUIDITY: reduzir tempo em posição
+6. Integração com Position Sizing
+Size deve adaptar:
+
+playbook bom historicamente: aumentar size
+playbook novo: scout
+playbook ruim recente: reduzir
+regime caótico: reduzir
+burst validado: aumentar
+7. Aprendizado por playbook
+Registrar cada trade com:
+
+regime
+playbook
+setupType
+regimeConfidence
+playbookVersion
+Relatório:
+
+PnL por playbook
+win rate por playbook
+PF por regime
+melhor TP/SL por playbook
+melhor stacking depth por playbook
+slippage por playbook
+score bucket por playbook
+8. Endpoint
+Criar:
+
+/regime-playbook/status
+Retornar:
+
+regime atual
+playbook ativo por símbolo
+playbooks permitidos
+score adjustments
+performance histórica por playbook
+9. Objetivo
+O sniper deve parar de usar a mesma lógica para todo mercado.
+
+Ele precisa saber:
+
+quando acelerar
+quando operar range
+quando seguir BTC
+quando caçar rompimento
+quando evitar
+quando deixar vencedor correr
+quando pegar lucro rápido

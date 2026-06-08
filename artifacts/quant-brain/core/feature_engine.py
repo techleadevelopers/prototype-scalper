@@ -70,6 +70,8 @@ class FeatureEngine:
     def __init__(self):
         self._client: Optional[httpx.AsyncClient] = None
         self._prev_oi: dict[str, float] = {}
+        self._prev_volume_24h: dict[str, float] = {}
+        self._volume_increment_history: dict[str, deque] = {s: deque(maxlen=60) for s in SYMBOLS}
         self._prev_prices: dict[str, list[float]] = {s: [] for s in SYMBOLS}
         self._snapshots: dict[str, MarketSnapshot] = {}
         self._btc_change = 0.0
@@ -492,8 +494,24 @@ class FeatureEngine:
             volume_24h = float(ticker.get("volume", 0))
             high_24h = float(ticker.get("highPrice", price))
             low_24h = float(ticker.get("lowPrice", price))
-            avg_vol = float(ticker.get("quoteVolume", volume_24h)) / 24 if volume_24h > 0 else 1
-            volume_ratio = volume_24h / avg_vol if avg_vol > 0 else 1.0
+
+            # Volume ratio: use short-term increment history (recent candle-style)
+            # rather than dividing 24h volume by 24 — gives a real scalp-relevant signal.
+            prev_vol_24h = self._prev_volume_24h.get(symbol, 0.0)
+            if prev_vol_24h > 0 and volume_24h >= prev_vol_24h:
+                vol_increment = volume_24h - prev_vol_24h
+                self._volume_increment_history[symbol].append(vol_increment)
+            self._prev_volume_24h[symbol] = volume_24h
+
+            increment_history = list(self._volume_increment_history[symbol])
+            if len(increment_history) >= 3:
+                avg_increment = sum(increment_history[:-1]) / max(len(increment_history) - 1, 1)
+                current_increment = increment_history[-1]
+                volume_ratio = current_increment / avg_increment if avg_increment > 0 else 1.0
+            else:
+                # Fallback: use 24h average (initial state before history builds up)
+                avg_vol = float(ticker.get("quoteVolume", volume_24h)) / 24 if volume_24h > 0 else 1
+                volume_ratio = volume_24h / avg_vol if avg_vol > 0 else 1.0
         except Exception:
             return None
 

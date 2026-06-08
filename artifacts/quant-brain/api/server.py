@@ -904,6 +904,37 @@ async def finalize_signals_endpoint():
     return await finalize_due_signal_outcomes()
 
 
+@app.post("/signal/lifecycle")
+async def record_signal_lifecycle_event(body: dict):
+    """Record a signal lifecycle event from the trading bot (fire-and-forget from API server)."""
+    for r in ("eventType", "symbol", "side"):
+        if r not in body:
+            raise HTTPException(400, f"Required field: {r}")
+    score_raw = body.get("score")
+    await kb.record_lifecycle_event(
+        event_type=str(body["eventType"]),
+        symbol=str(body["symbol"]),
+        side=str(body["side"]),
+        signal_id=body.get("signalId"),
+        score=float(score_raw) if score_raw is not None else None,
+        risk_profile=body.get("riskProfile"),
+        is_demo=bool(body.get("isDemo", True)),
+        metadata=body.get("metadata"),
+    )
+    return {"ok": True}
+
+
+@app.get("/metrics/learning")
+@cache_response(ttl_seconds=30)
+async def get_learning_metrics_endpoint(hours: int = Query(24, ge=1, le=168)):
+    """
+    Learning velocity and score-bucket metrics.
+    Use this to verify whether high-score trades outperform low-score trades
+    — the primary signal that the Coach Ranker is becoming a real teacher.
+    """
+    return await kb.get_learning_metrics(hours=hours)
+
+
 @app.post("/models/sniper/train")
 async def train_sniper_model_endpoint(min_samples: int = Query(300, ge=100, le=100000)):
     """Train and validate the calibrated sniper model; authority remains shadow-only."""

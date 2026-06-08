@@ -1,0 +1,133 @@
+Objetivo:
+Criar um motor de experimentos para testar variações do sniper em Demo VST com controle estatístico. O sistema deve descobrir quais configurações realmente melhoram PnL, win rate, profit factor, MFE/MAE e execução.
+
+Não queremos mudar config no escuro. Queremos rodar experimentos controlados.
+
+## 1. Criar `experiment_engine.py`
+
+Responsabilidade:
+Distribuir sinais/trades entre políticas diferentes e comparar resultados.
+
+Exemplos de políticas:
+- TP curto vs TP maior
+- SL fixo vs SL adaptativo
+- stacking depth 1/2/3/5
+- aggressiveScore threshold 0.52/0.58/0.65
+- trailing on/off
+- symbol rotation on/off
+- exit intelligence on/off
+- market order vs filtered market order
+- BTC regime strict vs loose
+
+## 2. Assignment determinístico
+
+Cada `signalId` ou `campaignId` deve cair sempre no mesmo grupo:
+
+```txt
+hash(signalId) % 100
+0-49 = control
+50-99 = treatment
+Evitar viés de seleção.
+
+3. Experimentos obrigatórios
+Criar experimentos iniciais:
+
+EXP_EXIT_TRAILING
+control: TP/SL fixo
+treatment: Exit Intelligence trailing/tighten
+EXP_STACKING_DEPTH
+control: max depth 1
+treatment A: max depth 3
+treatment B: max depth 5
+EXP_AGGRESSIVE_THRESHOLD
+control: min score 0.58
+treatment: min score 0.52
+EXP_SYMBOL_ROTATION
+control: todos símbolos iguais
+treatment: Adaptive Symbol Rotation
+EXP_COACH_RANKER
+control: ordenar por score antigo
+treatment: ordenar por aggressiveScore
+4. Métricas por experimento
+Para cada grupo:
+
+trades
+campaigns
+win rate
+PnL USDT
+profit factor
+avg PnL/trade
+max drawdown
+MFE médio
+MAE médio
+TP hit rate
+SL hit rate
+timeout rate
+execution slippage
+latency drag
+Sharpe/Sortino
+confidence interval
+bootstrap PnL confidence
+5. Guardrails
+Experimentos podem ser agressivos, mas devem parar se:
+
+treatment perde mais que X USDT
+drawdown treatment > control por limite
+slippage explode
+duplicate/pipeline gaps aumentam
+maxSessionLoss próximo
+6. Promoção automática
+Uma política só pode virar padrão se:
+
+samples suficientes
+PnL médio melhor que control
+profit factor melhor
+drawdown não piora demais
+bootstrap indica confiança aceitável
+pipeline integrity ok
+Estados:
+
+DRAFT
+RUNNING
+PAUSED
+WINNER
+LOSER
+PROMOTED
+7. Relatório
+Endpoint:
+
+/experiments/status
+Retornar:
+
+experimentos ativos
+control vs treatment
+samples
+PnL
+PF
+drawdown
+confiança
+recomendação: continue/promote/stop
+8. Integração
+Integrar com:
+
+Coach Ranker
+Exit Intelligence
+Symbol Rotation
+Aggression Controller
+StackingPolicy
+Pipeline Auditor
+Cada trade/outcome deve salvar:
+
+experimentId
+experimentArm
+policyVersion
+9. Objetivo
+O sniper deve evoluir por experimento real, não por opinião.
+
+O sistema precisa responder:
+
+trailing melhora lucro?
+stacking depth 5 ajuda ou destrói?
+score 0.52 opera mais e lucra mais?
+symbol rotation melhora PF?
+Coach Ranker bate o ranking antigo?

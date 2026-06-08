@@ -64,6 +64,8 @@ export const BotConfigSchema = z.object({
   sniperAutopilotIntervalSec: z.number().min(5).max(300).default(20),
   sniperMaxCandidatesPerCycle: z.number().min(1).max(30).default(8),
   sniperMinCombinedScore: z.number().min(0).max(1).default(0.20),
+  riskProfile: z.enum(["conservative", "balanced", "aggressive", "sniper_max"]).default("balanced"),
+  decisionProfile: z.enum(["conservative", "balanced", "aggressive", "sniper_max", "demo_learning_aggressive"]).default("balanced"),
   loadedAt: z.string(),
   hasOverrides: z.boolean(),
   activeOverrides: z.array(z.string()),
@@ -356,6 +358,8 @@ function getRawConfig(): Omit<BotConfig, "loadedAt" | "hasOverrides" | "activeOv
     sniperAutopilotIntervalSec:  ov("sniperAutopilotIntervalSec",  envNum("SCALP_AUTOPILOT_INTERVAL_SEC", 20)),
     sniperMaxCandidatesPerCycle: ov("sniperMaxCandidatesPerCycle", envNum("SCALP_AUTOPILOT_MAX_CANDIDATES", 8)),
     sniperMinCombinedScore:      ov("sniperMinCombinedScore",      envNum("SCALP_SNIPER_MIN_COMBINED_SCORE", 0.20)),
+    riskProfile:                 ov("riskProfile",                 env("QUANT_BRAIN_RISK_PROFILE", "balanced") as BotConfig["riskProfile"]),
+    decisionProfile:             ov("decisionProfile",             env("QUANT_BRAIN_DECISION_PROFILE", "balanced") as BotConfig["decisionProfile"]),
   };
 }
 

@@ -432,6 +432,43 @@ export async function evaluateQuantBrainEdge(
   }
 }
 
+// ── Signal Lifecycle Events ───────────────────────────────────────────────────
+// Fire-and-forget emissions from the bot so QB can track the full funnel:
+// signal_generated → signal_executed → order_placed → position_opened
+// → tp_hit | sl_hit | timeout | manual_close | api_error | duplicate_rejected
+
+export type SignalLifecycleEventType =
+  | "signal_generated"
+  | "signal_executed"
+  | "order_placed"
+  | "position_opened"
+  | "tp_hit"
+  | "sl_hit"
+  | "timeout"
+  | "manual_close"
+  | "api_error"
+  | "duplicate_rejected";
+
+export interface SignalLifecycleEvent {
+  eventType: SignalLifecycleEventType;
+  symbol: string;
+  side: "LONG" | "SHORT";
+  signalId?: string;
+  score?: number;
+  riskProfile?: string;
+  isDemo?: boolean;
+  metadata?: Record<string, unknown>;
+}
+
+/**
+ * Fire-and-forget signal lifecycle event reporting.
+ * Never blocks execution — QB unavailability silently drops the event.
+ */
+export function reportSignalLifecycle(event: SignalLifecycleEvent): void {
+  if (!quantBrainEnabled()) return;
+  postJson<{ ok: boolean }>("/signal/lifecycle", event, 3_000).catch(() => {});
+}
+
 export interface QuantBrainIntelligence {
   connected: boolean;
   enabled: boolean;

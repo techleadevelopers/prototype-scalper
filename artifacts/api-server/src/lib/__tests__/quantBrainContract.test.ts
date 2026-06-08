@@ -91,12 +91,37 @@ describe("QuantBrainEdgeInput — contract v2 fields", () => {
       marginType: "ISOLATED" as const,
       allowExecution: true,
       maxSessionLoss: 0,
+      takerFeeBps: 5,
+      slippageBpsPerSide: 2,
+      estimatedFundingCostPct: 0,
+      minEdgeOverCostPct: 0.03,
+      signalDedupeSeconds: 30,
+      signalSourceType: "hypothetical" as const,
+      requireFull15mContext: true,
+      maxDailyLossPct: 0,
+      maxDrawdownPct: 0,
+      maxConsecutiveLosses: 0,
+      recentEdgeWindowHours: 4,
+      recentEdgeMinTrades: 8,
+      recentEdgeMinProfitFactor: 0.8,
+      recentEdgeMaxConsecutiveLosses: 4,
+      candleMinScore: 0.5,
+      candleMinSeparation: 0.08,
+      attachProtectionOrders: true,
+      quantBrainGateMode: "shadow" as const,
       maxPositionsPerSymbol: 3,
       positionStackingEnabled: false,
       sniperAutopilotIntervalSec: 15,
       sniperMaxCandidatesPerCycle: 3,
       sniperMinCombinedScore: 0.5,
       preventHedgedPositions: true,
+      riskProfile: "balanced" as const,
+      decisionProfile: "balanced" as const,
+      loadedAt: new Date().toISOString(),
+      hasOverrides: false,
+      activeOverrides: [],
+      activeMode: null,
+      configVersion: 1,
     };
 
     await evaluateQuantBrainEdge({
@@ -135,7 +160,7 @@ describe("LONG/SHORT side consistency", () => {
 
   it("SHORT position always maps to SELL side", () => {
     const positionSide = "SHORT" as const;
-    const side: "BUY" | "SELL" = positionSide === "LONG" ? "BUY" : "SELL";
+    const side: "BUY" | "SELL" = (positionSide as string) === "LONG" ? "BUY" : "SELL";
     expect(side).toBe("SELL");
   });
 

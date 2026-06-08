@@ -1,0 +1,176 @@
+Objetivo:
+Auditar o ciclo completo do sniper para garantir que cada sinal, ordem, posição, fechamento e aprendizado estejam alinhados. Em scalp em massa, pequenos gaps no pipeline fazem a IA aprender errado, duplicar ordens, perder outcomes ou culpar a estratégia quando o erro foi execução/monitor.
+
+## Pipeline esperado
+
+```txt
+market snapshot
+→ feature engine
+→ sniper signal
+→ Judge Sniper
+→ Coach Ranker
+→ Symbol Rotation
+→ Aggression Controller
+→ order request
+→ exchange ack
+→ position confirmed
+→ Exit Intelligence
+→ close/TP/SL
+→ execution auditor
+→ outcome recorded
+→ signal learning
+→ shadow model training
+→ strategy/ranking updated
+1. Criar pipeline_auditor.py
+Responsabilidade:
+Rastrear cada trade/candidato por IDs consistentes.
+
+IDs obrigatórios:
+
+marketEventId
+signalId
+predictionId
+candidateId
+decisionId
+orderRequestId
+clientOrderId
+exchangeOrderId
+positionId
+campaignId
+outcomeId
+Cada etapa deve referenciar o ID anterior.
+
+2. Detectar gaps
+Detectar e reportar:
+
+signal sem decision
+decision sem order request
+order request sem exchange ack
+exchange ack sem position confirmed
+position opened sem monitor
+position closed sem outcome
+outcome sem signal original
+duplicated marketEventId
+duplicated clientOrderId
+multiple outcomes para mesma posição
+signal executado com side diferente
+entry price ausente
+exit price ausente
+TP/SL sem vínculo com posição
+campaign stacking sem campaignId
+Quant Brain prediction sem signalId
+aprendizado usando trade incompleto
+3. Classificar severidade
+CRITICAL:
+  duplicated execution
+  side mismatch
+  outcome sem posição
+  posição sem monitor
+  fechamento sem outcome
+  live/demo environment mismatch
+
+HIGH:
+  order ack sem position confirmed
+  signal sem outcome depois da janela
+  trade sem MFE/MAE
+  slippage sem preço esperado
+
+MEDIUM:
+  score ausente
+  predictionId ausente
+  campaignId ausente
+  feature version ausente
+
+LOW:
+  campos opcionais faltando
+4. Criar relatório de integridade
+Endpoint:
+
+/pipeline/audit
+Retornar:
+
+{
+  "health": "DEGRADED",
+  "totalSignals": 1200,
+  "totalOrders": 340,
+  "totalPositions": 338,
+  "totalOutcomes": 331,
+  "criticalGaps": [],
+  "highGaps": [],
+  "orphanSignals": 12,
+  "orphanOrders": 2,
+  "orphanPositions": 7,
+  "duplicateExecutions": 0,
+  "learningEligibleOutcomes": 318,
+  "blockedFromLearning": 13
+}
+5. Learning eligibility
+Antes de usar trade para treino, validar:
+
+learningEligible = true somente se:
+- tem signalId
+- tem marketEventId
+- tem side correto
+- tem entryPrice
+- tem exitPrice ou firstEvent
+- tem timestamp de entrada
+- tem timestamp de saída/finalização
+- tem outcome válido
+- não é duplicado
+- não tem environment mismatch
+Trades inválidos devem ir para auditoria, não para treino.
+
+6. Auditoria de versões
+Rastrear:
+
+featureVersion
+strategyVersion
+configVersion
+modelVersion
+policyVersion
+labelVersion
+Se mudar estratégia/config/modelo, o aprendizado deve saber. Não misturar tudo sem versão.
+
+7. Auditoria de Demo vs Live
+Garantir:
+
+Demo VST nunca registra como live.
+Live nunca entra em dataset demo sem flag.
+sourceType correto: demo/live/hypothetical/shadow.
+endpoints demo/live não se cruzam.
+8. Auditoria de side
+Validar sempre:
+
+LONG = BUY entry, SELL close
+SHORT = SELL entry, BUY close
+positionSide preservado no outcome
+Quant Brain não aprende BUY/SELL como LONG/SHORT errado
+9. Auditoria de campanha/stacking
+Para cada campaign:
+
+entries ordenadas
+depth correto
+margin por depth
+edgeAtInsertion presente
+MFE/MAE por entrada
+fechamento parcial alocado corretamente
+outcome agregado da campanha separado dos outcomes individuais
+10. Dashboard/relatório
+Adicionar visão:
+
+Pipeline Health
+gaps por etapa
+outcomes elegíveis para treino
+outcomes bloqueados do treino
+top causas de perda de integridade
+últimas 50 falhas críticas
+11. Objetivo final
+Nenhum modelo deve aprender com dado quebrado.
+
+Antes de melhorar estratégia, garantir que:
+
+todo trade tem linhagem completa
+toda posição tem outcome
+toda outcome aponta para sinal original
+todo sinal executado sabe se ganhou/perdeu
+toda perda sabe se foi estratégia, execução ou pipeline

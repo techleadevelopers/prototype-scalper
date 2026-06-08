@@ -440,6 +440,36 @@ async def init_db():
             "ON trade_outcomes(source_id)"
         )
 
+        # ── Signal lifecycle events (DEMO_LEARNING_AGGRESSIVE tracking) ──────
+        # Use executescript() so PostgresConnection._postgres_ddl() translates
+        # "INTEGER PRIMARY KEY AUTOINCREMENT" → "BIGSERIAL PRIMARY KEY" for PG.
+        await db.executescript(
+            """CREATE TABLE IF NOT EXISTS signal_lifecycle_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                signal_id TEXT,
+                event_type TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                score REAL,
+                risk_profile TEXT,
+                is_demo INTEGER DEFAULT 1,
+                metadata TEXT,
+                ts REAL NOT NULL
+            )"""
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_lifecycle_signal "
+            "ON signal_lifecycle_events(signal_id)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_lifecycle_type_ts "
+            "ON signal_lifecycle_events(event_type, ts)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_lifecycle_symbol_ts "
+            "ON signal_lifecycle_events(symbol, ts)"
+        )
+
         await db.commit()
 
 
@@ -1552,3 +1582,152 @@ async def vacuum_db():
     async with connect(DB_PATH) as db:
         await db.execute("VACUUM")
         await db.execute("ANALYZE")
+
+
+# ========== SIGNAL LIFECYCLE EVENTS ==========
+
+async def record_lifecycle_event(
+    event_type: str,
+    symbol: str,
+    side: str,
+    signal_id: str | None = None,
+    score: float | None = None,
+    risk_profile: str | None = None,
+    is_demo: bool = True,
+    metadata: dict | None = None,
+) -> None:
+    """Record a signal lifecycle event for learning quality tracking."""
+    async with connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT INTO signal_lifecycle_events
+               (signal_id, event_type, symbol, side, score, risk_profile, is_demo, metadata, ts)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (
+                signal_id,
+                event_type,
+                symbol.upper(),
+                side.upper(),
+                score,
+                risk_profile,
+                1 if is_demo else 0,
+                json.dumps(metadata or {}),
+                time.time(),
+            ),
+        )
+        await db.commit()
+
+
+async def get_learning_metrics(hours: int = 24) -> dict:
+    """
+    Learning velocity and score-bucket metrics for monitoring QB evolution.
+    Shows whether high-score trades outperform low-score trades, which is
+    the primary signal that the Coach Ranker is improving.
+    """
+    since = time.time() - hours * 3600
+
+    async with connect(DB_PATH) as db:
+        db.row_factory = Row
+
+        # 1. Event counts by type (last N hours)
+        event_rows = await (await db.execute(
+            """SELECT event_type, COUNT(*) as cnt
+               FROM signal_lifecycle_events
+               WHERE ts >= ? AND is_demo=1
+               GROUP BY event_type ORDER BY cnt DESC""",
+            (since,),
+        )).fetchall()
+        event_counts = {r["event_type"]: r["cnt"] for r in event_rows}
+
+        # 2. Funnel: generated → executed → placed → tp/sl
+        generated  = event_counts.get("signal_generated", 0)
+        executed   = event_counts.get("signal_executed", 0)
+        placed     = event_counts.get("order_placed", 0)
+        tp_hits    = event_counts.get("tp_hit", 0)
+        sl_hits    = event_counts.get("sl_hit", 0)
+        timeouts   = event_counts.get("timeout", 0)
+        api_errors = event_counts.get("api_error", 0)
+        dupes      = event_counts.get("duplicate_rejected", 0)
+
+        closed = tp_hits + sl_hits + timeouts
+        win_rate = round(tp_hits / closed * 100, 1) if closed > 0 else None
+
+        # 3. Score-bucket performance from signal_outcomes (finalized)
+        # GROUP BY 1 (positional) is used instead of alias for Postgres compat.
+        bucket_rows = await (await db.execute(
+            """SELECT
+                CASE
+                    WHEN max_favorable_pct IS NULL THEN 'no_data'
+                    WHEN target_configured_move_pct <= 0 THEN 'no_target'
+                    ELSE 'has_outcome'
+                END as bucket_type,
+                COUNT(*) as cnt,
+                AVG(CASE WHEN hit_configured=1 THEN 1.0 ELSE 0.0 END) as win_rate,
+                AVG(max_favorable_pct) as avg_mfe,
+                AVG(max_adverse_pct) as avg_mae,
+                AVG(target_configured_move_pct) as avg_target
+               FROM signal_outcomes
+               WHERE created_at >= ? AND finalized=1
+               GROUP BY 1""",
+            (since,),
+        )).fetchall()
+        outcome_summary = [dict(r) for r in bucket_rows]
+
+        # 4. Best performing symbols (by win rate, min 5 finalized)
+        # HAVING COUNT(*) used instead of alias for Postgres compat.
+        sym_rows = await (await db.execute(
+            """SELECT symbol, side,
+                COUNT(*) as trades,
+                AVG(CASE WHEN hit_configured=1 THEN 1.0 ELSE 0.0 END) as win_rate,
+                AVG(max_favorable_pct) as avg_mfe
+               FROM signal_outcomes
+               WHERE created_at >= ? AND finalized=1
+               GROUP BY symbol, side
+               HAVING COUNT(*) >= 5
+               ORDER BY win_rate DESC
+               LIMIT 10""",
+            (since,),
+        )).fetchall()
+        top_symbols = [dict(r) for r in sym_rows]
+
+        # 5. Samples by risk_profile
+        profile_rows = await (await db.execute(
+            """SELECT risk_profile, COUNT(*) as cnt
+               FROM signal_lifecycle_events
+               WHERE ts >= ? AND event_type='order_placed'
+               GROUP BY risk_profile ORDER BY cnt DESC""",
+            (since,),
+        )).fetchall()
+        profile_counts = {(r["risk_profile"] or "unknown"): r["cnt"] for r in profile_rows}
+
+        # 6. Total finalized signals and pending
+        totals = await (await db.execute(
+            """SELECT
+                SUM(CASE WHEN finalized=1 THEN 1 ELSE 0 END) as finalized,
+                SUM(CASE WHEN finalized=0 THEN 1 ELSE 0 END) as pending
+               FROM signal_outcomes WHERE created_at >= ?""",
+            (since,),
+        )).fetchone()
+
+    return {
+        "windowHours": hours,
+        "funnel": {
+            "generated": generated,
+            "executed": executed,
+            "placed": placed,
+            "tpHits": tp_hits,
+            "slHits": sl_hits,
+            "timeouts": timeouts,
+            "apiErrors": api_errors,
+            "duplicateRejected": dupes,
+            "closed": closed,
+            "winRate": win_rate,
+        },
+        "eventCounts": event_counts,
+        "outcomeSummary": outcome_summary,
+        "topSymbols": top_symbols,
+        "profileCounts": profile_counts,
+        "signalTotals": {
+            "finalized": int(totals["finalized"] or 0) if totals else 0,
+            "pending": int(totals["pending"] or 0) if totals else 0,
+        },
+    }

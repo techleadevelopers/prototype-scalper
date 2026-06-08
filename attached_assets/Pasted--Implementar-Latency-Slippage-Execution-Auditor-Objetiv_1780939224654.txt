@@ -1,0 +1,303 @@
+# Implementar Latency / Slippage / Execution Auditor
+
+Objetivo:
+Auditar a qualidade real da execução do sniper em massa. Em scalp curto, entrada boa pode virar prejuízo se houver atraso, slippage, spread alto, fill ruim, ordem duplicada ou monitor atrasado.
+
+O sistema deve medir se estamos perdendo dinheiro por estratégia ou por execução.
+
+## 1. Criar módulo `execution_auditor.py` no Quant Brain
+
+Responsabilidade:
+Receber eventos do backend e calcular qualidade de execução.
+
+Eventos:
+- signal_created
+- quant_brain_evaluated
+- order_requested
+- order_sent_to_exchange
+- order_acknowledged
+- position_opened
+- position_closed
+- protection_order_attached
+- monitor_detected_close
+
+Para cada trade calcular:
+- signalToOrderMs
+- orderToAckMs
+- ackToPositionMs
+- totalEntryLatencyMs
+- expectedEntryPrice
+- actualEntryPrice
+- entrySlippagePct
+- entrySlippageBps
+- expectedExitPrice
+- actualExitPrice
+- exitSlippagePct
+- exitSlippageBps
+- spreadAtSignal
+- spreadAtEntry
+- spreadAtExit
+- priceMoveDuringLatencyPct
+- executionQuality
+
+## 2. Classificar qualidade de execução
+
+Labels:
+- EXCELLENT_EXECUTION
+- ACCEPTABLE_EXECUTION
+- LATE_ENTRY
+- BAD_SLIPPAGE
+- SPREAD_TOO_WIDE
+- MISSED_MOVE
+- DUPLICATE_EXECUTION
+- POSITION_NOT_CONFIRMED
+- EXIT_MONITOR_LATE
+- API_DELAY
+- STRATEGY_LOSS_NOT_EXECUTION
+
+Exemplo:
+```txt
+Se sinal era bom, preço andou a favor antes da ordem entrar, e entrada ocorreu pior:
+executionQuality = LATE_ENTRY / MISSED_MOVE
+3. Separar perda de estratégia vs perda de execução
+Para cada trade fechado, gerar:
+
+{
+  "strategyWouldHaveWon": true,
+  "executionCausedLoss": false,
+  "entrySlippageBps": 4.2,
+  "exitSlippageBps": 3.1,
+  "latencyDamagePct": 0.08,
+  "executionQuality": "ACCEPTABLE_EXECUTION"
+}
+Regras:
+
+Se MFE após sinal atingiu TP, mas entrada real foi atrasada e trade perdeu: execução matou.
+Se nunca houve MFE relevante: entrada/setup ruim.
+Se bateu TP teórico mas monitor não fechou: saída/monitor ruim.
+Se slippage + fee consumiram edge: custo matou.
+4. Criar Execution Edge Adjuster
+O auditor deve alimentar o Coach Ranker.
+
+Se um símbolo/contexto tem execução ruim:
+
+aumentar threshold mínimo
+reduzir prioridade
+reduzir size
+evitar market order se spread ruim
+preferir não operar em horários de latência alta
+Campos por símbolo:
+
+avgEntrySlippageBps
+avgExitSlippageBps
+avgLatencyMs
+missedMoveRate
+executionProfitDragPct
+recommendedPenalty
+5. Integrar backend
+No backend, registrar timestamps:
+
+Em cada ordem sniper:
+
+signalCreatedAt
+qbEvaluatedAt
+orderRequestedAt
+orderSentAt
+orderAckAt
+positionConfirmedAt
+positionClosedAt
+Enviar esses dados ao Quant Brain junto com outcome.
+
+Também registrar:
+
+expectedEntryPrice
+markPriceBeforeOrder
+actualAvgEntryPrice
+expectedExitPrice
+actualExitPrice
+spreadBps
+orderType
+quantity
+leverage
+marginUsed
+6. Relatório de execução
+Adicionar endpoint/relatório:
+
+/execution/audit
+Retornar:
+
+total trades audited
+avg latency
+p95 latency
+avg slippage bps
+p95 slippage bps
+execution drag in USDT
+execution drag pct
+worst symbols by slippage
+worst hours by latency
+missed move rate
+trades lost by strategy
+trades lost by execution
+recommended config changes
+
+## 7. Aplicar ao sniper em massa
+
+No mass sniper:
+- se spread atual > spread médio aceitável, penalizar.
+- se símbolo tem histórico de slippage alto, reduzir prioridade.
+- se latência atual está alta, reduzir quantidade por ciclo.
+- se priceMoveDuringLatency estimado for alto, evitar entrada atrasada.
+- se `executionProfitDragPct` está alto, aumentar minScore do símbolo.
+
+## 8. Resultado esperado
+
+O sistema deve responder:
+
+- Estamos perdendo porque o setup é ruim?
+- Estamos perdendo porque entramos tarde?
+- Estamos perdendo por slippage?
+- Estamos fechando tarde?
+- Quais símbolos são bons no sinal mas ruins na execução?
+- Quais horários têm execução ruim?
+- Market order ainda compensa ou precisa filtrar melhor?
+
+Sem isso, o Coach Ranker pode aprender errado e culpar a estratégia quando o problema é execução.
+Ordem ideal dos 3 prompts para o Replit:
+
+1. Judge Sniper + Coach Ranker
+2. Exit Intelligence + Post-Trade Learning
+3. Latency / Slippage / Execution Auditor
+Depois desses, o quarto que valeria é Adaptive Symbol Rotation, para o bot concentrar fogo nos símbolos que estão pagando melhor naquele momento.
+
+
+
+
+
+14:18
+mand aja o o quarto que valeria é Adaptive Symbol Rotation e o 5
+14:19
+
+
+Aqui vão o 4º e o 5º prompts.
+
+Prompt 4: Adaptive Symbol Rotation
+
+# Implementar Adaptive Symbol Rotation
+
+Objetivo:
+Fazer o sniper concentrar execução nos símbolos que estão pagando melhor agora, em vez de distribuir trades igualmente entre todos os pares.
+
+Em scalp curto, nem todo símbolo está operável o tempo todo. O sistema deve rotacionar capital para símbolos com melhor momentum, melhor execução e melhor resultado recente.
+
+## 1. Criar módulo `symbol_rotation.py`
+
+Responsabilidade:
+Calcular um ranking dinâmico dos símbolos permitidos.
+
+Inputs:
+- performance recente por símbolo/lado
+- win rate recente
+- profit factor recente
+- PnL USDT recente
+- score médio do Coach Ranker
+- execução/slippage por símbolo
+- spread médio
+- volume/momentum atual
+- taxa de sinais válidos
+- drawdown recente
+- toxicidade de contexto
+- número de posições abertas
+
+Retorno:
+
+```json
+{
+  "activeSymbols": ["SOL-USDT", "ETH-USDT", "HYPE-USDT"],
+  "reducedSymbols": ["BTC-USDT", "NEAR-USDT"],
+  "pausedSymbols": ["MELANIA-USDT"],
+  "ranking": [
+    {
+      "symbol": "SOL-USDT",
+      "sideBias": "LONG",
+      "rotationScore": 0.82,
+      "allocationWeight": 0.24,
+      "maxPositions": 4,
+      "reason": "high_recent_pf_low_slippage"
+    }
+  ]
+}
+2. Criar rotationScore
+rotationScore =
+  recentPnlScore * 0.25
++ recentProfitFactorScore * 0.20
++ coachScoreAvg * 0.20
++ executionQualityScore * 0.15
++ currentMomentumScore * 0.10
++ liquidityScore * 0.10
+- drawdownPenalty
+- slippagePenalty
+- toxicContextPenalty
+3. Estados por símbolo
+Cada símbolo deve ter estado:
+
+HOT: aumentar prioridade e permitir mais posições
+ACTIVE: operar normal
+REDUCED: operar só setups fortes
+PAUSED: não operar temporariamente
+RECOVERY: operar pequeno até recuperar
+Regras:
+
+HOT: PF recente alto, execução boa, momentum bom
+REDUCED: sinais medianos ou slippage elevado
+PAUSED: sequência ruim, drawdown alto, execução ruim
+RECOVERY: saiu de paused, volta com size menor
+4. Integração com Mass Sniper
+Antes de executar /sniper/mass:
+
+consultar ranking de símbolos
+aplicar allocationWeight
+ordenar candidatos por aggressiveScore * rotationScore
+limitar posições por símbolo conforme estado
+Exemplo:
+
+HOT: max 4-5 posições
+ACTIVE: max 2-3 posições
+REDUCED: max 1 posição
+PAUSED: 0 posição
+5. Side Bias
+O sistema deve aprender lado por símbolo.
+
+Exemplo:
+
+SOL-USDT LONG performa bem no regime atual
+SOL-USDT SHORT está ruim
+então aumentar LONG e reduzir SHORT
+Retornar:
+
+{
+  "symbol": "SOL-USDT",
+  "longScore": 0.81,
+  "shortScore": 0.42,
+  "sideBias": "LONG"
+}
+6. Janela recente
+Usar múltiplas janelas:
+
+15 min: momentum atual
+1h: execução recente
+4h: performance tática
+24h: estabilidade
+Não deixar uma janela curta pausar símbolo bom por ruído.
+
+7. Relatório
+Criar endpoint:
+
+/symbol-rotation/status
+Mostrar:
+
+ranking atual
+símbolos HOT/ACTIVE/REDUCED/PAUSED
+PnL por símbolo
+slippage por símbolo
+score médio por símbolo
+posição recomendada por símbolo

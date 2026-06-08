@@ -1,0 +1,167 @@
+Objetivo:
+Criar um motor de tamanho de posição que aumenta ou reduz margem automaticamente conforme performance real, score do sniper, qualidade de execução e estado da conta.
+
+Queremos crescer capital quando o sistema está performando bem, mas sem usar martingale cego. O size deve ser agressivo quando há edge e reduzido quando o ambiente piora.
+
+## 1. Criar módulo `position_sizing.py`
+
+Responsabilidade:
+Calcular `recommendedMargin`, `recommendedLeverage`, `riskTier` e `sizeReason` para cada entrada.
+
+Inputs:
+- account equity
+- available margin
+- aggressiveScore
+- coach rank
+- symbol rotation state
+- aggression state
+- recent PnL
+- recent win rate
+- profit factor
+- drawdown
+- execution slippage
+- campaign depth
+- current open positions
+- symbol concentration
+- side/context performance
+- experiment arm
+
+Retorno:
+
+```json
+{
+  "recommendedMargin": 7.5,
+  "recommendedLeverage": 14,
+  "riskTier": "BOOST",
+  "sizeMultiplier": 1.5,
+  "reason": "high_score_hot_symbol_good_execution",
+  "maxLossIfStop": 0.58,
+  "notional": 105.0
+}
+2. Estados de size
+Criar tiers:
+
+MICRO: 0.25x base margin
+SCOUT: 0.5x
+BASE: 1.0x
+BOOST: 1.25x
+AGGRESSIVE: 1.5x
+MAX_SNIPER: 2.0x
+Nunca usar martingale baseado em perda anterior.
+
+3. Regras base
+if aggressiveScore < 0.55:
+  no trade
+
+0.55 - 0.68:
+  SCOUT or BASE
+
+0.68 - 0.78:
+  BASE or BOOST
+
+0.78+:
+  BOOST or AGGRESSIVE
+
+0.85+ and symbol HOT and execution excellent:
+  MAX_SNIPER
+4. Compounding
+A margem base deve crescer conforme equity cresce.
+
+Exemplo:
+
+baseMargin = max(
+  MIN_MARGIN,
+  equity * BASE_RISK_PCT
+)
+Config:
+
+POSITION_SIZING_ENABLED=true
+BASE_RISK_PCT=0.005
+MAX_RISK_PCT_PER_TRADE=0.015
+MAX_TOTAL_RISK_PCT=0.08
+MAX_SYMBOL_RISK_PCT=0.03
+Se equity subir, baseMargin sobe.
+Se equity cair, baseMargin cai.
+
+5. Redução automática
+Reduzir size se:
+
+drawdown recente aumenta
+slippage alto
+símbolo em REDUCED
+aggression state DEFENSIVE
+contexto ainda cold start
+campanha já tem depth alto
+execução ruim no símbolo
+API/data quality degradada
+6. Aumento automático
+Aumentar size se:
+
+symbol HOT
+aggressiveScore alto
+profit factor recente bom
+execution quality excelente
+score bucket alto performando melhor que baixo
+drawdown baixo
+Exit Intelligence está preservando lucro
+7. Size por stacking depth
+Não aumentar margem em stacking de forma martingale.
+
+Regras:
+
+depth 1: size normal
+depth 2: size igual ou menor
+depth 3+: size reduzido se campanha não estiver em lucro
+nunca adicionar com margem maior que entrada anterior se campanha está negativa
+permitir size maior somente se campanha está em lucro e score atual é maior
+8. Limites globais
+Antes de aprovar size:
+
+calcular worst case loss se todos stops baterem
+respeitar max total risk
+respeitar max symbol concentration
+respeitar max concurrent positions
+respeitar max margin utilization
+Mas em Demo Learning Aggressive, esses limites podem ser mais altos por config.
+
+9. Integração com mass sniper
+No /api/bot/sniper/mass:
+
+após Coach Ranker ordenar candidatos
+chamar Position Sizing para cada candidato
+executar com margem recomendada
+registrar sizeMultiplier, riskTier e sizeReason no trade/outcome
+10. Relatório
+Endpoint:
+
+/position-sizing/status
+Mostrar:
+
+baseMargin atual
+equity usado
+size tier distribution
+PnL por riskTier
+win rate por riskTier
+drawdown por riskTier
+maior concentração por símbolo
+compounding curve
+recommended config
+11. Métrica principal
+O sistema deve responder:
+
+BOOST está ganhando mais que BASE?
+MAX_SNIPER compensa ou aumenta drawdown?
+Scout evita perdas em setup fraco?
+compounding aumenta equity sem explodir drawdown?
+size por símbolo está correto?
+12. Objetivo
+O sniper não deve operar sempre com margem fixa.
+
+Ele deve:
+
+começar controlado
+acelerar quando o edge aparece
+reduzir quando ambiente piora
+crescer junto com a conta
+evitar martingale
+usar size como arma de lucro, não como aposta cega

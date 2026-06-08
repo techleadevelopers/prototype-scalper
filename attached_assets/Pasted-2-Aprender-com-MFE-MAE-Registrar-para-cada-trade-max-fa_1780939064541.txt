@@ -1,0 +1,109 @@
+2. Aprender com MFE/MAE
+Registrar para cada trade:
+
+max favorable excursion
+max adverse excursion
+tempo até MFE
+tempo até MAE
+se quase bateu TP e voltou
+se bateu SL antes de qualquer lucro
+se fechou cedo demais
+se TP era curto demais
+se SL era largo demais
+Criar campos:
+
+mfePct
+maePct
+timeToMfeSec
+timeToMaeSec
+gaveBackPct
+exitQuality
+exitReason
+3. Classificar qualidade da saída
+Criar labels:
+
+PERFECT_EXIT: fechou perto do topo/fundo
+EARLY_EXIT: fechou antes de movimento continuar
+LATE_EXIT: devolveu lucro demais
+BAD_ENTRY: nunca teve MFE relevante
+STOP_TOO_WIDE: MAE grande antes do fechamento
+TP_TOO_SHORT: bateu TP mas continuou muito
+TIMEOUT_BAD: ficou preso sem edge
+Esses labels devem alimentar o Coach Ranker.
+
+4. TP/SL adaptativo por contexto
+Não usar TP/SL fixo igual para todo setup.
+
+Criar recomendação dinâmica:
+
+momentum forte: TP maior ou trailing
+momentum fraco: TP curto
+spread alto: TP mínimo maior
+volatilidade alta: SL mais largo, tamanho menor
+volatilidade baixa: SL mais curto
+score alto: pode deixar correr
+score médio: scalp rápido
+Exemplo:
+
+if aggressiveScore >= 0.78 and momentum still expanding:
+    use trailing / let winner run
+
+if aggressiveScore 0.55-0.68:
+    use quick TP and tighter stop
+
+if position age > expectedTimeToTarget and no MFE:
+    close or tighten stop
+5. Proteção de lucro rápida
+Implementar regras:
+
+Se posição atinge +50% do TP e depois momentum enfraquece: tighten stop.
+Se posição atinge +70% do TP: mover stop para breakeven ou pequeno lucro.
+Se MFE > TP e preço começa a devolver: fechar.
+Se spread explode durante posição: reduzir risco.
+Se candle vira contra no 1m/5m: close/tighten.
+6. Stacking baseado em posição viva
+Stacking só deve continuar se a campanha está saudável.
+
+Permitir stack se:
+
+trade anterior tem MFE positivo
+preço não voltou contra entrada média
+momentum ainda confirma
+aggressiveScore atual >= score anterior ou ainda forte
+campanha sem drawdown relevante
+Bloquear stack se:
+
+campanha em drawdown
+MFE devolvido
+candle virou contra
+spread abriu
+novo sinal é só repetição do mesmo evento
+7. Relatório de saída
+Adicionar relatório:
+
+win rate por exit action
+PnL por exit action
+média MFE/MAE
+quanto lucro foi devolvido
+quantos trades quase bateram TP
+quantos SL poderiam ter sido evitados
+melhor TP/SL por símbolo/lado/contexto
+performance do trailing vs TP fixo
+8. Integração backend Demo VST
+No monitor de posições demo:
+
+chamar exit_intelligence
+registrar recomendação
+se action for CLOSE_NOW, fechar posição
+se action for TIGHTEN_STOP, registrar intenção e, se suportado, ajustar proteção
+se action for ALLOW_STACKING, liberar stacking
+se action for CANCEL_STACKING, bloquear novos adds na campanha
+9. Objetivo
+O sniper deve aprender não só onde entrar, mas como sair.
+
+Entrada agressiva gera oportunidade.
+Exit Intelligence transforma oportunidade em lucro.
+Post-trade learning ensina o Coach Ranker a melhorar com Demo real.
+
+
+Esse é o próximo mais valioso.
