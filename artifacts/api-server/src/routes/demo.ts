@@ -3,9 +3,9 @@ import { createHmac, randomUUID } from "crypto";
 import type { Request, Response } from "express";
 import { getBotConfig } from "../lib/botConfig";
 import { getEngine, recordTradeOutcome, updateTradeOutcome } from "../lib/telemetryStore";
-import { evaluateQuantBrainEdge, quantBrainGateMode, syncQuantBrainOutcome, reportSignalLifecycle, evaluateExit, recordExitOutcome } from "../lib/quantBrainClient";
+import { evaluateQuantBrainEdge, quantBrainGateMode, syncQuantBrainOutcome } from "../lib/quantBrainClient";
 import type { BtcRegime, TradeOutcome } from "../lib/adaptiveEngine";
-import { feeDragRejectReason } from "../lib/executionRisk";
+import { feeDragRejectReason, getCorrelation } from "../lib/executionRisk";
 import { buildTelemetryState } from "./telemetry";
 import { computeCandleEdge, computeAllCandleEdges } from "../lib/candleEdge";
 import type { ClusterKey } from "../lib/adaptiveEngine";
@@ -25,13 +25,20 @@ import {
   getOpenTradesAsMap,
   getClosedTradeIds,
   getCampaignOpenCount,
+  getActiveCampaignId,
   getClosedTradesForCampaign,
+  getOpenTradesBySymbolSide,
   buildCampaignOutcome,
   resolveCampaignId,
   loadClosedTrades,
   getCampaignSummary,
   archiveClosedIfNeeded,
 } from "../lib/demoTradeStore";
+import {
+  buildStackingAudit,
+  campaignControlCap,
+  evaluateStackingInsertion,
+} from "../lib/stackingPolicy";
 import {
   getServiceState,
   isEntryAllowed,
@@ -49,6 +56,20 @@ import {
   resetServiceState,
   getConsecutiveLosses,
 } from "../lib/serviceState";
+import {
+  createExecutionCredentials,
+  endpointForCredentials,
+  type ExecutionCredentials,
+} from "../lib/executionSecurity";
+import {
+  createClientOrderId,
+  getUnresolvedOrders,
+  initVstOrderJournal,
+  normalizeBingXOrderState,
+  recordOrderRequested,
+  updateOrderState,
+} from "../lib/vstOrderJournal";
+import { assertCampaignAccounting, assertExposureInvariant } from "../lib/vstAccounting";
 
 // Initialise persistent demo trade store on module load, then restore runtime state
 void initDemoTradeStore().then(() => {
@@ -63,7 +84,7 @@ void initDemoTradeStore().then(() => {
         positionSide: storeEntry.positionSide,
         quantity: storeEntry.qty,
         entryPrice: storeEntry.entryPrice,
-        expectedEntryPrice: storeEntry.expectedEntryPrice ?? undefined,
+        expectedEntryPrice: storeEntry.expectedEntryPrice,
         entryTime: storeEntry.entryTime,
         hourUtc: storeEntry.hourUtc,
         btcRegime: storeEntry.btcRegime as BtcRegime,
@@ -80,6 +101,9 @@ void initDemoTradeStore().then(() => {
 }).catch((err) => {
   console.error("[demoTradeStore] init failed", err);
 });
+void initVstOrderJournal().catch((err) => {
+  console.error("[vstOrderJournal] init failed", err);
+});
 
 interface DemoOpenTrade {
   orderId: string;
@@ -88,20 +112,18 @@ interface DemoOpenTrade {
   positionSide: "LONG" | "SHORT";
   quantity: number;
   entryPrice: number;
-  expectedEntryPrice?: number;
+  expectedEntryPrice?: number | null;
   entryTime: number;
   hourUtc: number;
   btcRegime: BtcRegime;
   leverage: number;
   marginUsed: number;
   expectedTpProfit: number;
-  aggressiveScore?: number;
 }
 
 declare module "express-session" {
   interface SessionData {
-    demoApiKey?: string;
-    demoSecretKey?: string;
+    demoCredentials?: ExecutionCredentials;
     demoOpenTrades?: Record<string, DemoOpenTrade>;
   }
 }
@@ -223,10 +245,132 @@ async function bingxPost(
   return parseBingXResponse(res);
 }
 
+function extractBingXOrder(data: Record<string, unknown>): Record<string, unknown> | null {
+  const payload = data.data as Record<string, unknown> | undefined;
+  const order = payload?.order ?? payload;
+  return order && typeof order === "object" ? order as Record<string, unknown> : null;
+}
+
+async function queryOrderByClientOrderId(
+  clientOrderId: string,
+  creds: { apiKey: string; secretKey: string },
+): Promise<Record<string, unknown> | null> {
+  const data = await bingxGet(
+    "/openApi/swap/v2/trade/order",
+    { clientOrderID: clientOrderId },
+    creds.apiKey,
+    creds.secretKey,
+  );
+  return isBingXSuccess(data) ? extractBingXOrder(data) : null;
+}
+
+async function placeVstOrderIdempotently(input: {
+  creds: { apiKey: string; secretKey: string };
+  clientOrderId: string;
+  campaignId: string;
+  symbol: string;
+  side: "BUY" | "SELL";
+  positionSide: "LONG" | "SHORT";
+  quantity: number;
+  params: Record<string, string | number | undefined>;
+}): Promise<Record<string, unknown>> {
+  assertExposureInvariant(input.positionSide, input.side, input.quantity, 0);
+  const intent = await recordOrderRequested({
+    clientOrderId: input.clientOrderId,
+    campaignId: input.campaignId,
+    symbol: input.symbol,
+    side: input.side,
+    positionSide: input.positionSide,
+    requestedQuantity: input.quantity,
+  });
+
+  if (intent.exchangeOrderId) {
+    const existing = await queryOrderByClientOrderId(input.clientOrderId, input.creds);
+    if (existing) return existing;
+  }
+
+  let data: Record<string, unknown>;
+  try {
+    data = await bingxPost(
+      "/openApi/swap/v2/trade/order",
+      { ...input.params, clientOrderId: input.clientOrderId },
+      input.creds.apiKey,
+      input.creds.secretKey,
+    );
+  } catch (error) {
+    const recovered = await queryOrderByClientOrderId(input.clientOrderId, input.creds).catch(() => null);
+    if (!recovered) {
+      await updateOrderState(input.clientOrderId, {
+        state: "UNKNOWN",
+        lastError: error instanceof Error ? error.message : String(error),
+      });
+      throw new Error(`ambiguous placement for ${input.clientOrderId}; exchange query returned no order`);
+    }
+    data = { code: 0, data: { order: recovered } };
+  }
+
+  if (!isBingXSuccess(data)) {
+    await updateOrderState(input.clientOrderId, {
+      state: "REJECTED",
+      lastError: String(data.msg ?? "BingX rejected order"),
+    });
+    throw new Error(String(data.msg ?? "BingX rejected order"));
+  }
+
+  let order = extractBingXOrder(data);
+  if (!order?.orderId) {
+    order = await queryOrderByClientOrderId(input.clientOrderId, input.creds).catch(() => null);
+  }
+  if (!order?.orderId) {
+    await updateOrderState(input.clientOrderId, {
+      state: "UNKNOWN",
+      lastError: "successful response without exchange orderId",
+    });
+    throw new Error(`BingX accepted ${input.clientOrderId} without a queryable exchange orderId`);
+  }
+
+  const rawState = String(order.status ?? "").toUpperCase();
+  const reportedFilled =
+    parseNumberField(order, ["executedQty", "filledQty", "quantity"]) ?? 0;
+  const filledQuantity = rawState === "FILLED" ? input.quantity : reportedFilled;
+  await updateOrderState(input.clientOrderId, {
+    exchangeOrderId: String(order.orderId),
+    filledQuantity: Math.min(input.quantity, filledQuantity),
+    state: normalizeBingXOrderState(order.status, filledQuantity, input.quantity),
+    lastError: null,
+  });
+  return order;
+}
+
+async function reconcileUnresolvedVstOrders(
+  creds: { apiKey: string; secretKey: string },
+): Promise<void> {
+  for (const intent of getUnresolvedOrders()) {
+    const order = await queryOrderByClientOrderId(intent.clientOrderId, creds).catch(() => null);
+    if (!order?.orderId) continue;
+    const rawState = String(order.status ?? "").toUpperCase();
+    const reportedFilled =
+      parseNumberField(order, ["executedQty", "filledQty", "quantity"]) ?? 0;
+    const filledQuantity =
+      rawState === "FILLED" ? intent.requestedQuantity : reportedFilled;
+    await updateOrderState(intent.clientOrderId, {
+      exchangeOrderId: String(order.orderId),
+      filledQuantity: Math.min(intent.requestedQuantity, filledQuantity),
+      state: normalizeBingXOrderState(
+        order.status,
+        filledQuantity,
+        intent.requestedQuantity,
+      ),
+      lastError: null,
+    });
+  }
+}
+
 function getDemoCredentials(req: Request): { apiKey: string; secretKey: string } | null {
-  const { demoApiKey, demoSecretKey } = req.session;
-  if (!demoApiKey || !demoSecretKey) return null;
-  return { apiKey: demoApiKey, secretKey: demoSecretKey };
+  const credentials = req.session.demoCredentials;
+  if (!credentials) return null;
+  endpointForCredentials(credentials, "demo");
+  return credentials;
 }
 
 async function fetchDemoBalance(apiKey: string, secretKey: string) {
@@ -743,7 +887,7 @@ async function closeTriggeredDemoPositions(
       const orderFee = parseNumberField(order, ["commission", "fee"]) ?? 0;
       const realized = resolveDemoRealizedPnl(grossPnl, balanceBefore, balanceAfter, orderFee);
       const expectedExitPrice = Number(position.markPrice || "0") || undefined;
-      const entrySlippage = estimateExecutionSlippage(entry.positionSide, entry.expectedEntryPrice, entry.entryPrice, closeQty, "entry");
+      const entrySlippage = estimateExecutionSlippage(entry.positionSide, entry.expectedEntryPrice ?? undefined, entry.entryPrice, closeQty, "entry");
       const exitSlippage = estimateExecutionSlippage(entry.positionSide, expectedExitPrice, exitPrice, closeQty, "exit");
       const totalSlippage = entrySlippage + exitSlippage;
       const notional = entry.entryPrice * closeQty;
@@ -769,7 +913,7 @@ async function closeTriggeredDemoPositions(
         realizedPnl: realized.realizedPnl,
         pnlSource: realized.source,
         estimated: realized.source === "price_estimate",
-        expectedEntryPrice: entry.expectedEntryPrice,
+        expectedEntryPrice: entry.expectedEntryPrice ?? undefined,
         expectedExitPrice,
         entrySlippage,
         exitSlippage,
@@ -789,14 +933,6 @@ async function closeTriggeredDemoPositions(
         if (!result.synced && result.error !== "missing QUANT_BRAIN_URL") {
           req.log.warn({ error: result.error, outcomeId: outcome.id }, "quant brain sync skipped");
         }
-      });
-      reportSignalLifecycle({
-        eventType: closeSignal.exitReason === "TP" ? "tp_hit" : "sl_hit",
-        symbol: position.symbol,
-        side: entry.positionSide,
-        isDemo: true,
-        riskProfile: config.decisionProfile,
-        metadata: { orderId: entry.orderId, realizedPnl: realized.realizedPnl, exitReason: closeSignal.exitReason },
       });
       enqueueDemoPnlReconciliation(req, creds, outcome, balanceBefore, grossPnl);
       closed.push({
@@ -836,32 +972,49 @@ async function closeTriggeredDemoPositions(
   return closed;
 }
 
-/** POST /api/demo/connect — usa as credenciais já salvas na sessão principal */
+/** POST /api/demo/connect - reuses credentials already stored by login. */
 router.post("/demo/connect", async (req: Request, res: Response) => {
-  // Reutiliza as credenciais da conta real já autenticadas (mesmas chaves, endpoint VST)
-  const { bingxApiKey, bingxSecretKey } = req.session as { bingxApiKey?: string; bingxSecretKey?: string };
-
-  if (!bingxApiKey || !bingxSecretKey) {
-    res.status(401).json({ connected: false, error: "Conecte sua conta BingX primeiro na aba principal antes de ativar o modo demo." });
+  const loginCredentials = req.session.liveCredentials;
+  if (!loginCredentials) {
+    res.status(400).json({
+      connected: false,
+      error: "Sessao de login nao encontrada. Entre novamente antes de ativar o Demo VST.",
+    });
     return;
   }
 
   try {
-    const bal = await fetchDemoBalance(bingxApiKey, bingxSecretKey);
+    const credentials = createExecutionCredentials({
+      environment: "demo",
+      accountId: `demo-${loginCredentials.fingerprint}`,
+      apiKey: loginCredentials.apiKey,
+      secretKey: loginCredentials.secretKey,
+      source: "demo-connect",
+    });
+    endpointForCredentials(credentials, "demo");
+    const bal = await fetchDemoBalance(credentials.apiKey, credentials.secretKey);
     if (!bal) {
       res.status(401).json({ connected: false, error: "Conta demo VST não acessível com essas credenciais. Verifique se a conta demo está ativada no app BingX." });
       return;
     }
 
-    req.session.demoApiKey = bingxApiKey;
-    req.session.demoSecretKey = bingxSecretKey;
+    req.session.demoCredentials = credentials;
+    await reconcileUnresolvedVstOrders(credentials);
 
-    const posData = await bingxGet("/openApi/swap/v2/user/positions", {}, bingxApiKey, bingxSecretKey);
+    const posData = await bingxGet(
+      "/openApi/swap/v2/user/positions",
+      {},
+      credentials.apiKey,
+      credentials.secretKey,
+    );
     const positions = isBingXSuccess(posData) ? mapDemoPositions(getRawPositions(posData)) : [];
     if (isBingXSuccess(posData)) reconcileSessionOpenTrades(req, positions);
 
     res.json({
       connected: true,
+      accountId: credentials.accountId,
+      environment: credentials.environment,
+      credentialFingerprint: credentials.fingerprint,
       balance: bal.balance ?? "0",
       equity: bal.equity ?? bal.balance ?? "0",
       availableBalance: bal.availableMargin ?? "0",
@@ -880,8 +1033,7 @@ router.post("/demo/connect", async (req: Request, res: Response) => {
 
 /** POST /api/demo/disconnect */
 router.post("/demo/disconnect", (req: Request, res: Response) => {
-  req.session.demoApiKey = undefined;
-  req.session.demoSecretKey = undefined;
+  req.session.demoCredentials = undefined;
   req.session.demoOpenTrades = undefined;
   res.json({ disconnected: true });
 });
@@ -1050,6 +1202,7 @@ router.post("/demo/order", async (req: Request, res: Response) => {
     btcChangePct,
     lastPrice,
     execute,
+    idempotencyKey,
   } = req.body as {
     symbol: string;
     side: "BUY" | "SELL";
@@ -1061,6 +1214,7 @@ router.post("/demo/order", async (req: Request, res: Response) => {
     btcChangePct?: number;
     lastPrice?: string | number;
     execute?: boolean;
+    idempotencyKey?: string;
   };
 
   if (!symbol || !side || !positionSide) {
@@ -1137,7 +1291,7 @@ router.post("/demo/order", async (req: Request, res: Response) => {
       currentProfitFactor,
       config,
       marketEventId: candle.marketEventId,
-      featureVersion: candle.candleOpenTimeMs ? String(candle.candleOpenTimeMs) : undefined,
+      featureVersion: "candle-edge-v1",
     }).then((edge) => {
       if (edge.error && edge.error !== "missing QUANT_BRAIN_URL") {
         req.log.warn({ error: edge.error, symbol, positionSide }, "quant brain edge unavailable");
@@ -1161,7 +1315,7 @@ router.post("/demo/order", async (req: Request, res: Response) => {
       currentProfitFactor,
       config,
       marketEventId: candle.marketEventId,
-      featureVersion: candle.candleOpenTimeMs ? String(candle.candleOpenTimeMs) : undefined,
+      featureVersion: "candle-edge-v1",
     });
     quantBrainEdge = edge;
     if (edge.error && edge.error !== "missing QUANT_BRAIN_URL") {
@@ -1202,8 +1356,9 @@ router.post("/demo/order", async (req: Request, res: Response) => {
     // non-fatal
   }
 
-  if (openPositionsCount >= config.maxConcurrentPositions) {
-    gateRejects.push(`CAPITAL_REJECT: ${openPositionsCount} positions >= max ${config.maxConcurrentPositions}`);
+  const demoPositionLimit = Math.max(config.maxConcurrentPositions, DEMO_SNIPER_GLOBAL_MAX);
+  if (openPositionsCount >= demoPositionLimit) {
+    gateRejects.push(`CAPITAL_REJECT: ${openPositionsCount} positions >= demo max ${demoPositionLimit}`);
   }
   if (config.preventHedgedPositions && openPositions.some((position) => position.symbol === symbol)) {
     const sides = openPositions
@@ -1278,6 +1433,11 @@ router.post("/demo/order", async (req: Request, res: Response) => {
 
   try {
     const protection = buildAttachedProtection(referencePrice, positionSide, config);
+    const campaignId = resolveCampaignId(symbol, positionSide, Date.now());
+    const clientOrderId = createClientOrderId(
+      `manual:${symbol}:${positionSide}`,
+      idempotencyKey,
+    );
     const orderParams: Record<string, string | number | undefined> = {
       symbol,
       side,
@@ -1288,30 +1448,17 @@ router.post("/demo/order", async (req: Request, res: Response) => {
       stopLoss: protection?.stopLoss,
       takeProfit: protection?.takeProfit,
     };
-    const data = await bingxPost(
-      "/openApi/swap/v2/trade/order",
-      orderParams,
-      creds.apiKey,
-      creds.secretKey,
-    );
-
-    if (!isBingXSuccess(data)) {
-      req.log.error({ data }, "demo order BingX error");
-      res.status(500).json({
-        placed: false,
-        orderId: null,
-        symbol,
-        side,
-        quantity: qty,
-        gateRejects: [],
-        observationMode: false,
-        message: `BingX error: ${(data.msg as string) ?? "unknown"}`,
-      });
-      return;
-    }
-
-    const order = (data.data as Record<string, unknown>)?.order as Record<string, unknown>;
-    const orderId = String(order?.orderId ?? "");
+    const order = await placeVstOrderIdempotently({
+      creds,
+      clientOrderId,
+      campaignId,
+      symbol,
+      side,
+      positionSide,
+      quantity: qty,
+      params: orderParams,
+    });
+    const orderId = String(order.orderId);
     const expectedEntryPrice = parseNumberField({ lastPrice }, ["lastPrice"]) ?? undefined;
     const entryPrice =
       parseNumberField(order, ["avgPrice", "price", "executedPrice"]) ??
@@ -1353,6 +1500,7 @@ router.post("/demo/order", async (req: Request, res: Response) => {
     res.json({
       placed: true,
       orderId,
+      clientOrderId,
       symbol,
       side,
       quantity: qty,
@@ -1466,7 +1614,7 @@ router.post("/demo/close", async (req: Request, res: Response) => {
         );
         const exitFee = parseNumberField(order, ["commission", "fee"]) ?? 0;
         const realized = resolveDemoRealizedPnl(grossPnl, balanceBefore, balanceAfter, exitFee);
-        const entrySlippage = estimateExecutionSlippage(entry.positionSide, entry.expectedEntryPrice, entry.entryPrice, closeQty, "entry");
+        const entrySlippage = estimateExecutionSlippage(entry.positionSide, entry.expectedEntryPrice ?? undefined, entry.entryPrice, closeQty, "entry");
         const exitSlippage = estimateExecutionSlippage(entry.positionSide, expectedExitPrice, exitPrice, closeQty, "exit");
         const totalSlippage = entrySlippage + exitSlippage;
         const notional = entry.entryPrice * closeQty;
@@ -1492,7 +1640,7 @@ router.post("/demo/close", async (req: Request, res: Response) => {
           realizedPnl: realized.realizedPnl,
           pnlSource: realized.source,
           estimated: realized.source === "price_estimate",
-          expectedEntryPrice: entry.expectedEntryPrice,
+          expectedEntryPrice: entry.expectedEntryPrice ?? undefined,
           expectedExitPrice,
           entrySlippage,
           exitSlippage,
@@ -1570,6 +1718,10 @@ const DEMO_SNIPER_GLOBAL_MAX = parseInt(process.env["DEMO_SNIPER_GLOBAL_MAX"] ??
 const DEMO_SNIPER_PER_SYMBOL_MAX = parseInt(process.env["DEMO_SNIPER_PER_SYMBOL_MAX"] ?? "10", 10);
 const DEMO_SNIPER_CYCLE_MS = parseInt(process.env["DEMO_SNIPER_CYCLE_MS"] ?? "30000", 10);
 const DEMO_SNIPER_MONITOR_MS = parseInt(process.env["DEMO_SNIPER_MONITOR_MS"] ?? "12000", 10);
+const DEMO_STACKING_COOLDOWN_MS = parseInt(process.env["DEMO_STACKING_COOLDOWN_MS"] ?? "60000", 10);
+const DEMO_STACKING_MAX_CAMPAIGN_DRAWDOWN_PCT = parseFloat(
+  process.env["DEMO_STACKING_MAX_CAMPAIGN_DRAWDOWN_PCT"] ?? "5",
+);
 const STALE_DATA_THRESHOLD_MS = parseInt(process.env["STALE_DATA_SHADOW_MS"] ?? "90000", 10);
 
 interface DemoSniperPlacement {
@@ -1607,9 +1759,6 @@ interface DemoSniperState {
 
 // Module-level open trade registry (survives session loss, keyed by orderId)
 const sniperOpenTrades = new Map<string, DemoOpenTrade>();
-// Campaigns where exit intelligence has requested stacking be paused.
-// Cleared when ALLOW_STACKING fires or when the campaign fully closes.
-const sniperStackingBlockedCampaigns = new Set<string>();
 const sniperRecordedIds = new Set<string>();
 
 const demoSniper: DemoSniperState = {
@@ -1625,6 +1774,36 @@ const demoSniper: DemoSniperState = {
   lastCycleSummary: null,
   cycleHistory: [],
 };
+let demoPlacementInFlight = false;
+let demoMonitorInFlight = false;
+let demoSkippedPlacementOverlaps = 0;
+let demoSkippedMonitorOverlaps = 0;
+
+async function runDemoSniperCycleLocked(): Promise<void> {
+  if (demoPlacementInFlight) {
+    demoSkippedPlacementOverlaps++;
+    return;
+  }
+  demoPlacementInFlight = true;
+  try {
+    await runDemoSniperCycle();
+  } finally {
+    demoPlacementInFlight = false;
+  }
+}
+
+async function runDemoSniperMonitorLocked(): Promise<void> {
+  if (demoMonitorInFlight) {
+    demoSkippedMonitorOverlaps++;
+    return;
+  }
+  demoMonitorInFlight = true;
+  try {
+    await runDemoSniperMonitor();
+  } finally {
+    demoMonitorInFlight = false;
+  }
+}
 
 /**
  * Base tier from signal score, then reduced proportionally when in a losing streak.
@@ -1641,17 +1820,9 @@ const demoSniper: DemoSniperState = {
  */
 function scoreTierMaxEntries(score: number): number {
   let base: number;
-  // Tiers aligned with aggressiveScore spec:
-  // < 0.45 → no entry (hard reject)
-  // 0.45–0.55 → 1 entry (learning)
-  // 0.55–0.68 → 2 entries (allow)
-  // 0.68–0.78 → 3 entries (priority)
-  // 0.78–0.90 → 5 entries (aggressive stacking)
-  // ≥ 0.90   → 10 entries (burst)
-  if (score < 0.45) return 0;
-  else if (score < 0.55) base = 1;
-  else if (score < 0.68) base = 2;
-  else if (score < 0.78) base = 3;
+  if (score < 0.60) return 0;
+  else if (score < 0.70) base = 1;
+  else if (score < 0.80) base = 3;
   else if (score < 0.90) base = 5;
   else base = 10;
 
@@ -1716,7 +1887,8 @@ async function runDemoSniperCycle(): Promise<void> {
 
   const btcRegime = inferBtcRegime(btcChangePct, config.btcRegimeThresholdPct);
   const hourUtc = new Date().getUTCHours();
-  const globalOpen = currentPositions.length;
+  // BingX can consolidate repeated fills into one symbol-side position.
+  const globalOpen = Math.max(currentPositions.length, getOpenTrades().length);
 
   // ── VST equity for equity-relative circuit breakers ─────────────────────
   void fetchDemoBalance(apiKey, secretKey).then((bal) => {
@@ -1773,6 +1945,10 @@ async function runDemoSniperCycle(): Promise<void> {
     tier: number;
     currentOpen: number;
     marketEventId?: string;
+    stateFingerprint: string;
+    currentEv: number;
+    currentWinRate: number;
+    currentProfitFactor: number;
   }
 
   const candidates: ScoredCandidate[] = [];
@@ -1812,6 +1988,15 @@ async function runDemoSniperCycle(): Promise<void> {
         tier,
         currentOpen,
         marketEventId: edge?.marketEventId,
+        stateFingerprint: [
+          edge?.marketEventId ?? "no-event",
+          btcRegime,
+          ps,
+          combinedScore.toFixed(4),
+        ].join(":"),
+        currentEv: ev,
+        currentWinRate: clusterProfile?.winRate ?? symProfile?.winRate ?? 0,
+        currentProfitFactor: clusterProfile?.profitFactor ?? symProfile?.profitFactor ?? 0,
       });
     }
   }
@@ -1837,7 +2022,8 @@ async function runDemoSniperCycle(): Promise<void> {
       globalHeadroom,
     );
 
-    for (let n = 0; n < entriesToAdd; n++) {
+    // One insertion at most per symbol-side and market state in a cycle.
+    for (let n = 0; n < Math.min(entriesToAdd, 1); n++) {
       if (globalHeadroom <= 0) break;
 
       // ── Per-entry entry-allowed check ──────────────────────────────────────
@@ -1849,20 +2035,83 @@ async function runDemoSniperCycle(): Promise<void> {
       // SHADOW_ONLY: only first entry per campaign allowed.
       // Resolve campaign BEFORE fetching price (no network call yet).
       const entryNow = Date.now();
-      const campaignIdPreview = resolveCampaignId(c.symbol, c.positionSide, entryNow);
-      const campaignAlreadyHasEntry = getCampaignOpenCount(campaignIdPreview) > 0 || c.currentOpen > 0;
-      if (!isEntryAllowed(campaignAlreadyHasEntry)) {
-        reportSignalLifecycle({ eventType: "duplicate_rejected", symbol: c.symbol, side: c.positionSide, score: c.score, isDemo: true, riskProfile: config.decisionProfile, metadata: { campaignAlreadyHasEntry } });
-        skipped++; break;
-      }
-      // Exit intelligence stacking gate: blocked if a live position in this campaign
-      // received CANCEL_STACKING from QB during the monitor cycle.
-      if (sniperStackingBlockedCampaigns.has(campaignIdPreview)) {
-        reportSignalLifecycle({ eventType: "duplicate_rejected", symbol: c.symbol, side: c.positionSide, score: c.score, isDemo: true, riskProfile: config.decisionProfile, metadata: { reason: "exit_intelligence_cancel_stacking", campaignId: campaignIdPreview } });
-        skipped++; break;
-      }
+      const activeCampaignId = getActiveCampaignId(c.symbol, c.positionSide, entryNow);
+      const campaignId = activeCampaignId ?? randomUUID();
+      const openCampaignEntries = activeCampaignId
+        ? getOpenTradesBySymbolSide(c.symbol, c.positionSide)
+            .filter((entry) => entry.campaignId === activeCampaignId)
+        : [];
+      const campaignAlreadyHasEntry = openCampaignEntries.length > 0 || c.currentOpen > 0;
+      if (!isEntryAllowed(campaignAlreadyHasEntry)) { skipped++; break; }
 
       const fallback = isFallbackMode();
+      const campaignSignalId = openCampaignEntries[0]?.signalId ?? `vst-campaign:${campaignId}`;
+      const quantEdge = await evaluateQuantBrainEdge({
+        symbol: c.symbol,
+        side: c.side,
+        positionSide: c.positionSide,
+        hourUtc,
+        btcChangePct,
+        currentEv: c.currentEv,
+        currentWinRate: c.currentWinRate,
+        currentProfitFactor: c.currentProfitFactor,
+        config,
+        signalId: campaignSignalId,
+        marketEventId: c.marketEventId,
+        featureVersion: "candle-edge-v1",
+        observationSourceType: "vst_campaign",
+      });
+      const calibratedProbability = quantEdge.calibratedProbability ?? null;
+      const uncertaintyType = quantEdge.uncertaintyType
+        ?? (quantEdge.error ? "MODEL_UNAVAILABLE" : null);
+      if (quantEdge.driftPolicy?.newEntriesAllowed === false) {
+        skipped++;
+        break;
+      }
+
+      const campaignMargin = openCampaignEntries.reduce((sum, entry) => sum + entry.marginUsed, 0);
+      const campaignAdverseExcursion = Math.abs(
+        openCampaignEntries.reduce((sum, entry) => sum + Math.min(0, entry.mae), 0),
+      );
+      const campaignDrawdownPct = campaignMargin > 0
+        ? (campaignAdverseExcursion / campaignMargin) * 100
+        : 0;
+      const baseControlMaxEntries = campaignControlCap(campaignId);
+      const driftStackingMultiplier = quantEdge.driftPolicy?.stackingMultiplier ?? 1;
+      const adjustedControlCap = baseControlMaxEntries * driftStackingMultiplier;
+      const controlMaxEntries =
+        adjustedControlCap >= 10 ? 10
+        : adjustedControlCap >= 5 ? 5
+        : adjustedControlCap >= 3 ? 3
+        : 1;
+      const stackingGate = evaluateStackingInsertion({
+        openEntries: openCampaignEntries,
+        proposedSide: c.positionSide,
+        edgeScore: c.score,
+        calibratedProbability,
+        uncertaintyType,
+        marketEventId: c.marketEventId ?? null,
+        stateFingerprint: c.stateFingerprint,
+        now: entryNow,
+        cooldownMs: DEMO_STACKING_COOLDOWN_MS,
+        campaignCap: controlMaxEntries,
+        proposedMargin: config.marginPerTrade,
+        campaignDrawdownPct,
+        maxCampaignDrawdownPct: DEMO_STACKING_MAX_CAMPAIGN_DRAWDOWN_PCT,
+        portfolioCapacityAvailable:
+          globalHeadroom > 0 && globalOpen + placed < DEMO_SNIPER_GLOBAL_MAX,
+      });
+      if (!stackingGate.allow) {
+        console.info({
+          symbol: c.symbol,
+          positionSide: c.positionSide,
+          campaignId,
+          depth: stackingGate.depth,
+          rejects: stackingGate.rejects,
+        }, "[demo-sniper] stacking rejected");
+        skipped++;
+        break;
+      }
 
       const price = await fetchDemoLastPrice(c.symbol).catch(() => null);
       if (!price || price <= 0) { skipped++; break; }
@@ -1871,12 +2120,27 @@ async function runDemoSniperCycle(): Promise<void> {
       if (!qty || qty <= 0) { skipped++; break; }
 
       const protection = buildAttachedProtection(price, c.positionSide, config);
-      const clientOrderId = randomUUID();
+      const clientOrderId = createClientOrderId(
+        `sniper:${c.symbol}:${c.positionSide}`,
+        `${c.marketEventId ?? c.stateFingerprint}:${stackingGate.depth}`,
+      );
+      const notional = price * qty;
+      const correlationSum = currentPositions.reduce(
+        (sum, position) => sum + Math.max(0, getCorrelation(c.symbol, position.symbol)),
+        0,
+      );
+      const correlationAdjustedExposure = notional * Math.sqrt(1 + 2 * correlationSum);
 
       try {
-        const data = await bingxPost(
-          "/openApi/swap/v2/trade/order",
-          {
+        const order = await placeVstOrderIdempotently({
+          creds: { apiKey, secretKey },
+          clientOrderId,
+          campaignId,
+          symbol: c.symbol,
+          side: c.side,
+          positionSide: c.positionSide,
+          quantity: qty,
+          params: {
             symbol: c.symbol,
             side: c.side,
             positionSide: c.positionSide,
@@ -1885,22 +2149,10 @@ async function runDemoSniperCycle(): Promise<void> {
             leverage: config.leverage,
             stopLoss: protection?.stopLoss,
             takeProfit: protection?.takeProfit,
-            clientOrderId,
           },
-          apiKey,
-          secretKey,
-        );
-
-        if (!isBingXSuccess(data)) {
-          reportSignalLifecycle({ eventType: "api_error", symbol: c.symbol, side: c.positionSide, score: c.score, isDemo: true, riskProfile: config.decisionProfile, metadata: { error: String((data as { msg?: string })?.msg ?? "bingx_error") } });
-          skipped++; continue;
-        }
-
-        const order = (data.data as Record<string, unknown>)?.order as Record<string, unknown>;
-        const orderId = String(order?.orderId ?? `sniper-${Date.now()}-${c.symbol}-${c.positionSide}`);
-        const entryPrice = parseFloat(String(order?.avgPrice ?? "")) || price;
-
-        reportSignalLifecycle({ eventType: "order_placed", symbol: c.symbol, side: c.positionSide, score: c.score, isDemo: true, riskProfile: config.decisionProfile, metadata: { orderId, price: entryPrice, tier: c.tier } });
+        });
+        const orderId = String(order.orderId);
+        const entryPrice = parseFloat(String(order.avgPrice ?? "")) || price;
 
         const entryTime = Date.now();
         sniperOpenTrades.set(orderId, {
@@ -1917,12 +2169,12 @@ async function runDemoSniperCycle(): Promise<void> {
           leverage: config.leverage,
           marginUsed: config.marginPerTrade,
           expectedTpProfit: config.marginPerTrade * config.leverage * (config.takeProfitPct / 100),
-          aggressiveScore: typeof c.score === "number" ? c.score : undefined,
         });
-        reportSignalLifecycle({ eventType: "position_opened", symbol: c.symbol, side: c.positionSide, score: c.score, isDemo: true, riskProfile: config.decisionProfile, metadata: { orderId, entryPrice, leverage: config.leverage, margin: config.marginPerTrade } });
 
         // Persist to durable trade store — idempotent, survives server restarts
-        void persistOpenTrade({
+        await persistOpenTrade({
+          campaignId,
+          signalId: campaignSignalId,
           orderId,
           clientOrderId,
           symbol: c.symbol,
@@ -1940,8 +2192,19 @@ async function runDemoSniperCycle(): Promise<void> {
           btcRegime,
           hourUtc,
           edgeScore: c.score,
-          modelVersion: fallback ? "shadow-baseline" : "sniper-v1",
-          fallbackMode: fallback,
+          stackingDepth: stackingGate.depth,
+          controlMaxEntries,
+          edgeAtInsertion: c.score,
+          calibratedProbability,
+          uncertaintyType,
+          marketEventId: c.marketEventId ?? null,
+          predictionId: quantEdge.predictionId ?? null,
+          featureVersion: quantEdge.featureVersion ?? "candle-edge-v1",
+          stateFingerprint: c.stateFingerprint,
+          correlationAdjustedExposure,
+          modelVersion: quantEdge.modelVersion
+            ?? (fallback ? "shadow-baseline" : "sniper-v1"),
+          fallbackMode: fallback || !quantEdge.available,
           mfe: 0,
           mae: 0,
           mfeAt: null,
@@ -1949,7 +2212,7 @@ async function runDemoSniperCycle(): Promise<void> {
           lastMarkPrice: null,
           lastCheckedAt: null,
           closedAt: null,
-        }).catch(() => {});
+        });
 
         if (c.marketEventId) {
           cycleProcessedEventIds.add(`${c.symbol}:${c.positionSide}:${c.marketEventId}`);
@@ -2001,7 +2264,7 @@ async function runDemoSniperMonitor(): Promise<void> {
         positionSide: storeEntry.positionSide,
         quantity: storeEntry.qty,
         entryPrice: storeEntry.entryPrice,
-        expectedEntryPrice: storeEntry.expectedEntryPrice ?? undefined,
+        expectedEntryPrice: storeEntry.expectedEntryPrice,
         entryTime: storeEntry.entryTime,
         hourUtc: storeEntry.hourUtc,
         btcRegime: storeEntry.btcRegime as BtcRegime,
@@ -2042,6 +2305,15 @@ async function runDemoSniperMonitor(): Promise<void> {
 
   // Campaigns whose last entry closed in this monitor pass — build campaign ML outcome
   const campaignsToClose = new Set<string>();
+  const trackedQuantityByPosition = new Map<string, number>();
+  for (const entry of sniperOpenTrades.values()) {
+    const positionKey = `${entry.symbol.toUpperCase()}:${entry.positionSide.toUpperCase()}`;
+    trackedQuantityByPosition.set(
+      positionKey,
+      (trackedQuantityByPosition.get(positionKey) ?? 0) + entry.quantity,
+    );
+  }
+  const incomeByPosition = new Map<string, Promise<{ realizedPnl: number; fee: number } | null>>();
 
   for (const [orderId, entry] of sniperOpenTrades.entries()) {
     if (sniperRecordedIds.has(orderId)) { sniperOpenTrades.delete(orderId); continue; }
@@ -2054,67 +2326,6 @@ async function runDemoSniperMonitor(): Promise<void> {
         const markPrice = openMarkPrices.get(key);
         if (markPrice && markPrice > 0) {
           void updateOpenTradeMfe(storeEntry.tradeId, markPrice).catch(() => {});
-
-          // ── Exit Intelligence (fire-and-forget, never blocks monitor) ──────
-          const ageSeconds = (Date.now() - entry.entryTime) / 1000;
-          const margin = entry.marginUsed || 1;
-          const unrealizedPnl = entry.positionSide === "LONG"
-            ? (markPrice - entry.entryPrice) * entry.quantity
-            : (entry.entryPrice - markPrice) * entry.quantity;
-          const unrealizedPnlPct = (unrealizedPnl / margin) * 100;
-          const mfePct = (storeEntry.mfe / margin) * 100;
-          const maePct = (storeEntry.mae / margin) * 100;
-          const campaignDepth = getCampaignOpenCount(storeEntry.campaignId);
-          // Compute campaign drawdown from all open trades in the same campaign
-          const campaignTrades = getOpenTrades().filter(
-            (t) => t.campaignId === storeEntry.campaignId,
-          );
-          const totalCampaignMargin = campaignTrades.reduce(
-            (s, t) => s + (t.marginUsed || 0), margin,
-          );
-          const totalCampaignMae = campaignTrades.reduce(
-            (s, t) => s + (t.mae || 0), 0,
-          );
-          const campaignDrawdownPct = totalCampaignMargin > 0
-            ? (totalCampaignMae / totalCampaignMargin) * 100
-            : 0;
-
-          void evaluateExit({
-            symbol: entry.symbol,
-            positionSide: entry.positionSide,
-            orderId: entry.orderId,
-            entryPrice: entry.entryPrice,
-            currentPrice: markPrice,
-            unrealizedPnlPct,
-            ageSeconds,
-            tpPct: config.takeProfitPct,
-            slPct: config.stopLossPct,
-            mfePct,
-            maePct,
-            aggressiveScore: entry.aggressiveScore,
-            campaignDepth,
-            campaignDrawdownPct,
-            btcRegime: entry.btcRegime,
-          }).then((exitEval) => {
-            if (!exitEval) return;
-            // Update stacking gate based on QB recommendation
-            const se = getOpenTradeByOrderId(orderId);
-            if (!se) return;
-            if (exitEval.stackingAction === "CANCEL_STACKING") {
-              sniperStackingBlockedCampaigns.add(se.campaignId);
-            } else if (exitEval.stackingAction === "ALLOW_STACKING") {
-              sniperStackingBlockedCampaigns.delete(se.campaignId);
-            }
-            // Auto-close if QB recommends it and position is still live
-            if (exitEval.shouldClose && !sniperRecordedIds.has(orderId) && demoSniper.creds) {
-              void closeDemoMarket(
-                demoSniper.creds,
-                entry.symbol,
-                entry.positionSide,
-                entry.quantity,
-              ).catch(() => {});
-            }
-          }).catch(() => {});
         }
       }
       continue;
@@ -2128,9 +2339,14 @@ async function runDemoSniperMonitor(): Promise<void> {
     // Attempt canonical PnL from BingX income API (covers entire position hold window)
     const windowStart = entry.entryTime - 10_000; // 10s before entry
     const windowEnd = exitTime + 60_000;           // 60s after detected close
-    const incomeData = await fetchBingXRealizedPnl(
-      entry.symbol, windowStart, windowEnd, apiKey, secretKey,
-    );
+    let incomePromise = incomeByPosition.get(key);
+    if (!incomePromise) {
+      incomePromise = fetchBingXRealizedPnl(
+        entry.symbol, windowStart, windowEnd, apiKey, secretKey,
+      );
+      incomeByPosition.set(key, incomePromise);
+    }
+    const incomeData = await incomePromise;
 
     let exitPrice: number;
     let grossPnl: number;
@@ -2141,8 +2357,10 @@ async function runDemoSniperMonitor(): Promise<void> {
 
     if (incomeData && incomeData.realizedPnl !== 0) {
       // Canonical exchange-reported values
-      realizedPnl = incomeData.realizedPnl;
-      fee = incomeData.fee;
+      const trackedQuantity = trackedQuantityByPosition.get(key) ?? entry.quantity;
+      const allocation = trackedQuantity > 0 ? entry.quantity / trackedQuantity : 0;
+      realizedPnl = incomeData.realizedPnl * allocation;
+      fee = incomeData.fee * allocation;
       grossPnl = realizedPnl + fee;
       exitPrice = estimatedExitPrice; // use last price for exit price (income API doesn't give it)
       pnlSource = "exchange_reported";
@@ -2190,43 +2408,13 @@ async function runDemoSniperMonitor(): Promise<void> {
         realizedPnl,
         pnlSource,
         estimated,
-        expectedEntryPrice: entry.expectedEntryPrice,
+        expectedEntryPrice: entry.expectedEntryPrice ?? undefined,
         exitReason,
         expectedTpProfit: entry.expectedTpProfit,
       });
 
       sniperRecordedIds.add(orderId);
       sniperOpenTrades.delete(orderId);
-
-      // ── Exit Outcome Recording (fire-and-forget) ──────────────────────────
-      // Enrich QB with post-trade quality classification for Coach Ranker learning.
-      {
-        const se = getOpenTradeByOrderId(orderId);
-        const margin = entry.marginUsed || 1;
-        const mfePctRecord = se ? (se.mfe / margin) * 100 : 0;
-        const maePctRecord = se ? (se.mae / margin) * 100 : 0;
-        const pnlPctRecord = (realizedPnl / margin) * 100;
-        const ageSecondsRecord = (exitTime - entry.entryTime) / 1000;
-        recordExitOutcome({
-          sourceId: entry.orderId,
-          symbol: entry.symbol,
-          positionSide: entry.positionSide,
-          entryPrice: entry.entryPrice,
-          exitPrice,
-          pnlPct: pnlPctRecord,
-          mfePct: mfePctRecord,
-          maePct: maePctRecord,
-          ageSeconds: ageSecondsRecord,
-          tpPct: config.takeProfitPct,
-          slPct: config.stopLossPct,
-          exitReason,
-          aggressiveScore: entry.aggressiveScore,
-          btcRegime: entry.btcRegime,
-          hourUtc: entry.hourUtc,
-          campaignId: se?.campaignId ?? "",
-          isDemo: true,
-        });
-      }
 
       // Close in durable store — idempotent
       const storeEntry = getOpenTradeByOrderId(orderId);
@@ -2265,6 +2453,12 @@ async function runDemoSniperMonitor(): Promise<void> {
       const closedTrades = getClosedTradesForCampaign(campaignId);
       const co = buildCampaignOutcome(closedTrades);
       if (!co) continue;
+      assertCampaignAccounting({
+        campaignId,
+        executionPnl: closedTrades.map((trade) => trade.realizedPnl),
+        campaignPnl: co.realizedPnl,
+        finalOutcomeCount: 1,
+      });
 
       const dominantReason = (
         Object.entries(co.exitReasons).sort((a, b) => b[1] - a[1])[0]?.[0] ?? "MANUAL"
@@ -2299,13 +2493,17 @@ async function runDemoSniperMonitor(): Promise<void> {
         holdDurationMs: co.holdDurationMs,
         entryCount: co.entryCount,
         modelVersion: co.modelVersion ?? undefined,
+        signalId: co.signalId,
+        marketEventId: co.marketEventId ?? undefined,
+        predictionId: co.predictionId ?? undefined,
+        campaignId: co.campaignId,
+        clientOrderId: co.clientOrderId,
+        exchangeOrderId: co.exchangeOrderId,
+        featureVersion: co.featureVersion ?? undefined,
       };
 
       // Single QB sync per campaign — the ML training boundary
       void syncQuantBrainOutcome(mlOutcome).catch(() => {});
-
-      // Exit intelligence cleanup — release stacking gate for closed campaigns
-      sniperStackingBlockedCampaigns.delete(campaignId);
 
       // Circuit breaker at campaign level
       if (co.realizedPnl > 0) recordTradeWin();
@@ -2334,6 +2532,10 @@ function getSniperStatus() {
     lastCycleSummary: demoSniper.lastCycleSummary,
     recentHistory: demoSniper.cycleHistory.slice(-10),
     openTrades: sniperOpenTrades.size,
+    placementInFlight: demoPlacementInFlight,
+    monitorInFlight: demoMonitorInFlight,
+    skippedPlacementOverlaps: demoSkippedPlacementOverlaps,
+    skippedMonitorOverlaps: demoSkippedMonitorOverlaps,
     config: {
       globalMax: DEMO_SNIPER_GLOBAL_MAX,
       perSymbolMax: DEMO_SNIPER_PER_SYMBOL_MAX,
@@ -2362,9 +2564,9 @@ router.post("/demo/sniper/start", (req: Request, res: Response) => {
   demoSniper.lastCycleSummary = null;
   demoSniper.cycleHistory = [];
 
-  runDemoSniperCycle().catch(() => {});
-  demoSniper.placeHandle = setInterval(() => { runDemoSniperCycle().catch(() => {}); }, DEMO_SNIPER_CYCLE_MS);
-  demoSniper.monitorHandle = setInterval(() => { runDemoSniperMonitor().catch(() => {}); }, DEMO_SNIPER_MONITOR_MS);
+  runDemoSniperCycleLocked().catch(() => {});
+  demoSniper.placeHandle = setInterval(() => { runDemoSniperCycleLocked().catch(() => {}); }, DEMO_SNIPER_CYCLE_MS);
+  demoSniper.monitorHandle = setInterval(() => { runDemoSniperMonitorLocked().catch(() => {}); }, DEMO_SNIPER_MONITOR_MS);
 
   req.log.info({ cycleMs: DEMO_SNIPER_CYCLE_MS, globalMax: DEMO_SNIPER_GLOBAL_MAX }, "[demo-sniper] started");
   res.json({ started: true, ...getSniperStatus() });
@@ -2591,6 +2793,19 @@ router.get("/demo/campaign/summary", async (_req: Request, res: Response) => {
     });
   } catch (err) {
     res.status(500).json({ error: "Failed to load campaign summary", detail: String(err) });
+  }
+});
+
+/**
+ * GET /api/demo/stacking/audit
+ * Chronological 70/30 holdout analysis of marginal stacking depth.
+ */
+router.get("/demo/stacking/audit", async (_req: Request, res: Response) => {
+  try {
+    const trades = await loadClosedTrades(10_000);
+    res.json(buildStackingAudit(trades));
+  } catch (err) {
+    res.status(500).json({ error: "Failed to build stacking audit", detail: String(err) });
   }
 });
 
