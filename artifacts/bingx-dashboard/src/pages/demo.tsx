@@ -1176,8 +1176,8 @@ export default function DemoPage() {
             return Math.min(26, Math.max(3, base2 + Math.sin(idx * 2.35) * vol * 0.35 + jag));
           });
           const sparkPts = sparkY.map((y, idx) => `${(idx / (sparkY.length - 1)) * 100},${y}`).join(" ");
-          const sparkColor = up ? "#8ed734" : "#ef4444";
-          const sparkGlow = up ? "drop-shadow(0 0 3px rgba(142,215,52,0.7))" : "drop-shadow(0 0 3px rgba(239,68,68,0.7))";
+          const sparkColor = up ? "#22c55e" : "#ef4444";
+          const sparkGlow = up ? "drop-shadow(0 0 3px rgba(34,197,94,0.7))" : "drop-shadow(0 0 3px rgba(239,68,68,0.7))";
 
           return (
             <div
