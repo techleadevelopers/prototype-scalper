@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { createHmac, randomUUID } from "crypto";
 import type { Request, Response } from "express";
-import { getBotConfig, setConfigOverrides, resetConfigOverrides } from "../lib/botConfig";
+import { getBotConfig, getOverrideHistory, setConfigOverrides, resetConfigOverrides } from "../lib/botConfig";
 import {
   BOT_MODES, type BotModeId, type BulkOrderItem, type BulkOrderResult, type BulkExecutionSummary,
   TokenBucket, setActiveModeId, getActiveModeId, getActiveModePreset, clearActiveMode,
@@ -13,9 +13,11 @@ import { feeDragRejectReason, maxCorrelatedBulkOrders } from "../lib/executionRi
 import {
   getQuantBrainIntelligence,
   evaluateQuantBrainEdge,
+  getCurrentQuantBrainDriftPolicy,
   quantBrainGateMode,
   type QuantBrainEdgeInput,
 } from "../lib/quantBrainClient";
+import { recordPredictionExecutionAge } from "../lib/runtimeMetrics";
 import { getMarketSentiment, getMarketSentimentBulk, type SentimentResult } from "../lib/sentimentEngine";
 import {
   buildAttachedProtection,
@@ -28,10 +30,33 @@ import {
   updateWatcherCreds,
   getLiveWatcherStats,
 } from "../lib/livePositionWatcher";
+import {
+  assertLiveExecutionAllowed,
+  endpointForCredentials,
+  requireAdminAuthorization,
+  type ExecutionCredentials,
+} from "../lib/executionSecurity";
+import {
+  claimMarketEventExecution,
+  getMarketDataQualityStatus,
+  releaseMarketEventExecution,
+} from "../lib/marketDataQuality";
 
 const router = Router();
 
 const BINGX_BASE = "https://open-api.bingx.com";
+
+function driftAdjustedStackLimit(config: ReturnType<typeof getBotConfig>): number {
+  const base = config.positionStackingEnabled ? config.maxPositionsPerSymbol : 1;
+  const policy = getCurrentQuantBrainDriftPolicy();
+  if (!policy.newEntriesAllowed) return 0;
+  if (policy.stackingMultiplier <= 0) return 1;
+  return Math.max(1, Math.floor(base * policy.stackingMultiplier));
+}
+
+router.get("/bot/market-data-quality", (_req: Request, res: Response) => {
+  res.json(getMarketDataQualityStatus());
+});
 
 type TelemetrySourceFilter = "all" | "demo" | "live";
 
@@ -107,10 +132,11 @@ async function bingxGet(
   return res.json() as Promise<Record<string, unknown>>;
 }
 
-function getCredentials(req: Request): { apiKey: string; secretKey: string } | null {
-  const { bingxApiKey, bingxSecretKey } = req.session;
-  if (!bingxApiKey || !bingxSecretKey) return null;
-  return { apiKey: bingxApiKey, secretKey: bingxSecretKey };
+function getCredentials(req: Request): ExecutionCredentials | null {
+  const credentials = req.session.liveCredentials;
+  if (!credentials) return null;
+  endpointForCredentials(credentials, "live");
+  return credentials;
 }
 
 // ── Capital Context — shared across bulk/autopilot cycles ─────────────────────
@@ -184,7 +210,7 @@ interface AutopilotCycleSummary {
 interface AutopilotState {
   running: boolean;
   startedAt: number | null;
-  creds: { apiKey: string; secretKey: string } | null;
+  creds: ExecutionCredentials | null;
   handle: NodeJS.Timeout | null;
   totalCycles: number;
   totalPlaced: number;
@@ -206,6 +232,21 @@ const autopilot: AutopilotState = {
   history: [],
   stopReason: null,
 };
+let autopilotCycleInFlight = false;
+let autopilotSkippedOverlaps = 0;
+
+async function runAutopilotCycleLocked(): Promise<void> {
+  if (autopilotCycleInFlight) {
+    autopilotSkippedOverlaps++;
+    return;
+  }
+  autopilotCycleInFlight = true;
+  try {
+    await runAutopilotCycle();
+  } finally {
+    autopilotCycleInFlight = false;
+  }
+}
 
 function stopAutopilot(reason: string): void {
   if (autopilot.handle) {
@@ -297,7 +338,7 @@ async function runAutopilotCycle(): Promise<void> {
       // Check position stacking limit
       const symCounts = capitalCtx.countsBySide.get(sym) ?? { LONG: 0, SHORT: 0 };
       const currentCount = symCounts[ps];
-      const limit = config.positionStackingEnabled ? config.maxPositionsPerSymbol : 1;
+      const limit = driftAdjustedStackLimit(config);
       if (currentCount >= limit) continue;
 
       // Check hedging constraint
@@ -364,8 +405,17 @@ router.get("/bot/config", (_req: Request, res: Response) => {
   res.json(getBotConfig());
 });
 
+router.get("/bot/config/audit", requireAdminAuthorization, (_req: Request, res: Response) => {
+  res.json({
+    entries: getOverrideHistory().map((entry) => ({
+      timestamp: entry.timestamp,
+      changedKeys: Object.keys(entry.patch),
+    })),
+  });
+});
+
 /** PATCH /api/bot/config/override — apply runtime overrides (in-memory) */
-router.patch("/bot/config/override", (req: Request, res: Response) => {
+router.patch("/bot/config/override", requireAdminAuthorization, (req: Request, res: Response) => {
   const patch = req.body as Record<string, unknown>;
   const allowed = [
     "leverage", "marginPerTrade", "maxConcurrentPositions", "maxMarginUtilization",
@@ -386,7 +436,7 @@ router.patch("/bot/config/override", (req: Request, res: Response) => {
 });
 
 /** POST /api/bot/config/override/reset — clear all runtime overrides */
-router.post("/bot/config/override/reset", (_req: Request, res: Response) => {
+router.post("/bot/config/override/reset", requireAdminAuthorization, (_req: Request, res: Response) => {
   resetConfigOverrides();
   res.json(getBotConfig());
 });
@@ -551,7 +601,11 @@ router.post("/bot/order", async (req: Request, res: Response) => {
         momentum24h: sentimentForQb.indicators.momentum24h,
       } : undefined,
       marketEventId: candle.marketEventId,
-      featureVersion: candle.candleOpenTimeMs ? String(candle.candleOpenTimeMs) : undefined,
+      featureVersion: "candle-edge-v1",
+      featureTimestampMs: candle.candleCloseTimeMs,
+      candleIsComplete: candle.candleIsComplete,
+      marketDataSource: "bingx",
+      referencePrice: candle.lastClose,
     };
     const qbResult = await evaluateQuantBrainEdge(qbInput);
     const qbMode = quantBrainGateMode();
@@ -595,7 +649,10 @@ router.post("/bot/order", async (req: Request, res: Response) => {
     }
 
     // Stacking limit
-    const stackLimit = config.positionStackingEnabled ? config.maxPositionsPerSymbol : 1;
+    const stackLimit = driftAdjustedStackLimit(config);
+    if (stackLimit === 0) {
+      gateRejects.push("DRIFT_PAUSED_REJECT: drift policy blocks new entries");
+    }
     if (sameSideCount >= stackLimit) {
       gateRejects.push(
         `STACK_REJECT: ${symbol} ${positionSide} already has ${sameSideCount}/${stackLimit} position(s)`,
@@ -629,6 +686,22 @@ router.post("/bot/order", async (req: Request, res: Response) => {
   }
 
   // ── Gate blocked ────────────────────────────────────────────────────────────
+  try {
+    assertLiveExecutionAllowed(creds);
+  } catch (err) {
+    res.status(403).json({
+      placed: false,
+      orderId: null,
+      symbol,
+      side,
+      quantity: quantity ?? null,
+      gateRejects: ["LIVE_ENVIRONMENT_REJECT"],
+      observationMode: false,
+      message: err instanceof Error ? err.message : "Real-money execution refused.",
+    });
+    return;
+  }
+
   if (gateRejects.length > 0) {
     req.log.info({ symbol, side, positionSide, gateRejects }, "bot order gate reject");
     res.status(403).json({
@@ -771,6 +844,7 @@ router.post("/bot/close", async (req: Request, res: Response) => {
   }
 
   try {
+    assertLiveExecutionAllowed(creds);
     const data = await bingxPost(
       "/openApi/swap/v2/trade/order",
       {
@@ -1362,7 +1436,7 @@ router.get("/bot/modes", (_req: Request, res: Response) => {
 });
 
 /** POST /api/bot/mode — activate a mode (applies runtime overrides) */
-router.post("/bot/mode", (req: Request, res: Response) => {
+router.post("/bot/mode", requireAdminAuthorization, (req: Request, res: Response) => {
   const { mode } = req.body as { mode: string };
   if (!mode || !(mode in BOT_MODES)) {
     res.status(400).json({
@@ -1383,7 +1457,7 @@ router.post("/bot/mode", (req: Request, res: Response) => {
 });
 
 /** POST /api/bot/mode/reset — clear active mode and related overrides */
-router.post("/bot/mode/reset", (_req: Request, res: Response) => {
+router.post("/bot/mode/reset", requireAdminAuthorization, (_req: Request, res: Response) => {
   clearActiveMode();
   resetConfigOverrides();
   res.json({ activeMode: null, config: getBotConfig() });
@@ -1401,7 +1475,7 @@ const QB_SNIPER_TIMEOUT_MS = Math.max(
 async function executeSingleOrder(
   item: BulkOrderItem,
   index: number,
-  creds: { apiKey: string; secretKey: string },
+  creds: ExecutionCredentials,
   config: ReturnType<typeof getBotConfig>,
   preGateRejects: string[] = [],
   capitalCtx?: CapitalContext,
@@ -1410,6 +1484,14 @@ async function executeSingleOrder(
   const { symbol, side, positionSide, btcChangePct } = item;
   const gateRejects: string[] = [...preGateRejects];
   const currentHour = new Date().getUTCHours();
+  const candle = item.marketEventId ? null : await computeCandleEdge(symbol, "5m");
+  const marketEventId = item.marketEventId ?? candle?.marketEventId;
+  const featureTimestampMs = item.featureTimestampMs ?? candle?.candleCloseTimeMs;
+  const candleIsComplete = item.candleIsComplete ?? candle?.candleIsComplete;
+  if (candle) gateRejects.push(...candleConfirmationRejects(candle, positionSide, config));
+  if (!marketEventId) {
+    gateRejects.push("MARKET_EVENT_REJECT: canonical completed candle event is unavailable");
+  }
 
   // Gate: symbol allowlist
   if (config.allowedSymbols.length > 0 && !config.allowedSymbols.includes(symbol)) {
@@ -1454,7 +1536,10 @@ async function executeSingleOrder(
     if (config.preventHedgedPositions && oppSide > 0) {
       gateRejects.push(`HEDGE_REJECT: ${symbol} has ${oppSide} open ${positionSide === "LONG" ? "SHORT" : "LONG"} position(s)`);
     }
-    const stackLimit = config.positionStackingEnabled ? config.maxPositionsPerSymbol : 1;
+    const stackLimit = driftAdjustedStackLimit(config);
+    if (stackLimit === 0) {
+      gateRejects.push("DRIFT_PAUSED_REJECT: drift policy blocks new entries");
+    }
     if (sameSide >= stackLimit) {
       gateRejects.push(`STACK_REJECT: ${symbol} ${positionSide} at limit ${sameSide}/${stackLimit}`);
     }
@@ -1463,7 +1548,7 @@ async function executeSingleOrder(
   // ── QB gate — hard 600ms cap so sniper is never held hostage ──────────────
   const qbMode = quantBrainGateMode();
   const signalId = randomUUID();
-  const marketEventId = `${symbol}:${positionSide}:${Math.floor(Date.now() / 300_000)}`;
+  let predictionTimestamp: number | undefined;
   const expiresAt = Date.now() + 30_000; // 30s — signal must be evaluated before expiry
   if (qbMode === "enforce") {
     try {
@@ -1474,6 +1559,8 @@ async function executeSingleOrder(
             symbol, side, positionSide, hourUtc: currentHour,
             btcChangePct, currentEv: item.currentEv, config,
             signalId, marketEventId, expiresAt, featureVersion: "sniper-v1",
+            featureTimestampMs, candleIsComplete, marketDataSource: "bingx",
+            referencePrice: candle?.lastClose,
           }),
           new Promise<never>((_, reject) =>
             setTimeout(() => reject(new Error("QB_TIMEOUT")), QB_SNIPER_TIMEOUT_MS),
@@ -1481,6 +1568,7 @@ async function executeSingleOrder(
         ]),
       ]);
       void sentiment; // used only for QB enrichment below if needed
+      predictionTimestamp = qbResult.predictionTimestamp;
       if (!qbResult.allow) {
         gateRejects.push(...qbResult.gateRejects.map((r) => `QB_${r}`));
       }
@@ -1495,6 +1583,8 @@ async function executeSingleOrder(
           symbol, side, positionSide, hourUtc: currentHour,
           btcChangePct, currentEv: item.currentEv, config,
           signalId, marketEventId, expiresAt, featureVersion: "sniper-v1",
+          featureTimestampMs, candleIsComplete, marketDataSource: "bingx",
+          referencePrice: candle?.lastClose,
           sentimentContext: sentiment ? {
             direction: sentiment.direction, confidence: sentiment.confidence,
             biasRatio: sentiment.biasRatio, dominantSide: sentiment.dominantSide,
@@ -1515,6 +1605,19 @@ async function executeSingleOrder(
       message: gateRejects.length > 0
         ? `BLOCKED by ${gateRejects.length} gate(s). Observation mode.`
         : "All gates pass. Observation mode — set SCALP_ALLOW_EXECUTION=true.",
+      durationMs: Date.now() - t0,
+    };
+  }
+
+  try {
+    assertLiveExecutionAllowed(creds);
+  } catch (err) {
+    return {
+      index, symbol, side, placed: false, orderId: null,
+      quantity: null,
+      gateRejects: ["LIVE_ENVIRONMENT_REJECT"],
+      observationMode: false,
+      message: err instanceof Error ? err.message : "Real-money execution refused.",
       durationMs: Date.now() - t0,
     };
   }
@@ -1556,14 +1659,25 @@ async function executeSingleOrder(
     };
   }
 
+  if (!marketEventId || !claimMarketEventExecution(marketEventId, positionSide)) {
+    return {
+      index, symbol, side, placed: false, orderId: null,
+      quantity: qty, gateRejects: ["DUPLICATE_EXECUTION_REJECT: candle event already executed"],
+      observationMode: false, message: "Duplicate candle execution rejected.",
+      durationMs: Date.now() - t0,
+    };
+  }
+
   // Place order
   try {
+    recordPredictionExecutionAge(predictionTimestamp);
     const data = await bingxPost(
       "/openApi/swap/v2/trade/order",
       { symbol, side, positionSide, type: config.orderType, quantity: qty, leverage: config.leverage },
       creds.apiKey, creds.secretKey,
     );
     if (data.code !== 0) {
+      releaseMarketEventExecution(marketEventId, positionSide);
       return {
         index, symbol, side, placed: false, orderId: null,
         quantity: qty, gateRejects: [], observationMode: false,
@@ -1606,6 +1720,7 @@ async function executeSingleOrder(
       durationMs: Date.now() - t0,
     };
   } catch (err) {
+    releaseMarketEventExecution(marketEventId, positionSide);
     return {
       index, symbol, side, placed: false, orderId: null,
       quantity: qty, gateRejects: [], observationMode: false,
@@ -1754,9 +1869,9 @@ router.post("/bot/sniper/autopilot/start", (req: Request, res: Response) => {
   autopilot.stopReason = null;
 
   // First cycle fires immediately, then on interval
-  runAutopilotCycle().catch((err) => req.log.warn({ err }, "autopilot cycle error"));
+  runAutopilotCycleLocked().catch((err) => req.log.warn({ err }, "autopilot cycle error"));
   autopilot.handle = setInterval(() => {
-    runAutopilotCycle().catch(() => {});
+    runAutopilotCycleLocked().catch(() => {});
   }, intervalMs);
 
   req.log.info({ intervalMs, sniperMinCombinedScore: config.sniperMinCombinedScore, maxCandidates: config.sniperMaxCandidatesPerCycle }, "sniper autopilot started");
@@ -1792,6 +1907,8 @@ router.get("/bot/sniper/autopilot/status", (_req: Request, res: Response) => {
     totalPlaced: autopilot.totalPlaced,
     sessionLossUsd: autopilot.sessionLossUsd,
     stopReason: autopilot.stopReason,
+    cycleInFlight: autopilotCycleInFlight,
+    skippedOverlaps: autopilotSkippedOverlaps,
     lastCycle: autopilot.lastCycle,
     recentHistory: autopilot.history.slice(-20),
     config: {
