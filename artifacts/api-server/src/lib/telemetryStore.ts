@@ -30,6 +30,7 @@ import { createReadStream, createWriteStream } from "fs";
 import readline from "readline";
 import { AdaptiveEngine, type TradeOutcome, type BtcRegime, type PositionSide, type ExitReason, TradeOutcomeSchema } from "./adaptiveEngine";
 import { logger, logMetric, logAlert } from "./logger";
+import { recordKillSwitchOutcome } from "./killSwitch";
 
 const pipelineAsync = promisify(pipeline);
 
@@ -491,6 +492,7 @@ export function recordTradeOutcome(raw: Omit<TradeOutcome, "id"> & { id?: string
 
   appendToDiskAsync(outcome);
   getEngine().recordOutcome(outcome);
+  recordKillSwitchOutcome(outcome);
   emitSseTrade(outcome);
 
   logMetric({
@@ -617,6 +619,7 @@ export function buildOutcomeFromOrders(
   return {
     id: entryOrder.orderId,
     source: "bingx-live",
+    sourceType: "live",
     symbol: entryOrder.symbol,
     positionSide,
     side: entryOrder.side as "BUY" | "SELL",
