@@ -8,7 +8,7 @@ import {
 } from "../lib/botModes";
 import { exportAllOutcomes, getEngine } from "../lib/telemetryStore";
 import { AdaptiveEngine, type BtcRegime, type ClusterKey, type PositionSide, type TradeOutcome } from "../lib/adaptiveEngine";
-import { computeAllCandleEdges, computeCandleEdge, type CandleInterval } from "../lib/candleEdge";
+import { computeAllCandleEdges, computeCandleEdge, type CandleEdge, type CandleInterval } from "../lib/candleEdge";
 import { feeDragRejectReason, maxCorrelatedBulkOrders } from "../lib/executionRisk";
 import {
   getQuantBrainIntelligence,
@@ -41,6 +41,39 @@ import {
   getMarketDataQualityStatus,
   releaseMarketEventExecution,
 } from "../lib/marketDataQuality";
+import {
+  buildSymbolRotationReport,
+  rotationRankBySymbol,
+  type SymbolOpenCounts,
+} from "../lib/symbolRotation";
+import {
+  calculatePositionSizing,
+  recentSizingStats,
+  summarizeSizingStatus,
+  type PositionSizingDecision,
+  type PositionSizingOpenPosition,
+  type PositionRiskTier,
+} from "../lib/positionSizing";
+import { getServiceState } from "../lib/serviceState";
+import {
+  applyAggressionToConfig,
+  evaluateAggression,
+  getAggressionStatus,
+  recordAggressionCycleImpact,
+  type AggressionCandidate,
+} from "../lib/aggressionController";
+import {
+  applyKillSwitchToConfig,
+  evaluateKillSwitch,
+  recordKillSwitchExecutionAttempt,
+  type KillSwitchDecision,
+} from "../lib/killSwitch";
+import {
+  buildLiveReadinessStatus,
+  evaluateLiveReadinessForOrder,
+  type PromotionState,
+} from "../lib/live_readiness";
+import { loadClosedTrades } from "../lib/demoTradeStore";
 
 const router = Router();
 
@@ -54,8 +87,136 @@ function driftAdjustedStackLimit(config: ReturnType<typeof getBotConfig>): numbe
   return Math.max(1, Math.floor(base * policy.stackingMultiplier));
 }
 
+function openCountsBySymbolFromCapital(capitalCtx: CapitalContext | null | undefined): Map<string, SymbolOpenCounts> {
+  const counts = new Map<string, SymbolOpenCounts>();
+  if (!capitalCtx) return counts;
+  for (const [symbol, bySide] of capitalCtx.countsBySide.entries()) {
+    counts.set(symbol.toUpperCase(), { LONG: bySide.LONG, SHORT: bySide.SHORT });
+  }
+  return counts;
+}
+
+function evaluateLiveKillSwitch(input: {
+  config: ReturnType<typeof getBotConfig>;
+  btcRegime?: BtcRegime | "HIGH_VOLATILITY_CHAOS" | "LOW_LIQUIDITY" | "NEUTRAL";
+  btcChangePct?: number;
+  capitalCtx?: CapitalContext | null;
+  maxSessionLossRemaining?: number | null;
+  dataFresh?: boolean;
+  integrityOk?: boolean;
+  scoreCalibrationHealthy?: boolean;
+  symbolRotationHealthy?: boolean;
+}): KillSwitchDecision {
+  const quality = getMarketDataQualityStatus();
+  const watcher = getLiveWatcherStats();
+  const lastClosedAt = watcher.lastClosedAt ?? 0;
+  return evaluateKillSwitch({
+    outcomes: exportAllOutcomes().filter((outcome) => !isDemoOutcome(outcome)),
+    config: input.config,
+    serviceState: getServiceState(),
+    marketRegime: input.btcRegime,
+    btcChangePct: input.btcChangePct,
+    dataQuality: {
+      stale: quality.metrics.stale,
+      invalid: quality.metrics.invalid,
+      missing: quality.metrics.missing,
+      duplicates: quality.metrics.duplicates,
+      incidents: quality.incidents,
+      activeExecutionClaims: quality.activeExecutionClaims,
+    },
+    pipeline: {
+      dataFresh: input.dataFresh ?? true,
+      integrityOk: input.integrityOk ?? true,
+      scoreCalibrationHealthy: input.scoreCalibrationHealthy,
+      symbolRotationHealthy: input.symbolRotationHealthy,
+      openPositionRisk: input.capitalCtx?.marginUtilization,
+      exitMonitorDelayMs: lastClosedAt > 0 ? Math.max(0, Date.now() - lastClosedAt) : 0,
+    },
+    openPositionsCount: input.capitalCtx?.openPositionsCount,
+    maxOpenPositions: input.config.maxConcurrentPositions,
+    maxSessionLossRemaining: input.maxSessionLossRemaining,
+  });
+}
+
+function killSwitchReject(
+  item: Pick<BulkOrderItem, "symbol" | "side">,
+  index: number,
+  decision: KillSwitchDecision,
+  startedAt: number,
+): BulkOrderResult {
+  return {
+    index,
+    symbol: item.symbol,
+    side: item.side,
+    placed: false,
+    orderId: null,
+    quantity: null,
+    gateRejects: [`KILL_SWITCH_${decision.state}: ${decision.reason}`],
+    observationMode: false,
+    message: `Kill switch blocks new entries: ${decision.recommendedAction}`,
+    durationMs: Date.now() - startedAt,
+  };
+}
+
 router.get("/bot/market-data-quality", (_req: Request, res: Response) => {
   res.json(getMarketDataQualityStatus());
+});
+
+router.get("/position-sizing/status", async (req: Request, res: Response) => {
+  const config = getBotConfig();
+  const creds = getCredentials(req);
+  const capitalCtx = creds ? await fetchCapitalContext(creds).catch(() => null) : null;
+  const outcomes = exportAllOutcomes();
+  const fallbackEquity = config.marginPerTrade / 0.005;
+  res.json(summarizeSizingStatus({
+    equity: capitalCtx?.equity ?? fallbackEquity,
+    outcomes,
+    openPositions: capitalPositionsForSizing(capitalCtx),
+    config,
+  }));
+});
+
+router.get("/aggression/status", (_req: Request, res: Response) => {
+  res.json(getAggressionStatus());
+});
+
+router.get("/symbol-rotation/status", async (req: Request, res: Response) => {
+  const config = getBotConfig();
+  const symbols = config.allowedSymbols.length > 0 ? config.allowedSymbols : [];
+  if (symbols.length === 0) {
+    res.json({
+      generatedAt: Date.now(),
+      activeSymbols: [],
+      reducedSymbols: [],
+      pausedSymbols: [],
+      hotSymbols: [],
+      recoverySymbols: [],
+      ranking: [],
+    });
+    return;
+  }
+
+  const btcChangePct = req.query.btcChangePct !== undefined
+    ? parseFloat(String(req.query.btcChangePct))
+    : 0;
+  const btcRegime: BtcRegime =
+    btcChangePct >= config.btcRegimeThresholdPct ? "BULL" :
+    btcChangePct <= -config.btcRegimeThresholdPct ? "BEAR" : "NEUTRAL";
+  const creds = getCredentials(req);
+  const capitalCtx = creds
+    ? await fetchCapitalContext(creds).catch(() => null)
+    : null;
+
+  const report = await buildSymbolRotationReport({
+    symbols,
+    engine: getEngine(),
+    config,
+    btcRegime,
+    hourUtc: new Date().getUTCHours(),
+    openCountsBySymbol: openCountsBySymbolFromCapital(capitalCtx),
+  });
+
+  res.json(report);
 });
 
 type TelemetrySourceFilter = "all" | "demo" | "live";
@@ -147,6 +308,7 @@ interface CapitalContext {
   openPositionsCount: number;
   marginUtilization: number;
   equity: number;
+  availableMargin: number;
   // counts[symbol][side] = number of open positions on that side
   countsBySide: Map<string, { LONG: number; SHORT: number }>;
   fetchedAt: number;
@@ -163,6 +325,7 @@ async function fetchCapitalContext(
   let openPositions: Record<string, unknown>[] = [];
   let equity = 1;
   let usedMargin = 0;
+  let availableMargin = 0;
 
   if (posData?.code === 0) {
     openPositions = ((posData.data as unknown[]) ?? []) as Record<string, unknown>[];
@@ -172,6 +335,7 @@ async function fetchCapitalContext(
     const bal = ((balData.data as Record<string, unknown>)?.balance ?? {}) as Record<string, string>;
     usedMargin = parseFloat(bal.usedMargin ?? "0");
     equity = parseFloat(bal.equity ?? "1") || 1;
+    availableMargin = parseFloat(bal.availableMargin ?? bal.availableBalance ?? "0") || Math.max(0, equity - usedMargin);
   }
 
   const countsBySide = new Map<string, { LONG: number; SHORT: number }>();
@@ -189,9 +353,31 @@ async function fetchCapitalContext(
     openPositionsCount: openPositions.length,
     marginUtilization: equity > 0 ? usedMargin / equity : 0,
     equity,
+    availableMargin,
     countsBySide,
     fetchedAt: Date.now(),
   };
+}
+
+function capitalPositionsForSizing(capitalCtx: CapitalContext | null | undefined): PositionSizingOpenPosition[] {
+  if (!capitalCtx) return [];
+  return capitalCtx.openPositions.map((position) => {
+    const symbol = String(position.symbol ?? "").toUpperCase();
+    const entryPrice = Math.abs(parseFloat(String(position.avgPrice ?? position.entryPrice ?? "0")));
+    const qty = Math.abs(parseFloat(String(position.positionAmt ?? "0")));
+    const leverage = Math.max(1, parseFloat(String(position.leverage ?? "1")) || 1);
+    const reportedMargin = Math.abs(parseFloat(String(position.initialMargin ?? position.margin ?? "0")));
+    const marginUsed = reportedMargin > 0 ? reportedMargin : entryPrice > 0 ? (entryPrice * qty) / leverage : 0;
+    const rawSide = String(position.positionSide ?? "").toUpperCase();
+    const positionSide: "LONG" | "SHORT" | undefined =
+      rawSide === "LONG" || rawSide === "SHORT" ? rawSide : undefined;
+    return {
+      symbol,
+      positionSide,
+      marginUsed,
+      leverage,
+    };
+  }).filter((position) => position.symbol && position.marginUsed > 0);
 }
 
 // ── Sniper Autopilot — server-side autonomous execution loop ──────────────────
@@ -205,6 +391,8 @@ interface AutopilotCycleSummary {
   placed: number;
   rejected: number;
   btcChangePct: number;
+  aggressionState?: string;
+  aggressionReason?: string;
 }
 
 interface AutopilotState {
@@ -261,7 +449,7 @@ function stopAutopilot(reason: string): void {
 async function runAutopilotCycle(): Promise<void> {
   if (!autopilot.running || !autopilot.creds) return;
 
-  const config = getBotConfig();
+  let config = getBotConfig();
   const engine = getEngine();
   const t0 = Date.now();
   const cycleNum = ++autopilot.totalCycles;
@@ -284,6 +472,33 @@ async function runAutopilotCycle(): Promise<void> {
   if (!capitalCtx) {
     return; // Skip cycle — cannot verify capital
   }
+
+  const killSwitch = evaluateLiveKillSwitch({
+    config,
+    btcChangePct,
+    capitalCtx,
+    maxSessionLossRemaining: config.maxSessionLoss > 0 ? config.maxSessionLoss - autopilot.sessionLossUsd : null,
+    integrityOk: true,
+  });
+  if (!killSwitch.entryAllowed) {
+    const summary: AutopilotCycleSummary = {
+      cycle: cycleNum,
+      startedAt: t0,
+      durationMs: Date.now() - t0,
+      candidates: 0,
+      attempted: 0,
+      placed: 0,
+      rejected: 0,
+      btcChangePct,
+      aggressionState: killSwitch.state,
+      aggressionReason: killSwitch.reason,
+    };
+    autopilot.lastCycle = summary;
+    autopilot.history.push(summary);
+    if (autopilot.history.length > 100) autopilot.history.shift();
+    return;
+  }
+  config = applyKillSwitchToConfig(config, killSwitch);
 
   // Session loss circuit-breaker
   if (config.maxSessionLoss > 0 && autopilot.sessionLossUsd >= config.maxSessionLoss) {
@@ -309,6 +524,16 @@ async function runAutopilotCycle(): Promise<void> {
   const candleEdges = await computeAllCandleEdges(symbols, "5m").catch(() =>
     symbols.map((sym) => ({ symbol: sym, longScore: 0, shortScore: 0, error: "fetch failed" }))
   );
+  const rotation = await buildSymbolRotationReport({
+    symbols,
+    engine,
+    config,
+    btcRegime,
+    hourUtc,
+    candleEdges: candleEdges as CandleEdge[],
+    openCountsBySymbol: openCountsBySymbolFromCapital(capitalCtx),
+  });
+  const rotationBySymbol = rotationRankBySymbol(rotation);
 
   // Score candidates
   const candidates: Array<{
@@ -316,13 +541,15 @@ async function runAutopilotCycle(): Promise<void> {
     side: "BUY" | "SELL";
     positionSide: "LONG" | "SHORT";
     combinedScore: number;
+    rotationScore: number;
     currentEv: number;
     btcChangePct: number;
   }> = [];
+  const aggressionCandidates: AggressionCandidate[] = [];
 
   for (let i = 0; i < symbols.length; i++) {
     const sym = symbols[i];
-    const candle = (candleEdges[i] as { longScore?: number; shortScore?: number; error?: string | null } | undefined);
+    const candle = (candleEdges[i] as { longScore?: number; shortScore?: number; volumeRatio?: number; error?: string | null } | undefined);
     if (!candle || (candle as { error?: string | null }).error) continue;
 
     for (const ps of ["LONG", "SHORT"] as const) {
@@ -347,35 +574,119 @@ async function runAutopilotCycle(): Promise<void> {
 
       const profile = engine.symbolProfile(sym);
       if (profile?.isToxic) continue;
+      const rotationRank = rotationBySymbol.get(sym.toUpperCase());
+      if (rotationRank?.state === "PAUSED") continue;
+      const rotationLimit = rotationRank?.maxPositions ?? limit;
+      if (symCounts.LONG + symCounts.SHORT >= rotationLimit) continue;
+      const sideFactor =
+        !rotationRank || rotationRank.sideBias === "NEUTRAL" || rotationRank.sideBias === ps ? 1 : 0.72;
+      const rotationAdjustedScore = combined * (rotationRank?.rotationScore ?? 0.5) * sideFactor;
+
+      aggressionCandidates.push({
+        symbol: sym,
+        positionSide: ps,
+        score: rotationAdjustedScore,
+        candleScore: ps === "LONG" ? (candle.longScore ?? 0) : (candle.shortScore ?? 0),
+        rankingScore: rotationRank?.rotationScore,
+        volumeRatio: candle.volumeRatio,
+      });
 
       candidates.push({
         symbol: sym,
         side: ps === "LONG" ? "BUY" : "SELL",
         positionSide: ps,
-        combinedScore: combined,
+        combinedScore: rotationAdjustedScore,
+        rotationScore: rotationRank?.rotationScore ?? 0.5,
         currentEv: engine.clusterProfile(clusterKey)?.ev ?? 0,
         btcChangePct,
       });
     }
   }
 
-  // Sort by score, take top N
+  const aggression = evaluateAggression({
+    config,
+    outcomes: exportAllOutcomes().filter((outcome) => !isDemoOutcome(outcome)),
+    serviceState: getServiceState(),
+    candidates: aggressionCandidates,
+    btcRegime,
+    btcChangePct,
+    openPositionsCount: capitalCtx.openPositionsCount,
+    maxOpenPositions: config.maxConcurrentPositions,
+    dataFresh: true,
+    apiHealthy: true,
+    executionHealthy: true,
+    source: "live",
+  });
+  if (aggression.aggressionState === "PAUSED") {
+    const summary: AutopilotCycleSummary = {
+      cycle: cycleNum,
+      startedAt: t0,
+      durationMs: Date.now() - t0,
+      candidates: candidates.length,
+      attempted: 0,
+      placed: 0,
+      rejected: 0,
+      btcChangePct,
+      aggressionState: aggression.aggressionState,
+      aggressionReason: aggression.reason,
+    };
+    autopilot.lastCycle = summary;
+    autopilot.history.push(summary);
+    if (autopilot.history.length > 100) autopilot.history.shift();
+    return;
+  }
+  const aggressiveConfig = applyAggressionToConfig(config, aggression);
+
+  // Sort by adaptive rotation-adjusted score, take top N
   candidates.sort((a, b) => b.combinedScore - a.combinedScore);
-  const toFire = candidates.slice(0, config.sniperMaxCandidatesPerCycle);
+  const selectedBySymbol = new Map<string, number>();
+  const toFire: typeof candidates = [];
+  for (const candidate of candidates) {
+    if (toFire.length >= aggression.maxCandidatesThisCycle) break;
+    if (candidate.combinedScore < aggression.minAggressiveScore) continue;
+    const rank = rotationBySymbol.get(candidate.symbol.toUpperCase());
+    const maxPositions = Math.min(
+      rank?.maxPositions ?? driftAdjustedStackLimit(aggressiveConfig),
+      aggression.symbolConcentrationLimit,
+    );
+    const openCounts = capitalCtx.countsBySide.get(candidate.symbol.toUpperCase()) ?? { LONG: 0, SHORT: 0 };
+    const selectedForSymbol = selectedBySymbol.get(candidate.symbol.toUpperCase()) ?? 0;
+    if (openCounts.LONG + openCounts.SHORT + selectedForSymbol >= maxPositions) continue;
+    selectedBySymbol.set(candidate.symbol.toUpperCase(), selectedForSymbol + 1);
+    toFire.push(candidate);
+  }
 
   // Respect max concurrent positions headroom
   const headroom = config.maxConcurrentPositions - capitalCtx.openPositionsCount;
-  const firing = toFire.slice(0, Math.max(0, headroom));
+  const firing = toFire.slice(0, Math.max(0, Math.min(headroom, aggression.maxPositionsThisCycle)));
 
   let placed = 0;
   let rejected = 0;
 
   for (const c of firing) {
+    const rank = rotationBySymbol.get(c.symbol.toUpperCase());
+    const allocationMultiplier = rank
+      ? Math.max(0.25, Math.min(1.75, rank.allocationWeight * Math.max(1, rotation.ranking.length)))
+      : 1;
+    const stateMultiplier =
+      rank?.state === "HOT" ? allocationMultiplier :
+      rank?.state === "ACTIVE" ? Math.min(1.25, allocationMultiplier) :
+      rank?.state === "REDUCED" ? Math.min(0.50, allocationMultiplier) :
+      rank?.state === "RECOVERY" ? Math.min(0.35, allocationMultiplier) :
+      0;
+    const orderConfig = rank
+      ? {
+          ...aggressiveConfig,
+          marginPerTrade: Math.max(0.1, aggressiveConfig.marginPerTrade * stateMultiplier),
+          maxPositionsPerSymbol: Math.max(1, rank.maxPositions),
+          positionStackingEnabled: aggressiveConfig.positionStackingEnabled && rank.maxPositions > 1,
+        }
+      : aggressiveConfig;
     const result = await executeSingleOrder(
       { symbol: c.symbol, side: c.side, positionSide: c.positionSide, currentEv: c.currentEv, btcChangePct: c.btcChangePct },
       0,
       autopilot.creds!,
-      config,
+      orderConfig,
       [],
       capitalCtx,
     );
@@ -384,6 +695,7 @@ async function runAutopilotCycle(): Promise<void> {
   }
 
   autopilot.totalPlaced += placed;
+  recordAggressionCycleImpact(firing.length, placed);
 
   const summary: AutopilotCycleSummary = {
     cycle: cycleNum,
@@ -394,6 +706,8 @@ async function runAutopilotCycle(): Promise<void> {
     placed,
     rejected,
     btcChangePct,
+    aggressionState: aggression.aggressionState,
+    aggressionReason: aggression.reason,
   };
   autopilot.lastCycle = summary;
   autopilot.history.push(summary);
@@ -449,7 +763,10 @@ router.post("/bot/order", async (req: Request, res: Response) => {
     return;
   }
 
-  const config = getBotConfig();
+  let config = getBotConfig();
+  let orderMargin = config.marginPerTrade;
+  let readinessScopeId: string | undefined;
+  let promotionState: PromotionState | undefined;
   const {
     symbol,
     side,
@@ -485,6 +802,17 @@ router.post("/bot/order", async (req: Request, res: Response) => {
   gateRejects.push(...recentPerformanceRejects(recentPerformance, config));
   const candle = await computeCandleEdge(symbol, "5m");
   gateRejects.push(...candleConfirmationRejects(candle, positionSide, config));
+  const killSwitch = evaluateLiveKillSwitch({
+    config,
+    btcChangePct,
+    maxSessionLossRemaining: config.maxSessionLoss,
+    integrityOk: true,
+  });
+  if (!killSwitch.entryAllowed) {
+    gateRejects.push(`KILL_SWITCH_${killSwitch.state}: ${killSwitch.reason}`);
+  } else {
+    config = applyKillSwitchToConfig(config, killSwitch);
+  }
 
   // Gate 1: master kill switch
   if (!config.allowExecution) {
@@ -702,6 +1030,45 @@ router.post("/bot/order", async (req: Request, res: Response) => {
     return;
   }
 
+  {
+    const sameSideOpen = openPositions.filter(
+      (p) => String(p.symbol ?? "").toUpperCase() === symbol.toUpperCase()
+        && String(p.positionSide ?? "").toUpperCase() === positionSide,
+    ).length;
+    const btcRegimeForReadiness: BtcRegime | null = btcChangePct === undefined
+      ? null
+      : btcChangePct >= config.btcRegimeThresholdPct
+        ? "BULL"
+        : btcChangePct <= -config.btcRegimeThresholdPct
+          ? "BEAR"
+          : "NEUTRAL";
+    const readinessStatus = buildLiveReadinessStatus({
+      outcomes: exportAllOutcomes(),
+      closedDemoTrades: await loadClosedTrades(5_000),
+      config,
+    });
+    const readiness = evaluateLiveReadinessForOrder({
+      status: readinessStatus,
+      order: {
+        symbol,
+        side,
+        positionSide,
+        playbook: "MOMENTUM_BREAKOUT_SCALP",
+        btcRegime: btcRegimeForReadiness,
+        score: currentEv,
+      },
+      config,
+      openSameSidePositions: sameSideOpen,
+    });
+    readinessScopeId = readiness.readinessScopeId ?? undefined;
+    promotionState = readiness.promotionState;
+    if (!readiness.allowed) {
+      gateRejects.push(...readiness.gateRejects);
+    } else {
+      orderMargin = Math.min(orderMargin, readiness.maxMargin);
+    }
+  }
+
   if (gateRejects.length > 0) {
     req.log.info({ symbol, side, positionSide, gateRejects }, "bot order gate reject");
     res.status(403).json({
@@ -730,7 +1097,7 @@ router.post("/bot/order", async (req: Request, res: Response) => {
         const t = (tickerData.data as Record<string, string>) ?? {};
         const markPrice = parseFloat(t.lastPrice ?? "0");
         if (markPrice > 0) {
-          qty = (config.marginPerTrade * config.leverage) / markPrice;
+          qty = (orderMargin * config.leverage) / markPrice;
           // Round to reasonable precision
           qty = Math.floor(qty * 1000) / 1000;
         }
@@ -799,6 +1166,9 @@ router.post("/bot/order", async (req: Request, res: Response) => {
       gateRejects: [],
       observationMode: false,
       message: `Order placed: ${side} ${qty} ${symbol} @ MARKET`,
+      readinessScopeId,
+      promotionState,
+      maxMarginApplied: orderMargin,
     });
   } catch (err) {
     req.log.error({ err }, "bot order execution error");
@@ -1482,8 +1852,25 @@ async function executeSingleOrder(
 ): Promise<BulkOrderResult> {
   const t0 = Date.now();
   const { symbol, side, positionSide, btcChangePct } = item;
+  let orderMargin = item.marginOverride ?? config.marginPerTrade;
+  const orderLeverage = Math.max(1, Math.round(item.leverageOverride ?? config.leverage));
   const gateRejects: string[] = [...preGateRejects];
   const currentHour = new Date().getUTCHours();
+  const killSwitch = evaluateLiveKillSwitch({
+    config,
+    btcChangePct,
+    capitalCtx,
+    maxSessionLossRemaining: config.maxSessionLoss,
+    integrityOk: true,
+  });
+  if (!killSwitch.entryAllowed) {
+    return killSwitchReject(item, index, killSwitch, t0);
+  }
+  config = applyKillSwitchToConfig(config, killSwitch);
+  orderMargin = item.marginOverride ?? config.marginPerTrade;
+  const playbook = item.playbook ?? "MOMENTUM_BREAKOUT_SCALP";
+  let readinessScopeId: string | undefined;
+  let promotionState: PromotionState | undefined;
   const candle = item.marketEventId ? null : await computeCandleEdge(symbol, "5m");
   const marketEventId = item.marketEventId ?? candle?.marketEventId;
   const featureTimestampMs = item.featureTimestampMs ?? candle?.candleCloseTimeMs;
@@ -1515,7 +1902,7 @@ async function executeSingleOrder(
     }
   }
 
-  const feeDragReject = feeDragRejectReason(item.currentEv, config.marginPerTrade, config);
+  const feeDragReject = feeDragRejectReason(item.currentEv, orderMargin, { ...config, marginPerTrade: orderMargin, leverage: orderLeverage });
   if (feeDragReject) gateRejects.push(feeDragReject);
 
   // ── Capital gate (use pre-fetched context if available) ───────────────────
@@ -1546,9 +1933,52 @@ async function executeSingleOrder(
   }
 
   // ── QB gate — hard 600ms cap so sniper is never held hostage ──────────────
+  if (config.allowExecution) {
+    const sameSideOpen = ctx?.countsBySide.get(symbol.toUpperCase())?.[positionSide] ?? 0;
+    const readinessStatus = buildLiveReadinessStatus({
+      outcomes: exportAllOutcomes(),
+      closedDemoTrades: await loadClosedTrades(5_000),
+      config,
+    });
+    const btcRegimeForReadiness: BtcRegime | null = btcChangePct === undefined
+      ? null
+      : btcChangePct >= config.btcRegimeThresholdPct
+        ? "BULL"
+        : btcChangePct <= -config.btcRegimeThresholdPct
+          ? "BEAR"
+          : "NEUTRAL";
+    const readiness = evaluateLiveReadinessForOrder({
+      status: readinessStatus,
+      order: {
+        symbol,
+        side,
+        positionSide,
+        playbook,
+        btcRegime: btcRegimeForReadiness,
+        score: item.currentEv,
+        context: item.context,
+        stackingDepth: item.stackingDepth,
+        exitPolicy: item.exitPolicy,
+        positionSizingTier: item.positionSizingTier,
+      },
+      config,
+      openSameSidePositions: sameSideOpen,
+    });
+    readinessScopeId = readiness.readinessScopeId ?? undefined;
+    promotionState = readiness.promotionState;
+    if (!readiness.allowed) {
+      gateRejects.push(...readiness.gateRejects);
+    } else {
+      orderMargin = Math.min(orderMargin, readiness.maxMargin);
+    }
+  }
+
   const qbMode = quantBrainGateMode();
   const signalId = randomUUID();
+  const signalCreatedAt = Date.now();
   let predictionTimestamp: number | undefined;
+  let predictionId: string | undefined;
+  let qbEvaluatedAt: number | undefined;
   const expiresAt = Date.now() + 30_000; // 30s — signal must be evaluated before expiry
   if (qbMode === "enforce") {
     try {
@@ -1569,6 +1999,8 @@ async function executeSingleOrder(
       ]);
       void sentiment; // used only for QB enrichment below if needed
       predictionTimestamp = qbResult.predictionTimestamp;
+      predictionId = qbResult.predictionId;
+      qbEvaluatedAt = Date.now();
       if (!qbResult.allow) {
         gateRejects.push(...qbResult.gateRejects.map((r) => `QB_${r}`));
       }
@@ -1644,7 +2076,7 @@ async function executeSingleOrder(
         const markPrice = parseFloat(d.lastPrice ?? "0");
         if (markPrice > 0) {
           expectedEntryPrice = markPrice;
-          qty = Math.floor((config.marginPerTrade * config.leverage) / markPrice * 1000) / 1000;
+          qty = Math.floor((orderMargin * orderLeverage) / markPrice * 1000) / 1000;
         }
       }
     } catch { /* fallthrough */ }
@@ -1671,13 +2103,24 @@ async function executeSingleOrder(
   // Place order
   try {
     recordPredictionExecutionAge(predictionTimestamp);
+    const orderRequestedAt = Date.now();
+    const orderSentAt = orderRequestedAt;
     const data = await bingxPost(
       "/openApi/swap/v2/trade/order",
-      { symbol, side, positionSide, type: config.orderType, quantity: qty, leverage: config.leverage },
+      { symbol, side, positionSide, type: config.orderType, quantity: qty, leverage: orderLeverage },
       creds.apiKey, creds.secretKey,
     );
+    const orderAckAt = Date.now();
     if (data.code !== 0) {
       releaseMarketEventExecution(marketEventId, positionSide);
+      recordKillSwitchExecutionAttempt({
+        placed: false,
+        latencyMs: orderAckAt - orderSentAt,
+        failedAck: true,
+        failedConfirmation: false,
+        slippagePctNotional: 0,
+        message: String(data.msg ?? "BingX order error"),
+      });
       return {
         index, symbol, side, placed: false, orderId: null,
         quantity: qty, gateRejects: [], observationMode: false,
@@ -1687,10 +2130,26 @@ async function executeSingleOrder(
     }
     const order = ((data.data as Record<string, unknown>)?.order ?? {}) as Record<string, unknown>;
     const placedOrderId = String(order.orderId ?? "");
+    const executedPrice = Number(order.avgPrice ?? order.price ?? 0);
+    const notional = executedPrice > 0 ? executedPrice * qty : 0;
+    const adverseSlip = expectedEntryPrice > 0 && executedPrice > 0
+      ? Math.max(0, positionSide === "LONG" ? executedPrice - expectedEntryPrice : expectedEntryPrice - executedPrice) * qty
+      : 0;
+    recordKillSwitchExecutionAttempt({
+      placed: Boolean(placedOrderId),
+      latencyMs: orderAckAt - orderSentAt,
+      failedAck: false,
+      failedConfirmation: !placedOrderId,
+      slippagePctNotional: notional > 0 ? adverseSlip / notional : 0,
+      message: placedOrderId ? "order placed" : "order ack missing id",
+    });
 
     // Register entry for autonomous outcome recording — watcher polls BingX
     // every LIVE_WATCHER_POLL_MS and records the outcome when the position closes.
     if (placedOrderId) {
+      const sizingDecision = item.sizing as PositionSizingDecision | undefined;
+      const liveRiskTier: PositionRiskTier | undefined =
+        sizingDecision?.riskTier === "NO_TRADE" ? undefined : sizingDecision?.riskTier;
       updateWatcherCreds(creds);
       const btcRegimeForEntry: import("../lib/adaptiveEngine").BtcRegime =
         (item.btcChangePct ?? 0) >= config.btcRegimeThresholdPct ? "BULL" :
@@ -1702,14 +2161,37 @@ async function executeSingleOrder(
         side,
         expectedEntryPrice,
         qty: qty!,
-        leverage: config.leverage,
-        marginUsed: config.marginPerTrade,
+        leverage: orderLeverage,
+        marginUsed: orderMargin,
         btcRegime: btcRegimeForEntry,
         hourUtc: currentHour,
-        entryTime: Date.now(),
-        expectedTpProfit: config.marginPerTrade * config.leverage * (config.takeProfitPct / 100),
+        entryTime: orderAckAt,
+        expectedTpProfit: orderMargin * orderLeverage * (config.takeProfitPct / 100),
         takeProfitPct: config.takeProfitPct,
         stopLossPct: config.stopLossPct,
+        riskTier: liveRiskTier,
+        sizeMultiplier: sizingDecision?.sizeMultiplier,
+        sizeReason: sizingDecision?.reason,
+        recommendedMargin: sizingDecision?.recommendedMargin,
+        recommendedLeverage: sizingDecision?.recommendedLeverage,
+        maxLossIfStop: sizingDecision?.maxLossIfStop,
+        notional: sizingDecision?.notional,
+        signalId,
+        marketEventId,
+        predictionId,
+        featureVersion: "sniper-v1",
+        signalCreatedAt,
+        qbEvaluatedAt,
+        orderRequestedAt,
+        orderSentAt,
+        orderAckAt,
+        positionConfirmedAt: orderAckAt,
+        orderType: config.orderType,
+        playbook,
+        readinessScopeId,
+        promotionState,
+        stackingDepth: item.stackingDepth,
+        exitPolicy: item.exitPolicy ?? "TP_SL_PROTECTED",
       });
     }
 
@@ -1717,10 +2199,19 @@ async function executeSingleOrder(
       index, symbol, side, placed: true, orderId: placedOrderId,
       quantity: qty, gateRejects: [], observationMode: false,
       message: `Placed: ${side} ${qty} ${symbol}`,
+      sizing: item.sizing,
       durationMs: Date.now() - t0,
     };
   } catch (err) {
     releaseMarketEventExecution(marketEventId, positionSide);
+    recordKillSwitchExecutionAttempt({
+      placed: false,
+      latencyMs: Date.now() - t0,
+      failedAck: true,
+      failedConfirmation: false,
+      slippagePctNotional: 0,
+      message: err instanceof Error ? err.message : String(err),
+    });
     return {
       index, symbol, side, placed: false, orderId: null,
       quantity: qty, gateRejects: [], observationMode: false,
@@ -1750,6 +2241,7 @@ router.post("/bot/sniper/mass", async (req: Request, res: Response) => {
       symbol: string;
       positionSide: "LONG" | "SHORT";
       combinedScore?: number;
+      aggressiveScore?: number;
       currentEv?: number;
       btcChangePct?: number;
     }>;
@@ -1765,24 +2257,112 @@ router.post("/bot/sniper/mass", async (req: Request, res: Response) => {
     return;
   }
 
-  const config = getBotConfig();
+  let config = getBotConfig();
   const t0 = Date.now();
 
   // Pre-fetch capital once for ALL orders
   const capitalCtx = await fetchCapitalContext(creds).catch(() => null);
+  const firstBtcChangePct = candidates[0]?.btcChangePct;
+  const initialBtcRegime: BtcRegime = firstBtcChangePct !== undefined
+    ? firstBtcChangePct >= config.btcRegimeThresholdPct ? "BULL"
+      : firstBtcChangePct <= -config.btcRegimeThresholdPct ? "BEAR"
+      : "NEUTRAL"
+    : "NEUTRAL";
+  const killSwitch = evaluateLiveKillSwitch({
+    config,
+    btcRegime: Math.abs(firstBtcChangePct ?? 0) >= 2.5 ? "HIGH_VOLATILITY_CHAOS" : initialBtcRegime,
+    btcChangePct: firstBtcChangePct,
+    capitalCtx,
+    maxSessionLossRemaining: config.maxSessionLoss,
+    integrityOk: capitalCtx !== null,
+  });
+  if (!killSwitch.entryAllowed) {
+    res.status(200).json({
+      total: candidates.length,
+      filtered: 0,
+      attempted: 0,
+      placed: 0,
+      rejected: candidates.length,
+      skippedNoHeadroom: 0,
+      skippedBelowScore: 0,
+      skippedByRotation: 0,
+      killSwitch,
+      durationMs: Date.now() - t0,
+      results: [],
+    });
+    return;
+  }
+  config = applyKillSwitchToConfig(config, killSwitch);
+  const rotation = await buildSymbolRotationReport({
+    symbols: Array.from(new Set(candidates.map((candidate) => candidate.symbol))),
+    engine: getEngine(),
+    config,
+    btcRegime: initialBtcRegime,
+    hourUtc: new Date().getUTCHours(),
+    openCountsBySymbol: openCountsBySymbolFromCapital(capitalCtx),
+  });
+  const rotationBySymbol = rotationRankBySymbol(rotation);
 
   const rps = Math.min(Math.max(1, ordersPerSecond), 10);
   const bucket = new TokenBucket(rps, rps);
 
-  // Sort by combinedScore descending; filter by sniperMinCombinedScore
-  const sorted = candidates
-    .filter((c) => (c.combinedScore ?? 1) >= config.sniperMinCombinedScore)
-    .sort((a, b) => (b.combinedScore ?? 0) - (a.combinedScore ?? 0));
+  const scored = candidates.map((candidate) => {
+    const rank = rotationBySymbol.get(candidate.symbol.toUpperCase());
+    const baseScore = candidate.aggressiveScore ?? candidate.combinedScore ?? 1;
+    const sideFactor =
+      !rank || rank.sideBias === "NEUTRAL" || rank.sideBias === candidate.positionSide ? 1 : 0.72;
+    return {
+      ...candidate,
+      rotationRank: rank,
+      effectiveScore: baseScore * (rank?.rotationScore ?? 0.5) * sideFactor,
+    };
+  });
+  const btcRegime: BtcRegime = initialBtcRegime;
+  const aggression = evaluateAggression({
+    config,
+    outcomes: exportAllOutcomes().filter((outcome) => !isDemoOutcome(outcome)),
+    serviceState: getServiceState(),
+    candidates: scored.map((candidate) => ({
+      symbol: candidate.symbol,
+      positionSide: candidate.positionSide,
+      score: candidate.effectiveScore,
+      rankingScore: candidate.rotationRank?.rotationScore,
+    })),
+    btcRegime,
+    btcChangePct: candidates[0]?.btcChangePct,
+    openPositionsCount: capitalCtx?.openPositionsCount ?? 0,
+    maxOpenPositions: config.maxConcurrentPositions,
+    dataFresh: true,
+    apiHealthy: capitalCtx !== null,
+    executionHealthy: true,
+    source: "live",
+  });
+  const aggressiveConfig = applyAggressionToConfig(config, aggression);
+
+  // Sort by aggressiveScore * rotationScore; paused symbols never fire.
+  const sorted = scored
+    .filter((c) => (c.combinedScore ?? c.aggressiveScore ?? 1) >= aggressiveConfig.sniperMinCombinedScore)
+    .filter((c) => c.effectiveScore >= aggression.minAggressiveScore)
+    .filter((c) => c.rotationRank?.state !== "PAUSED")
+    .sort((a, b) => b.effectiveScore - a.effectiveScore);
 
   // Headroom check
   const currentOpen = capitalCtx?.openPositionsCount ?? 0;
   const headroom = config.maxConcurrentPositions - currentOpen;
-  const toFire = sorted.slice(0, Math.max(0, headroom));
+  const selectedBySymbol = new Map<string, number>();
+  const toFire: typeof sorted = [];
+  for (const candidate of sorted) {
+    if (toFire.length >= Math.max(0, Math.min(headroom, aggression.maxCandidatesThisCycle, aggression.maxPositionsThisCycle))) break;
+    const symbol = candidate.symbol.toUpperCase();
+    const rank = candidate.rotationRank;
+    const maxPositions = Math.min(rank?.maxPositions ?? 1, aggression.symbolConcentrationLimit);
+    const openCounts = capitalCtx?.countsBySide.get(symbol) ?? { LONG: 0, SHORT: 0 };
+    const openForSymbol = openCounts.LONG + openCounts.SHORT;
+    const selectedForSymbol = selectedBySymbol.get(symbol) ?? 0;
+    if (openForSymbol + selectedForSymbol >= maxPositions) continue;
+    selectedBySymbol.set(symbol, selectedForSymbol + 1);
+    toFire.push(candidate);
+  }
 
   const results: BulkOrderResult[] = [];
   const correlationRejects = buildBulkCorrelationRejects(
@@ -1794,36 +2374,118 @@ router.post("/bot/sniper/mass", async (req: Request, res: Response) => {
     })),
     maxCorrelatedBulkOrders(),
   );
+  const recentOutcomes = exportAllOutcomes();
+  const projectedPositions = capitalPositionsForSizing(capitalCtx);
+  const dataQualityStatus = getMarketDataQualityStatus();
+  const dataQualityDegraded = dataQualityStatus.incidents.some((incident) => Date.now() - incident.occurredAt < 10 * 60_000);
 
   for (let i = 0; i < toFire.length; i++) {
     await bucket.consume();
     const c = toFire[i];
+    const rank = c.rotationRank;
+    const openSameSide = projectedPositions.filter((position) =>
+      position.symbol.toUpperCase() === c.symbol.toUpperCase()
+      && position.positionSide === c.positionSide
+    );
+    const sizingStats = recentSizingStats(recentOutcomes, c.symbol, c.positionSide);
+    const sizing = calculatePositionSizing({
+      symbol: c.symbol,
+      positionSide: c.positionSide,
+      accountEquity: capitalCtx?.equity ?? aggressiveConfig.marginPerTrade / 0.005,
+      availableMargin: capitalCtx?.availableMargin ?? Number.POSITIVE_INFINITY,
+      aggressiveScore: Math.max(0, Math.min(1, c.aggressiveScore ?? c.combinedScore ?? c.effectiveScore ?? 0)),
+      coachRank: i + 1,
+      rotationState: rank?.state,
+      aggressionState: aggression.aggressionState === "DEFENSIVE" ? "DEFENSIVE" : getActiveModeId() === "aggressive" ? "AGGRESSIVE" : "NORMAL",
+      recentPnl: sizingStats.recentPnl,
+      recentWinRate: sizingStats.recentWinRate,
+      profitFactor: sizingStats.profitFactor,
+      drawdown: sizingStats.drawdown,
+      executionSlippageBps: rank?.metrics.avgSlippageBps ?? sizingStats.executionSlippageBps,
+      campaignDepth: openSameSide.length + 1,
+      campaignPnl: sizingStats.recentPnl,
+      previousEntryMargin: openSameSide.at(-1)?.marginUsed,
+      currentOpenPositions: projectedPositions,
+      symbolConcentration: rank ? rank.currentOpenPositions / Math.max(1, aggressiveConfig.maxConcurrentPositions) : undefined,
+      sideContextWinRate: sizingStats.sideContextWinRate,
+      sideContextProfitFactor: sizingStats.sideContextProfitFactor,
+      experimentArm: req.body?.experimentArm,
+      dataQualityDegraded,
+      exitPreservingProfit: sizingStats.recentPnl > 0 && sizingStats.drawdown <= Math.max(0.5, (capitalCtx?.equity ?? 0) * 0.005),
+      baseMarginFallback: aggressiveConfig.marginPerTrade,
+      leverageFallback: aggressiveConfig.leverage,
+      stopLossPct: aggressiveConfig.stopLossPct,
+    });
+    if (!sizing.approved) {
+      results.push({
+        index: i,
+        symbol: c.symbol,
+        side: c.positionSide === "LONG" ? "BUY" : "SELL",
+        placed: false,
+        orderId: null,
+        quantity: null,
+        gateRejects: sizing.gateRejects,
+        observationMode: false,
+        message: `REJECTED: ${sizing.gateRejects[0] ?? sizing.reason}`,
+        sizing,
+        durationMs: 0,
+      });
+      continue;
+    }
+    const orderConfig = rank
+      ? {
+          ...aggressiveConfig,
+          maxPositionsPerSymbol: Math.max(1, rank.maxPositions),
+          positionStackingEnabled: aggressiveConfig.positionStackingEnabled && rank.maxPositions > 1,
+        }
+      : aggressiveConfig;
     const result = await executeSingleOrder(
       {
         symbol: c.symbol,
         side: c.positionSide === "LONG" ? "BUY" : "SELL",
         positionSide: c.positionSide,
+        marginOverride: sizing.recommendedMargin,
+        leverageOverride: sizing.recommendedLeverage,
+        sizing,
         currentEv: c.currentEv,
         btcChangePct: c.btcChangePct,
       },
       i,
       creds,
-      config,
+      orderConfig,
       correlationRejects.get(i) ?? [],
       capitalCtx ?? undefined,
     );
     results.push(result);
+    if (result.placed) {
+      projectedPositions.push({
+        symbol: c.symbol,
+        positionSide: c.positionSide,
+        marginUsed: sizing.recommendedMargin,
+        leverage: sizing.recommendedLeverage,
+      });
+    }
   }
 
   const placed = results.filter((r) => r.placed).length;
+  recordAggressionCycleImpact(toFire.length, placed);
   req.log.info({
     total: candidates.length,
     filtered: sorted.length,
     headroom,
     attempted: toFire.length,
     placed,
+    rotationHot: rotation.hotSymbols.length,
+    rotationPaused: rotation.pausedSymbols.length,
+    aggressionState: aggression.aggressionState,
     durationMs: Date.now() - t0,
   }, "sniper/mass execution complete");
+
+  const skippedBelowScore = candidates.filter((c) => (c.combinedScore ?? c.aggressiveScore ?? 1) < aggressiveConfig.sniperMinCombinedScore).length;
+  const skippedPaused = scored.filter((c) =>
+    (c.combinedScore ?? c.aggressiveScore ?? 1) >= config.sniperMinCombinedScore
+    && c.rotationRank?.state === "PAUSED"
+  ).length;
 
   res.json({
     total: candidates.length,
@@ -1832,8 +2494,17 @@ router.post("/bot/sniper/mass", async (req: Request, res: Response) => {
     placed,
     rejected: toFire.length - placed,
     skippedNoHeadroom: sorted.length - toFire.length,
-    skippedBelowScore: candidates.length - sorted.length,
+    skippedBelowScore,
+    skippedByRotation: skippedPaused,
+    aggression,
+    killSwitch,
     durationMs: Date.now() - t0,
+    rotation: {
+      activeSymbols: rotation.activeSymbols,
+      reducedSymbols: rotation.reducedSymbols,
+      pausedSymbols: rotation.pausedSymbols,
+      ranking: rotation.ranking,
+    },
     capitalSnapshot: capitalCtx ? {
       openPositions: capitalCtx.openPositionsCount,
       marginUtilization: parseFloat((capitalCtx.marginUtilization * 100).toFixed(1)),
@@ -1910,6 +2581,7 @@ router.get("/bot/sniper/autopilot/status", (_req: Request, res: Response) => {
     cycleInFlight: autopilotCycleInFlight,
     skippedOverlaps: autopilotSkippedOverlaps,
     lastCycle: autopilot.lastCycle,
+    aggression: getAggressionStatus(),
     recentHistory: autopilot.history.slice(-20),
     config: {
       intervalSec: config.sniperAutopilotIntervalSec,
@@ -1950,7 +2622,7 @@ router.post("/bot/order/bulk", async (req: Request, res: Response) => {
 
   const rps = Math.min(Math.max(1, ordersPerSecond), 10); // clamp 1–10
   const bucket = new TokenBucket(rps, rps);
-  const config = getBotConfig();
+  let config = getBotConfig();
   const activeMode = getActiveModeId();
   const t0 = Date.now();
   const results: BulkOrderResult[] = [];
@@ -1958,6 +2630,28 @@ router.post("/bot/order/bulk", async (req: Request, res: Response) => {
 
   // Pre-fetch capital once — all orders share the same snapshot
   const capitalCtx = await fetchCapitalContext(creds).catch(() => undefined);
+  const firstBtcChangePct = orders[0]?.btcChangePct;
+  const killSwitch = evaluateLiveKillSwitch({
+    config,
+    btcChangePct: firstBtcChangePct,
+    capitalCtx,
+    maxSessionLossRemaining: config.maxSessionLoss,
+    integrityOk: capitalCtx !== undefined,
+  });
+  if (!killSwitch.entryAllowed) {
+    res.json({
+      mode: activeMode ?? "aggressive",
+      total: orders.length,
+      placed: 0,
+      rejected: orders.length,
+      observationMode: !config.allowExecution,
+      durationMs: Date.now() - t0,
+      killSwitch,
+      results: [],
+    });
+    return;
+  }
+  config = applyKillSwitchToConfig(config, killSwitch);
 
   req.log.info({
     count: orders.length, rps, activeMode,
@@ -1983,7 +2677,7 @@ router.post("/bot/order/bulk", async (req: Request, res: Response) => {
   };
 
   req.log.info({ placed, total: orders.length, durationMs: summary.durationMs }, "bulk execution complete");
-  res.json(summary);
+  res.json({ ...summary, killSwitch });
 });
 
 /** GET /api/bot/watcher — live position watcher health and registry snapshot */
