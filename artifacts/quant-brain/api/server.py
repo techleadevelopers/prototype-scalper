@@ -36,8 +36,14 @@ from core.shadow_model import restore_shadow_model, shadow_model_status, train_s
 from core.shadow_sampler import shadow_sampler_status, sample_shadow_signals_once
 from core.exit_intelligence import evaluate_exit
 from core.exit_learning import record_exit_outcome as _record_exit_outcome, record_exit_evaluation, get_exit_stats
+from core.experiment_engine import experiment_status, infer_assignment_for_outcome
+from core.execution_auditor import record_trade_audit, get_execution_audit_report
+from core.pipeline_auditor import validate_learning_eligibility
+from core.position_sizing import calculate_position_size, build_status as build_position_sizing_status
 from core.job_supervisor import JobSupervisor
+from core.score_calibration import run_score_calibration
 from core.candle_regime import analyze_macro_candle_regime, candle_regime_status
+from core.regime_playbook import classify_regime_playbook
 from layers.tactical import process_tactical_cycle, get_active_alerts, get_snapshot_history
 from layers.strategic import build_strategic_report, report_to_dict, compute_edge_evolution
 from analyst.ai_analyst import (
@@ -473,6 +479,12 @@ async def get_metrics():
     return metrics
 
 
+@app.get("/experiments/status")
+async def get_experiments_status(days: int = Query(30, ge=1, le=365)):
+    """A/B experiment status: active arms, samples, PnL, PF, drawdown and recommendation."""
+    return await experiment_status(days=days)
+
+
 @app.get("/health/live")
 async def liveness_check():
     """Liveness probe para Kubernetes/Railway."""
@@ -791,6 +803,15 @@ async def record_trade(body: dict):
     for r in required:
         if r not in body:
             raise HTTPException(400, f"Campo obrigatório: {r}")
+    eligibility = validate_learning_eligibility(body)
+    if not eligibility.learning_eligible:
+        raise HTTPException(
+            422,
+            {
+                "error": "pipeline_integrity_blocked",
+                "blockedReasons": eligibility.blocked_reasons,
+            },
+        )
     side = body.get("positionSide") or body.get("position_side") or body.get("side")
     if not side:
         raise HTTPException(400, "Required field: side or positionSide")
@@ -801,6 +822,7 @@ async def record_trade(body: dict):
         pnl_pct = (realized_pnl / margin_used * 100) if margin_used > 0 else realized_pnl
 
     pnl_usdt = body.get("pnl_usdt", body.get("realizedPnl", 0))
+    experiment = await infer_assignment_for_outcome(body) or {}
 
     recorded = await kb.record_trade_outcome(
         source_id=str(body.get("id") or "") or None,
@@ -820,7 +842,76 @@ async def record_trade(body: dict):
         ema_cross=body.get("ema_cross", body.get("emaCross", "FLAT")),
         slippage_bps=float(body.get("slippage_bps", body.get("slippageBps", 0))),
         fee_paid_usdt=float(body.get("fee_paid_usdt", body.get("feePaidUsdt", 0))),
+        experiment_id=str(experiment.get("experimentId") or ""),
+        experiment_arm=str(experiment.get("experimentArm") or ""),
+        policy_version=str(experiment.get("policyVersion") or ""),
+        campaign_id=str(body.get("campaignId", body.get("campaign_id", "")) or ""),
+        mfe_pct=float(body.get("mfePct", body.get("mfe_pct", body.get("mfe", 0)))),
+        mae_pct=float(body.get("maePct", body.get("mae_pct", body.get("mae", 0)))),
+        exit_reason=str(body.get("exitReason", body.get("exit_reason", "")) or ""),
+        latency_drag_usdt=float(body.get("latencyDragUsdt", body.get("latency_drag_usdt", 0))),
+        regime=body.get("regime"),
+        playbook=body.get("playbook"),
+        setup_type=body.get("setupType", body.get("setup_type")),
+        regime_confidence=(
+            float(body["regimeConfidence"])
+            if body.get("regimeConfidence") is not None
+            else None
+        ),
+        playbook_version=body.get("playbookVersion", body.get("playbook_version")),
+        stacking_depth=int(body.get("stackingDepth", body.get("stacking_depth", 1))),
+        execution_priority=float(body.get("executionPriority", body.get("execution_priority", body.get("score", 0))) or 0),
+        coach_score=float(body.get("coachScore", body.get("coach_score", body.get("executionPriority", body.get("score", 0)))) or 0),
+        playbook_score=(
+            float(body.get("playbookScore", body.get("playbook_score")))
+            if body.get("playbookScore", body.get("playbook_score")) is not None
+            else None
+        ),
+        ml_probability=(
+            float(body.get("mlProbability", body.get("calibratedProbability", body.get("calibrated_probability"))))
+            if body.get("mlProbability", body.get("calibratedProbability", body.get("calibrated_probability"))) is not None
+            else None
+        ),
+        execution_quality=(
+            float(body.get("executionQuality", body.get("execution_quality")))
+            if body.get("executionQuality", body.get("execution_quality")) is not None
+            else None
+        ),
+        signal_id=str(body.get("signalId", body.get("signal_id", "")) or ""),
+        entry_aggressive_score=(
+            float(body.get("aggressiveScore", body.get("entryAggressiveScore", body.get("entry_aggressive_score"))))
+            if body.get("aggressiveScore", body.get("entryAggressiveScore", body.get("entry_aggressive_score"))) is not None
+            else None
+        ),
+        risk_tier=body.get("risk_tier", body.get("riskTier")),
+        size_multiplier=(
+            float(body.get("sizeMultiplier", body.get("size_multiplier")))
+            if body.get("sizeMultiplier", body.get("size_multiplier")) is not None
+            else None
+        ),
+        size_reason=body.get("size_reason", body.get("sizeReason")),
+        recommended_margin=(
+            float(body.get("recommendedMargin", body.get("recommended_margin")))
+            if body.get("recommendedMargin", body.get("recommended_margin")) is not None
+            else None
+        ),
+        recommended_leverage=(
+            float(body.get("recommendedLeverage", body.get("recommended_leverage")))
+            if body.get("recommendedLeverage", body.get("recommended_leverage")) is not None
+            else None
+        ),
+        max_loss_if_stop=(
+            float(body.get("maxLossIfStop", body.get("max_loss_if_stop")))
+            if body.get("maxLossIfStop", body.get("max_loss_if_stop")) is not None
+            else None
+        ),
+        notional=(
+            float(body.get("notional"))
+            if body.get("notional") is not None
+            else None
+        ),
     )
+    execution_audit = await record_trade_audit(body)
 
     # Invalida cache relacionado
     _response_cache.clear()
@@ -830,7 +921,115 @@ async def record_trade(body: dict):
         "recorded": recorded,
         "symbol": body["symbol"],
         "pnl_pct": float(pnl_pct),
+        "experiment": experiment,
+        "executionAudit": execution_audit,
     }
+
+
+@app.post("/execution/audit/trade")
+async def record_execution_audit_trade(body: dict):
+    """Audit one closed trade execution payload without recording a KB trade outcome."""
+    if "symbol" not in body:
+        raise HTTPException(400, "Required field: symbol")
+    return await record_trade_audit(body)
+
+
+@app.post("/kb/trades/batch")
+async def record_trades_batch(body: list[dict]):
+    """Record a batch of trade outcomes and execution audits."""
+    if not isinstance(body, list):
+        raise HTTPException(400, "Expected a JSON array")
+    results = []
+    for item in body[:200]:
+        if not isinstance(item, dict):
+            continue
+        side = item.get("positionSide") or item.get("position_side") or item.get("side")
+        if not item.get("symbol") or not side:
+            continue
+        eligibility = validate_learning_eligibility(item)
+        if not eligibility.learning_eligible:
+            results.append({
+                "sourceId": str(item.get("id") or ""),
+                "recorded": False,
+                "blockedReasons": eligibility.blocked_reasons,
+            })
+            continue
+        pnl_pct = item.get("pnl_pct")
+        if pnl_pct is None:
+            realized_pnl = float(item.get("realizedPnl", item.get("realized_pnl", 0)))
+            margin_used = float(item.get("marginUsed", item.get("margin_used", 0)))
+            pnl_pct = (realized_pnl / margin_used * 100) if margin_used > 0 else realized_pnl
+        pnl_usdt = item.get("pnl_usdt", item.get("realizedPnl", 0))
+        experiment = await infer_assignment_for_outcome(item) or {}
+        recorded = await kb.record_trade_outcome(
+            source_id=str(item.get("id") or "") or None,
+            source=str(item.get("source") or "manual"),
+            is_demo=bool(item.get("isDemo", item.get("is_demo", False))),
+            symbol=item["symbol"],
+            side=side,
+            pnl_pct=float(pnl_pct),
+            pnl_usdt=float(pnl_usdt) if pnl_usdt else 0.0,
+            entry_price=float(item.get("entry_price", item.get("entryPrice", 0))),
+            exit_price=float(item.get("exit_price", item.get("exitPrice", 0))),
+            oi_change=float(item.get("oi_change", item.get("oiChange", 0))),
+            funding=float(item.get("funding", item.get("fundingRate", 0))),
+            volume_ratio=float(item.get("volume_ratio", item.get("volumeRatio", 1))),
+            btc_regime=item.get("btc_regime", item.get("btcRegime", "NEUTRAL")),
+            rsi=float(item.get("rsi", item.get("rsiAtEntry", 50))),
+            ema_cross=item.get("ema_cross", item.get("emaCross", "FLAT")),
+            slippage_bps=float(item.get("slippage_bps", item.get("slippageBps", 0))),
+            fee_paid_usdt=float(item.get("fee_paid_usdt", item.get("feePaidUsdt", 0))),
+            experiment_id=str(experiment.get("experimentId") or ""),
+            experiment_arm=str(experiment.get("experimentArm") or ""),
+            policy_version=str(experiment.get("policyVersion") or ""),
+            campaign_id=str(item.get("campaignId", item.get("campaign_id", "")) or ""),
+            mfe_pct=float(item.get("mfePct", item.get("mfe_pct", item.get("mfe", 0)))),
+            mae_pct=float(item.get("maePct", item.get("mae_pct", item.get("mae", 0)))),
+            exit_reason=str(item.get("exitReason", item.get("exit_reason", "")) or ""),
+            latency_drag_usdt=float(item.get("latencyDragUsdt", item.get("latency_drag_usdt", 0))),
+            regime=item.get("regime"),
+            playbook=item.get("playbook"),
+            setup_type=item.get("setupType", item.get("setup_type")),
+            stacking_depth=int(item.get("stackingDepth", item.get("stacking_depth", 1))),
+            execution_priority=float(item.get("executionPriority", item.get("execution_priority", item.get("score", 0))) or 0),
+            coach_score=float(item.get("coachScore", item.get("coach_score", item.get("executionPriority", item.get("score", 0)))) or 0),
+            playbook_score=(
+                float(item.get("playbookScore", item.get("playbook_score")))
+                if item.get("playbookScore", item.get("playbook_score")) is not None
+                else None
+            ),
+            ml_probability=(
+                float(item.get("mlProbability", item.get("calibratedProbability", item.get("calibrated_probability"))))
+                if item.get("mlProbability", item.get("calibratedProbability", item.get("calibrated_probability"))) is not None
+                else None
+            ),
+            execution_quality=(
+                float(item.get("executionQuality", item.get("execution_quality")))
+                if item.get("executionQuality", item.get("execution_quality")) is not None
+                else None
+            ),
+            signal_id=str(item.get("signalId", item.get("signal_id", "")) or ""),
+            entry_aggressive_score=(
+                float(item.get("aggressiveScore", item.get("entryAggressiveScore", item.get("entry_aggressive_score"))))
+                if item.get("aggressiveScore", item.get("entryAggressiveScore", item.get("entry_aggressive_score"))) is not None
+                else None
+            ),
+        )
+        audit = await record_trade_audit(item)
+        results.append({
+            "sourceId": str(item.get("id") or ""),
+            "recorded": recorded,
+            "experiment": experiment,
+            "executionQuality": audit["executionQuality"],
+        })
+    _response_cache.clear()
+    return {"ok": True, "count": len(results), "results": results}
+
+
+@app.get("/execution/audit")
+async def get_execution_audit_endpoint(hours: int = Query(24, ge=1, le=720)):
+    """Latency, slippage and execution-drag report for sniper fills."""
+    return await get_execution_audit_report(hours=hours)
 
 
 @app.get("/kb/trades/summary")
@@ -846,6 +1045,17 @@ async def get_recent_trade_outcomes(
 ):
     """Trades realizados recentes em formato compatível com o dashboard."""
     return await kb.get_recent_trade_outcomes(source=source, limit=limit)
+
+
+@app.get("/score-calibration/status")
+@cache_response(ttl_seconds=20)
+async def get_score_calibration_status(
+    days: int = Query(30, ge=1, le=365),
+    limit: int = Query(5000, ge=50, le=20000),
+):
+    """Score Truth Engine: compara scores operacionais contra PnL realizado."""
+    rows = await kb.get_score_calibration_rows(days=days, limit=limit)
+    return run_score_calibration(rows)
 
 
 @app.get("/kb/feature-history/{symbol}")
@@ -899,6 +1109,26 @@ async def evaluate_edge_endpoint(body: dict):
             "mode": "degraded_error",
             "error": f"{type(exc).__name__}: {exc}",
         }
+
+
+@app.post("/position-sizing/evaluate")
+async def evaluate_position_sizing_endpoint(body: dict):
+    """Calculate compounding-aware margin/leverage for one candidate."""
+    if "symbol" not in body:
+        raise HTTPException(400, "Required field: symbol")
+    return calculate_position_size(body)
+
+
+@app.get("/position-sizing/status")
+async def position_sizing_status_endpoint(
+    source: str = Query("all", pattern="^(all|demo|live)$"),
+    limit: int = Query(500, ge=1, le=2000),
+    equity: float = Query(0.0, ge=0.0),
+):
+    """Risk-tier performance and compounding curve from recent realized trades."""
+    trades = await kb.get_recent_trade_outcomes(source=source, limit=limit)
+    inferred_equity = equity if equity > 0 else float(os.environ.get("POSITION_SIZING_EQUITY_FALLBACK", "1000"))
+    return build_position_sizing_status(trades, inferred_equity, {})
 
 
 @app.post("/cycle/rank")
@@ -984,6 +1214,100 @@ async def rank_cycle_candidates(body: dict):
     }
 
 
+@app.get("/regime-playbook/status")
+@cache_response(ttl_seconds=10)
+async def regime_playbook_status_endpoint(days: int = Query(30, ge=1, le=365)):
+    """
+    Current regime/playbook map plus historical performance by playbook.
+    """
+    snaps = engine.get_all_snapshots()
+    btc_snap = snaps.get("BTC-USDT")
+    performance = await kb.get_playbook_performance(days=days)
+    report = await kb.get_playbook_report(days=days)
+    breadth_values = [
+        snap.price_change_pct
+        for symbol, snap in snaps.items()
+        if symbol != "BTC-USDT"
+    ]
+    market_breadth = (
+        sum(1 for value in breadth_values if value > 0) / len(breadth_values)
+        if breadth_values
+        else 0.5
+    )
+
+    active_by_symbol: dict[str, Any] = {}
+    for symbol, snap in snaps.items():
+        if symbol == "BTC-USDT":
+            continue
+        try:
+            alt_history = get_snapshot_history(symbol, 900)
+            btc_history = get_snapshot_history("BTC-USDT", 900)
+            sniper = evaluate_sniper_window(
+                symbol,
+                alt_history,
+                btc_history,
+                target_moves_pct={"configured": 0.3, "0.5": 0.5, "1.0": 1.0, "2.0": 2.0},
+            )
+            alt_features = sniper.get("altFeatures") or {}
+            correlation = 0.0
+            sample_count = min(len(alt_history), len(btc_history), 60)
+            if sample_count >= 10:
+                alt_change = float(alt_history[-1].get("price_change_pct", 0) or 0)
+                btc_change = float(btc_history[-1].get("price_change_pct", 0) or 0)
+                correlation = 0.6 if alt_change * btc_change > 0 else 0.2
+            spread_bps = float(alt_features.get("spread_bps") or snap.spread_bps or 0)
+            liquidity_score = max(0.0, min(1.0, 1.0 - spread_bps / 30.0))
+            news_context = await kb.get_active_news_context(symbol)
+            active_by_symbol[symbol] = classify_regime_playbook(
+                symbol=symbol,
+                position_side="LONG" if snap.price_change_pct >= 0 else "SHORT",
+                btc_regime=(btc_snap.btc_regime if btc_snap else snap.btc_regime),
+                btc_volatility_pct=(btc_snap.atr_pct if btc_snap else 0.0),
+                btc_trend_strength=(btc_snap.price_change_pct if btc_snap else 0.0),
+                alt_btc_correlation=correlation,
+                symbol_momentum=float(alt_features.get("price_change_pct") or snap.price_change_pct),
+                volume_ratio=float(alt_features.get("volume_ratio") or snap.volume_ratio),
+                oi_change_pct=float(alt_features.get("oi_change_pct") or snap.oi_change_pct),
+                spread_bps=spread_bps,
+                liquidity_score=liquidity_score,
+                candle_context=sniper.get("altTimeframes") or {},
+                market_breadth=market_breadth,
+                funding_rate=float(alt_features.get("funding_rate") or snap.funding_rate),
+                news_context=news_context,
+                operational_risk=_runtime_state.get("operational_risk") or {},
+                playbook_performance=performance,
+            )
+        except Exception as exc:
+            active_by_symbol[symbol] = {
+                "regime": "LOW_LIQUIDITY",
+                "playbook": "AVOID_MODE",
+                "allowedSetups": [],
+                "blockedSetups": ["UNKNOWN_DATA_QUALITY"],
+                "scoreAdjustments": {"minScoreBoost": 0.16},
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+
+    current_regimes: dict[str, int] = defaultdict(int)
+    for item in active_by_symbol.values():
+        current_regimes[str(item.get("regime", "UNKNOWN"))] += 1
+
+    return {
+        "timestamp": time.time(),
+        "regimeCurrent": dict(current_regimes),
+        "activeBySymbol": active_by_symbol,
+        "allowedPlaybooks": [
+            "MOMENTUM_BREAKOUT_SCALP",
+            "PULLBACK_CONTINUATION",
+            "RANGE_QUICK_SCALP",
+            "LIQUIDITY_SWEEP_REVERSAL",
+            "BTC_LEAD_ALT_FOLLOW",
+            "AVOID_MODE",
+        ],
+        "performanceByPlaybook": performance,
+        "report": report,
+    }
+
+
 # ========== SIGNALS ==========
 
 @app.post("/signals/finalize")
@@ -1055,6 +1379,8 @@ async def exit_evaluate_endpoint(body: dict):
             campaign_depth=int(body.get("campaignDepth", body.get("campaign_depth", 1))),
             campaign_drawdown_pct=float(body.get("campaignDrawdownPct", body.get("campaign_drawdown_pct", 0))),
             btc_regime=str(body.get("btcRegime", body.get("btc_regime", "NEUTRAL"))),
+            regime_playbook=body.get("regimePlaybook") or {},
+            playbook=body.get("playbook"),
         )
     except Exception as exc:
         # Never crash the monitor — return safe HOLD
@@ -1115,6 +1441,7 @@ async def exit_record_outcome_endpoint(body: dict):
             raise HTTPException(400, f"Required field: {r}")
     side = body.get("positionSide") or body.get("side") or "LONG"
     try:
+        experiment = await infer_assignment_for_outcome(body) or {}
         result = await _record_exit_outcome(
             source_id=str(body["sourceId"]),
             symbol=str(body["symbol"]).upper(),
@@ -1134,10 +1461,13 @@ async def exit_record_outcome_endpoint(body: dict):
             btc_regime=str(body.get("btcRegime") or "NEUTRAL"),
             hour_utc=int(body.get("hourUtc", 0)),
             campaign_id=str(body.get("campaignId") or ""),
+            experiment_id=str(experiment.get("experimentId") or ""),
+            experiment_arm=str(experiment.get("experimentArm") or ""),
+            policy_version=str(experiment.get("policyVersion") or ""),
             expected_duration_sec=float(body.get("expectedDurationSec", 300)),
         )
         _response_cache.clear()
-        return {"ok": True, **result}
+        return {"ok": True, **result, "experiment": experiment}
     except Exception as exc:
         raise HTTPException(500, f"Failed to record exit outcome: {exc}") from exc
 
