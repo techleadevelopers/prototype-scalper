@@ -2,7 +2,7 @@ import { Router, type IRouter } from "express";
 import { getServiceState, pauseExecution, resetServiceState } from "../lib/serviceState";
 import type { Request, Response } from "express";
 import { getRuntimeMetrics } from "../lib/runtimeMetrics";
-import { getQuantBrainQueueStats } from "../lib/quantBrainClient";
+import { getQuantBrainOperationalStats, getQuantBrainQueueStats } from "../lib/quantBrainClient";
 import { getLiveWatcherStats } from "../lib/livePositionWatcher";
 import { getTelemetryStats } from "../lib/telemetryStore";
 import { requireAdminAuthorization } from "../lib/executionSecurity";
@@ -20,6 +20,9 @@ router.get("/runtime/metrics", (_req: Request, res: Response) => {
       quantBrain: getQuantBrainQueueStats(),
       telemetry: getTelemetryStats(),
       positionProtection: getLiveWatcherStats(),
+    },
+    dependencies: {
+      quantBrain: getQuantBrainOperationalStats(),
     },
   });
 });
