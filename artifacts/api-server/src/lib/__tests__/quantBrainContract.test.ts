@@ -1,4 +1,86 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import fs from "node:fs";
+import path from "node:path";
+
+describe("shared edge-v3 contract", () => {
+  it("uses the same unavailable and side semantics as Quant Brain", () => {
+    const contractPath = path.resolve(
+      process.cwd(),
+      path.basename(process.cwd()) === "backend"
+        ? "../contracts/quant-brain-edge-v3.json"
+        : "contracts/quant-brain-edge-v3.json",
+    );
+    const contract = JSON.parse(
+      fs.readFileSync(contractPath, "utf8"),
+    );
+    expect(contract.contractVersion).toBe("edge-v3");
+    expect(contract.sides).toEqual({ LONG: "BUY", SHORT: "SELL" });
+    expect(contract.unavailable).toEqual({ score: null, calibratedProbability: null });
+  });
+
+  it("rejects malformed, stale, incompatible, and provenance-mismatched responses", async () => {
+    const { validateQuantBrainEdgeResponse } = await import("../quantBrainClient");
+    const now = Date.now();
+    const request = {
+      symbol: "ETH-USDT",
+      side: "BUY" as const,
+      positionSide: "LONG" as const,
+      config: {} as never,
+      signalId: "signal-1",
+      marketEventId: "event-1",
+      expiresAt: now + 30_000,
+      featureVersion: "sniper-v1",
+      featureTimestampMs: now,
+      candleIsComplete: true,
+      marketDataSource: "bingx" as const,
+      requestTimestamp: now,
+      contractVersion: "edge-v3",
+    };
+    const valid = {
+      allow: true,
+      available: true,
+      contractVersion: "edge-v3",
+      gateRejects: [],
+      score: 0.7,
+      authority: "quant-brain",
+      predictionId: "prediction-1",
+      signalId: "signal-1",
+      marketEventId: "event-1",
+      symbol: "ETH-USDT",
+      side: "BUY",
+      positionSide: "LONG",
+      modelVersion: "shadow-1",
+      featureVersion: "sniper-v1",
+      calibratedProbability: 0.64,
+      probabilityDefinition: "probability_configured_target_hit_before_stop",
+      uncertaintyType: "WEAK_EVIDENCE",
+      predictionTimestamp: now,
+      dataAgeMs: 100,
+    };
+
+    expect(() => validateQuantBrainEdgeResponse({ ...valid, score: 2 }, request, now)).toThrow();
+    expect(() => validateQuantBrainEdgeResponse(
+      { ...valid, predictionTimestamp: now - 60_000 },
+      request,
+      now,
+    )).toThrow(/stale/);
+    expect(() => validateQuantBrainEdgeResponse(
+      { ...valid, featureVersion: "other-v1" },
+      request,
+      now,
+    )).toThrow(/featureVersion/);
+    expect(() => validateQuantBrainEdgeResponse(
+      { ...valid, signalId: "other-signal" },
+      request,
+      now,
+    )).toThrow(/provenance/);
+    expect(() => validateQuantBrainEdgeResponse(
+      { ...valid, available: false, score: 0, calibratedProbability: 0 },
+      request,
+      now,
+    )).toThrow(/unavailable/);
+  });
+});
 
 vi.mock("../quantBrainClient", async (importOriginal) => {
   const real = await importOriginal<typeof import("../quantBrainClient")>();
@@ -9,7 +91,12 @@ describe("outcomeToQuantPayload — audit trail fields", () => {
   it("includes mfe, mae, holdDurationMs, entryCount, modelVersion in payload", async () => {
     const { syncQuantBrainOutcome } = await import("../quantBrainClient");
     const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      new Response(JSON.stringify({ ok: true }), { status: 200 })
+      new Response(JSON.stringify({
+        ok: true,
+        sourceId: "campaign:abc-123",
+        recorded: true,
+        duplicate: false,
+      }), { status: 200 })
     );
 
     const outcome = {
@@ -91,37 +178,12 @@ describe("QuantBrainEdgeInput — contract v2 fields", () => {
       marginType: "ISOLATED" as const,
       allowExecution: true,
       maxSessionLoss: 0,
-      takerFeeBps: 5,
-      slippageBpsPerSide: 2,
-      estimatedFundingCostPct: 0,
-      minEdgeOverCostPct: 0.03,
-      signalDedupeSeconds: 30,
-      signalSourceType: "hypothetical" as const,
-      requireFull15mContext: true,
-      maxDailyLossPct: 0,
-      maxDrawdownPct: 0,
-      maxConsecutiveLosses: 0,
-      recentEdgeWindowHours: 4,
-      recentEdgeMinTrades: 8,
-      recentEdgeMinProfitFactor: 0.8,
-      recentEdgeMaxConsecutiveLosses: 4,
-      candleMinScore: 0.5,
-      candleMinSeparation: 0.08,
-      attachProtectionOrders: true,
-      quantBrainGateMode: "shadow" as const,
       maxPositionsPerSymbol: 3,
       positionStackingEnabled: false,
       sniperAutopilotIntervalSec: 15,
       sniperMaxCandidatesPerCycle: 3,
       sniperMinCombinedScore: 0.5,
       preventHedgedPositions: true,
-      riskProfile: "balanced" as const,
-      decisionProfile: "balanced" as const,
-      loadedAt: new Date().toISOString(),
-      hasOverrides: false,
-      activeOverrides: [],
-      activeMode: null,
-      configVersion: 1,
     };
 
     await evaluateQuantBrainEdge({
@@ -151,6 +213,29 @@ describe("QuantBrainEdgeInput — contract v2 fields", () => {
   });
 });
 
+describe("unavailable prediction semantics", () => {
+  it("never converts a timeout into zero probability or a valid edge", async () => {
+    vi.stubEnv("QUANT_BRAIN_URL", "http://localhost:9000");
+    vi.stubEnv("QUANT_BRAIN_GATE_MODE", "enforce");
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValueOnce(new Error("timeout"));
+    const { evaluateQuantBrainEdge } = await import("../quantBrainClient");
+
+    const result = await evaluateQuantBrainEdge({
+      symbol: "ETH-USDT",
+      side: "BUY",
+      positionSide: "LONG",
+      config: {} as never,
+    });
+
+    expect(result.allow).toBe(false);
+    expect(result.available).toBe(false);
+    expect(result.score).toBeNull();
+    expect(result.calibratedProbability).toBeNull();
+    fetchSpy.mockRestore();
+    vi.unstubAllEnvs();
+  });
+});
+
 describe("LONG/SHORT side consistency", () => {
   it("LONG position always maps to BUY side", () => {
     const positionSide = "LONG" as const;
@@ -160,7 +245,7 @@ describe("LONG/SHORT side consistency", () => {
 
   it("SHORT position always maps to SELL side", () => {
     const positionSide = "SHORT" as const;
-    const side: "BUY" | "SELL" = (positionSide as string) === "LONG" ? "BUY" : "SELL";
+    const side: "BUY" | "SELL" = positionSide === "LONG" ? "BUY" : "SELL";
     expect(side).toBe("SELL");
   });
 
