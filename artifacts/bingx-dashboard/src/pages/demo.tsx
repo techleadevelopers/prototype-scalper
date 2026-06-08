@@ -1186,9 +1186,9 @@ export default function DemoPage() {
                 isReady && "bg-gradient-to-r from-green-500/5 to-transparent"
               }`}
             >
-              <div className="flex items-center justify-between">
-                {/* Left side - Symbol & Side */}
-                <div className="flex items-center gap-3 min-w-[140px]">
+              <div className="flex items-center gap-3">
+                {/* Left side - Symbol & Side + Sparkline */}
+                <div className="flex items-center gap-3 shrink-0">
                   <div className={`w-2 h-2 rounded-full transition-all ${
                     isToxic ? "bg-red-500" : isReady ? "bg-green-400 animate-pulse" : isGatePass ? "bg-yellow-500" : "bg-muted-foreground/30"
                   }`} />
@@ -1224,23 +1224,24 @@ export default function DemoPage() {
                       </div>
                     </div>
                   </div>
+                  {/* Sparkline — anchored to symbol */}
+                  <svg viewBox="0 0 100 30" preserveAspectRatio="none" className="w-24 h-6 overflow-visible hidden md:block shrink-0">
+                    <polyline
+                      points={sparkPts}
+                      fill="none"
+                      stroke={sparkColor}
+                      strokeWidth="1.5"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      vectorEffect="non-scaling-stroke"
+                      style={{ filter: sparkGlow }}
+                    />
+                    <circle cx="100" cy={sparkY[sparkY.length - 1]} r="2" fill={sparkColor}
+                      vectorEffect="non-scaling-stroke" style={{ filter: sparkGlow }} />
+                  </svg>
                 </div>
 
-                {/* Sparkline */}
-                <svg viewBox="0 0 100 30" preserveAspectRatio="none" className="w-24 h-6 mx-3 overflow-visible hidden md:block shrink-0">
-                  <polyline
-                    points={sparkPts}
-                    fill="none"
-                    stroke={sparkColor}
-                    strokeWidth="1.5"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    vectorEffect="non-scaling-stroke"
-                    style={{ filter: sparkGlow }}
-                  />
-                  <circle cx="100" cy={sparkY[sparkY.length - 1]} r="2" fill={sparkColor}
-                    vectorEffect="non-scaling-stroke" style={{ filter: sparkGlow }} />
-                </svg>
+                <div className="flex-1" />
 
                 {/* Center - Metrics */}
                 <div className="hidden md:flex items-center gap-6">
