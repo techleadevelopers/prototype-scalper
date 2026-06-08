@@ -14,12 +14,27 @@ const DEFAULT_MAX_SYMBOL_CONCENTRATION_PCT = 0.40; // 40% em um único símbolo
 export const ExecutionCostEstimateSchema = z.object({
   notional: z.number(),
   roundTripFee: z.number(),
+  slippageCost: z.number(),
+  spreadCost: z.number(),
+  fundingCost: z.number(),
+  latencyDragCost: z.number(),
+  partialFillDragCost: z.number(),
+  protectionFailureRiskCost: z.number(),
+  closeFailureRiskCost: z.number(),
+  totalCost: z.number(),
   feeDragPctOfMargin: z.number(),
   minExpectedPnl: z.number(),
-  // NOVOS CAMPOS
+  expectedTpProfit: z.number().optional(),
+  grossEv: z.number().optional(),
+  netEv: z.number().optional(),
+  breakEvenWinRate: z.number().optional(),
+  expectedWinRate: z.number().optional(),
   effectiveSlippageBps: z.number().optional(),
+  effectiveSlippageBpsPerSide: z.number().optional(),
+  spreadBpsRoundTrip: z.number().optional(),
   totalCostPct: z.number().optional(),
   breakevenMovePct: z.number().optional(),
+  recommendedMinTpPct: z.number().optional(),
 });
 export type ExecutionCostEstimate = z.infer<typeof ExecutionCostEstimateSchema>;
 
@@ -111,6 +126,11 @@ export interface SlippageContext {
   atrPct: number;           // ATR percentual
   orderSizeUsdt: number;    // tamanho da ordem em USDT
   marketDepth: number;      // profundidade do book (0-1)
+  fundingCostPct?: number;
+  latencyDragBps?: number;
+  partialFillDragBps?: number;
+  protectionFailureRiskBps?: number;
+  closeFailureRiskBps?: number;
 }
 
 export function estimateSlippageBps(context: SlippageContext): number {
@@ -148,6 +168,15 @@ export function estimateExecutionCosts(
   feeRate = takerFeeRate(),
   bufferMultiplier = feeDragBufferMultiplier(),
   slippageContext?: SlippageContext,
+  options?: {
+    takeProfitPct?: number;
+    stopLossPct?: number;
+    grossEv?: number;
+    expectedWinRate?: number;
+    slippageBpsPerSide?: number;
+    fundingCostPct?: number;
+    minEdgeOverCostPct?: number;
+  },
 ): ExecutionCostEstimate {
   const safeMargin = Math.max(0.001, marginUsed);
   const safeLeverage = Math.max(1, leverage);
@@ -156,24 +185,71 @@ export function estimateExecutionCosts(
   const roundTripFee = notional * feeRate * 2;
 
   // Slippage estimado
-  const slippageBps = slippageContext ? estimateSlippageBps(slippageContext) : 2.0;
-  const slippageCost = notional * (slippageBps / 10000);
+  const slippageBpsPerSide = Math.max(
+    0,
+    options?.slippageBpsPerSide ?? (slippageContext ? estimateSlippageBps(slippageContext) : 2.0),
+  );
+  const roundTripSlippageBps = slippageBpsPerSide * 2;
+  const slippageCost = notional * (roundTripSlippageBps / 10_000);
+  const spreadBpsRoundTrip = Math.max(0, slippageContext?.spreadBps ?? 0) * 2;
+  const spreadCost = notional * (spreadBpsRoundTrip / 10_000);
+  const fundingCostPct = Math.max(0, options?.fundingCostPct ?? slippageContext?.fundingCostPct ?? 0);
+  const fundingCost = notional * (fundingCostPct / 100);
+  const latencyDragCost = notional * (Math.max(0, slippageContext?.latencyDragBps ?? 0) / 10_000);
+  const partialFillDragCost = notional * (Math.max(0, slippageContext?.partialFillDragBps ?? 0) / 10_000);
+  const protectionFailureRiskCost = notional * (Math.max(0, slippageContext?.protectionFailureRiskBps ?? 0) / 10_000);
+  const closeFailureRiskCost = notional * (Math.max(0, slippageContext?.closeFailureRiskBps ?? 0) / 10_000);
 
-  const totalCost = roundTripFee + slippageCost;
+  const totalCost = roundTripFee
+    + slippageCost
+    + spreadCost
+    + fundingCost
+    + latencyDragCost
+    + partialFillDragCost
+    + protectionFailureRiskCost
+    + closeFailureRiskCost;
   const totalCostPct = (totalCost / safeMargin) * 100;
   const feeDragPctOfMargin = safeMargin > 0 ? (roundTripFee / safeMargin) * 100 : 0;
 
   // Ponto de breakeven: movimento necessário para cobrir custos
-  const breakevenMovePct = totalCostPct;
+  const breakevenMovePct = notional > 0 ? (totalCost / notional) * 100 : 0;
+  const minEdgeOverCostPct = Math.max(0, options?.minEdgeOverCostPct ?? 0);
+  const recommendedMinTpPct = breakevenMovePct + minEdgeOverCostPct;
+  const expectedTpProfit = options?.takeProfitPct !== undefined
+    ? notional * (Math.max(0, options.takeProfitPct) / 100)
+    : undefined;
+  const grossEv = options?.grossEv;
+  const netEv = grossEv !== undefined ? grossEv - totalCost : undefined;
+  const stopLossPct = Math.max(0, options?.stopLossPct ?? 0);
+  const lossAtStop = stopLossPct > 0 ? notional * (stopLossPct / 100) + totalCost : undefined;
+  const breakEvenWinRate = expectedTpProfit !== undefined && lossAtStop !== undefined
+    ? lossAtStop / Math.max(0.000001, expectedTpProfit + lossAtStop)
+    : undefined;
 
   return {
     notional,
     roundTripFee,
+    slippageCost,
+    spreadCost,
+    fundingCost,
+    latencyDragCost,
+    partialFillDragCost,
+    protectionFailureRiskCost,
+    closeFailureRiskCost,
+    totalCost,
     feeDragPctOfMargin,
-    minExpectedPnl: roundTripFee * bufferMultiplier,
-    effectiveSlippageBps: slippageBps,
+    minExpectedPnl: totalCost * bufferMultiplier,
+    expectedTpProfit,
+    grossEv,
+    netEv,
+    breakEvenWinRate,
+    expectedWinRate: options?.expectedWinRate,
+    effectiveSlippageBps: roundTripSlippageBps,
+    effectiveSlippageBpsPerSide: slippageBpsPerSide,
+    spreadBpsRoundTrip,
     totalCostPct: totalCostPct,
     breakevenMovePct,
+    recommendedMinTpPct,
   };
 }
 
@@ -192,11 +268,33 @@ export function feeDragRejectReason(
 ): string | null {
   if (currentEv === undefined) return null;
 
-  const costs = estimateExecutionCosts(marginUsed, config.leverage, undefined, undefined, slippageContext);
+  const costs = estimateExecutionCosts(
+    marginUsed,
+    config.leverage,
+    config.takerFeeBps / 10_000,
+    undefined,
+    slippageContext,
+    {
+      takeProfitPct: config.takeProfitPct,
+      stopLossPct: config.stopLossPct,
+      grossEv: currentEv,
+      slippageBpsPerSide: config.slippageBpsPerSide,
+      fundingCostPct: config.estimatedFundingCostPct,
+      minEdgeOverCostPct: config.minEdgeOverCostPct,
+    },
+  );
+
+  if ((costs.netEv ?? 0) <= 0) {
+    return `NET_EV_REJECT: gross EV ${currentEv.toFixed(4)} - total cost ${costs.totalCost.toFixed(4)} = ${(costs.netEv ?? 0).toFixed(4)}`;
+  }
+
+  if (costs.expectedTpProfit !== undefined && costs.expectedTpProfit <= costs.totalCost) {
+    return `TP_COST_REJECT: expected TP ${costs.expectedTpProfit.toFixed(4)} <= round-trip cost ${costs.totalCost.toFixed(4)} (min TP ${costs.recommendedMinTpPct?.toFixed(3)}%)`;
+  }
 
   if (currentEv >= costs.minExpectedPnl) return null;
 
-  return `FEE_DRAG_REJECT: EV ${currentEv.toFixed(4)} < fee buffer ${costs.minExpectedPnl.toFixed(4)} (${costs.feeDragPctOfMargin.toFixed(2)}% margin drag, slippage ${costs.effectiveSlippageBps?.toFixed(1)}bps)`;
+  return `FEE_DRAG_REJECT: EV ${currentEv.toFixed(4)} < cost buffer ${costs.minExpectedPnl.toFixed(4)} (${costs.feeDragPctOfMargin.toFixed(2)}% margin fee drag, slippage ${costs.effectiveSlippageBps?.toFixed(1)}bps RT)`;
 }
 
 // ========== ANÁLISE DE CORRELAÇÃO ==========
