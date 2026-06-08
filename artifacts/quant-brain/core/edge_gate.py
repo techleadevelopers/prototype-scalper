@@ -20,6 +20,25 @@ from core.database import connect
 from layers.tactical import get_snapshot_history
 from core.judge_sniper import judge_entry, judge_high_sample_context
 from core.coach_ranker import score_candidate
+from core.experiment_engine import assign_signal_to_experiments, persist_assignments, primary_assignment
+from core.regime_playbook import classify_regime_playbook
+from core.score_calibration import run_score_calibration
+
+_score_calibration_cache: dict[str, Any] = {"expires_at": 0.0, "status": None}
+
+
+async def _score_calibration_status() -> dict[str, Any] | None:
+    now = time.time()
+    if _score_calibration_cache["status"] is not None and now < float(_score_calibration_cache["expires_at"]):
+        return _score_calibration_cache["status"]
+    try:
+        rows = await kb.get_score_calibration_rows(days=30, limit=5000)
+        status = run_score_calibration(rows)
+    except Exception:
+        status = None
+    _score_calibration_cache["status"] = status
+    _score_calibration_cache["expires_at"] = now + 60
+    return status
 
 
 def _target_moves(config: dict[str, Any]) -> dict[str, float]:
@@ -345,6 +364,28 @@ def _calculate_correlation_from_history(
     return covariance / denominator if denominator > 0 else 0.0
 
 
+def _calculate_market_breadth_from_snapshots() -> float:
+    """Approximate market breadth from cached tactical snapshots."""
+    from layers.tactical import _snap_buffer
+
+    latest: list[float] = []
+    for history in _snap_buffer.values():
+        if history:
+            latest.append(_num(history[-1].get("price_change_pct"), 0.0))
+    if not latest:
+        return 0.5
+    return sum(1 for value in latest if value > 0) / len(latest)
+
+
+def _liquidity_score(*, spread_bps: float, bid_depth: float, ask_depth: float) -> float:
+    spread_component = max(0.0, 1.0 - max(0.0, spread_bps) / 30.0)
+    depth = max(0.0, min(bid_depth, ask_depth))
+    depth_component = max(0.0, min(1.0, depth / 10_000.0))
+    if depth <= 0:
+        depth_component = 0.55
+    return max(0.0, min(1.0, spread_component * 0.65 + depth_component * 0.35))
+
+
 async def _get_recent_returns(symbol: str, side: str, days: int = 30) -> list[float]:
     """Busca retornos recentes do símbolo para cálculo de Sharpe."""
     from core.knowledge_base import DB_PATH
@@ -406,6 +447,15 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
     signal_id = payload.get("signalId")
     market_event_id = payload.get("marketEventId")
     feature_version = payload.get("featureVersion", "sniper-v1")
+    experiment_assignments = assign_signal_to_experiments(payload)
+    try:
+        await persist_assignments(payload, experiment_assignments)
+    except Exception:
+        pass
+    primary_experiment = primary_assignment(
+        experiment_assignments,
+        str(payload.get("experimentId") or payload.get("experiment_id") or "") or None,
+    )
 
     expires_at_ms = payload.get("expiresAt")
     signal_expired = False
@@ -532,6 +582,47 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
     )
     optimal_size = _calculate_optimal_position_size(
         equity_usdt, hit_probability, net_target_usdt, loss_usdt
+    )
+
+    alt_features = sniper.get("altFeatures") or {}
+    alt_1m = data_quality.get("alt1m") or {}
+    micro = alt_1m.get("microstructure", {}) if isinstance(alt_1m, dict) else {}
+    bid_depth = _num(alt_1m.get("bid_depth_5") or alt_1m.get("bidDepth5"), 0.0)
+    ask_depth = _num(alt_1m.get("ask_depth_5") or alt_1m.get("askDepth5"), 0.0)
+    spread_bps = _num(alt_features.get("spread_bps"), _num(alt_1m.get("spread_bps"), 0.0))
+    liquidity_score = _liquidity_score(
+        spread_bps=spread_bps,
+        bid_depth=bid_depth,
+        ask_depth=ask_depth,
+    )
+    market_breadth = _calculate_market_breadth_from_snapshots()
+    playbook_performance = await kb.get_playbook_performance(days=30)
+    regime_playbook = classify_regime_playbook(
+        symbol=symbol,
+        position_side=position_side,
+        btc_regime=btc_regime,
+        btc_volatility_pct=current_vol * 2,
+        btc_trend_strength=_num(btc_trend_strength),
+        alt_btc_correlation=correlation,
+        symbol_momentum=_num(alt_features.get("price_change_pct"), 0.0),
+        volume_ratio=_num(alt_features.get("volume_ratio"), 1.0),
+        oi_change_pct=_num(alt_features.get("oi_change_pct"), 0.0),
+        spread_bps=spread_bps,
+        liquidity_score=liquidity_score,
+        candle_context=sniper.get("altTimeframes") or {},
+        recent_pnl_by_setup={},
+        symbol_rotation_state=str(payload.get("symbolRotationState") or "NEUTRAL"),
+        market_breadth=market_breadth,
+        funding_rate=_num(alt_features.get("funding_rate"), 0.0),
+        news_context=news_context,
+        operational_risk=operational_risk,
+        playbook_performance=playbook_performance,
+    )
+    size_multiplier = _num((regime_playbook.get("sizing") or {}).get("sizeMultiplier"), 1.0)
+    optimal_size["base_optimal_margin_usdt"] = optimal_size["optimal_margin_usdt"]
+    optimal_size["optimal_margin_usdt"] = round(
+        max(0.0, optimal_size["optimal_margin_usdt"] * size_multiplier),
+        2,
     )
 
     # ── LAYER 1: Judge Sniper — fatal hard blocks ────────────────────────────
@@ -709,6 +800,7 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
     allow = len(all_blocks) == 0
 
     # ── LAYER 2: Coach Ranker — scoring, soft penalties, ranking ────────────
+    score_calibration = await _score_calibration_status()
     coaching = score_candidate(
         symbol=symbol,
         position_side=position_side,
@@ -729,6 +821,8 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
         sentiment_counter=sentiment_counter,
         sentiment_confidence=sentiment_confidence,
         sentiment_aligned=sentiment_aligned,
+        regime_playbook=regime_playbook,
+        score_calibration=score_calibration,
     )
 
     # ── ML audit fields ───────────────────────────────────────────────────────
@@ -747,6 +841,7 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
         "aggressiveScore": coaching["aggressiveScore"],
         "learningScore": coaching["learningScore"],
         "executionPriority": coaching["executionPriority"],
+        "calibratedScore": coaching.get("calibratedScore", coaching["executionPriority"]),
         "scorePenalties": coaching["scorePenalties"],
         "riskProfile": risk_profile,
         "authority": "quant-brain",
@@ -756,6 +851,10 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
         "signalId": signal_id,
         "marketEventId": market_event_id,
         "featureVersion": feature_version,
+        "experimentAssignments": experiment_assignments,
+        "experimentId": primary_experiment["experimentId"] if primary_experiment else None,
+        "experimentArm": primary_experiment["experimentArm"] if primary_experiment else None,
+        "policyVersion": primary_experiment["policyVersion"] if primary_experiment else None,
         "modelVersion": ml_model_version,
         "calibratedProbability": round(ml_calibrated_prob, 6) if ml_calibrated_prob is not None else None,
         "uncertaintyType": ml_uncertainty_type,
@@ -772,6 +871,16 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
             "aligned": sentiment_aligned,
             "counter": sentiment_counter,
         },
+        "regimePlaybook": regime_playbook,
+        "regime": regime_playbook["regime"],
+        "playbook": regime_playbook["playbook"],
+        "allowedSetups": regime_playbook["allowedSetups"],
+        "blockedSetups": regime_playbook["blockedSetups"],
+        "scoreAdjustments": regime_playbook["scoreAdjustments"],
+        "recommendedTpPct": regime_playbook["recommendedTpPct"],
+        "recommendedSlPct": regime_playbook["recommendedSlPct"],
+        "maxPositions": regime_playbook["maxPositions"],
+        "stackingBias": regime_playbook["stackingBias"],
         "sniper": sniper,
         "signalMemory": signal_memory,
         "signalEdge": signal_edge,
@@ -785,6 +894,8 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
             "adjustedStopPct": adjusted_stop,
             "optimalMarginKelly": optimal_size["optimal_margin_usdt"],
             "kellyFraction": optimal_size["kelly_fraction"],
+            "playbookSizeMultiplier": size_multiplier,
+            "baseOptimalMarginKelly": optimal_size.get("base_optimal_margin_usdt", 0.0),
         },
         "newsContext": news_context,
         "dataQuality": data_quality,
@@ -798,7 +909,9 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
             "regimeConfidence": regime_confidence_dict,
             "evBootstrap": ev_bootstrap,
             "correlation": round(correlation, 3),
+            "marketBreadth": round(market_breadth, 3),
+            "liquidityScore": round(liquidity_score, 3),
             "adjustedStopPct": adjusted_stop,
         },
-        "mode": "judge-coach-dual-layer-v1",
+        "mode": "expired" if signal_expired else "judge-coach-dual-layer-v1",
     }
