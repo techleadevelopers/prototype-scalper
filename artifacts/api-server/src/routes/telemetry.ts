@@ -10,6 +10,7 @@ import {
 import { getQuantBrainRecentTrades, getQuantBrainTradeSummary, syncQuantBrainOutcome } from "../lib/quantBrainClient";
 import { AdaptiveEngine } from "../lib/adaptiveEngine";
 import type { BtcRegime, ExitReason, PositionSide, TradeOutcome } from "../lib/adaptiveEngine";
+import { requireAdminAuthorization } from "../lib/executionSecurity";
 
 const router = Router();
 
@@ -126,7 +127,7 @@ router.get("/telemetry/recommendation", (_req: Request, res: Response) => {
 });
 
 /** POST /api/telemetry/outcome — record a realized trade outcome */
-router.post("/telemetry/outcome", (req: Request, res: Response) => {
+router.post("/telemetry/outcome", requireAdminAuthorization, (req: Request, res: Response) => {
   const body = req.body as {
     id?: string;
     symbol: string;
