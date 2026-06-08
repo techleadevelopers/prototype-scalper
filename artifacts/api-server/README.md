@@ -509,6 +509,42 @@ pnpm run typecheck
 O typecheck inclui testes TypeScript e exige todas as dependências de teste
 instaladas. O build de produção é gerado em `dist/`.
 
+### Estado Atual Da Validação
+
+Validações que passaram no estado atual do workspace:
+
+- `pnpm.cmd --dir backend run build`
+- `pnpm.cmd --dir backend run test:security`
+- `pnpm.cmd --dir artifacts\bingx-dashboard run typecheck`
+- `pnpm.cmd --dir artifacts\bingx-dashboard run build`
+- `pnpm run typecheck` na raiz, quando usado para validar o contrato/mappers
+  compartilhados mais recentes
+- `pnpm run build` na raiz, com apenas warning existente de chunk grande no
+  Vite
+
+Validações com bloqueios conhecidos:
+
+- `pnpm.cmd --dir backend typecheck` ainda falha por dívidas preexistentes em
+  testes/tipos, principalmente imports de `vitest`, imports `.ts` não
+  habilitados e alguns símbolos antigos em testes/rotas. Use o build runtime
+  como validação operacional enquanto esses testes não forem normalizados.
+- Testes focados que dependem de `vitest` não rodam quando o binário/deps de
+  teste não estão instalados no workspace.
+- Alguns testes Node com `node --test` podem falhar no sandbox Windows com
+  `spawn EPERM`; isso não indica necessariamente regressão funcional.
+
+Ao validar patches pequenos, priorize:
+
+```powershell
+pnpm.cmd --dir backend run build
+pnpm.cmd --dir backend run test:security
+pnpm.cmd --dir artifacts\bingx-dashboard run typecheck
+pnpm.cmd --dir artifacts\bingx-dashboard run build
+```
+
+Se o patch tocar contrato backend/Quant Brain, rode também os testes Python
+focados do contrato no diretório `quant-brain`.
+
 ## Dados Que Não Devem Ir Para Git
 
 ```text
