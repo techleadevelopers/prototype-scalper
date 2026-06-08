@@ -1168,6 +1168,17 @@ export default function DemoPage() {
           const isToxic = s.isToxic;
           const isGatePass = s.gatePass && !isReady;
           
+          const up = s.priceChangePct >= 0;
+          const vol = Math.min(11, Math.max(4, Math.abs(s.priceChangePct) * 1.1));
+          const sparkY = Array.from({ length: 18 }, (_, idx) => {
+            const base2 = 18 + idx * (up ? -0.4 : 0.4);
+            const jag = (idx % 2 === 0 ? -1 : 1) * vol * 0.72 + (idx % 5 === 0 ? -1 : 0.45) * vol * 0.38;
+            return Math.min(26, Math.max(3, base2 + Math.sin(idx * 2.35) * vol * 0.35 + jag));
+          });
+          const sparkPts = sparkY.map((y, idx) => `${(idx / (sparkY.length - 1)) * 100},${y}`).join(" ");
+          const sparkColor = up ? "#8ed734" : "#ef4444";
+          const sparkGlow = up ? "drop-shadow(0 0 3px rgba(142,215,52,0.7))" : "drop-shadow(0 0 3px rgba(239,68,68,0.7))";
+
           return (
             <div
               key={`${key}-${i}`}
@@ -1214,6 +1225,22 @@ export default function DemoPage() {
                     </div>
                   </div>
                 </div>
+
+                {/* Sparkline */}
+                <svg viewBox="0 0 100 30" preserveAspectRatio="none" className="flex-1 h-6 mx-3 overflow-visible hidden md:block">
+                  <polyline
+                    points={sparkPts}
+                    fill="none"
+                    stroke={sparkColor}
+                    strokeWidth="1.5"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    vectorEffect="non-scaling-stroke"
+                    style={{ filter: sparkGlow }}
+                  />
+                  <circle cx="100" cy={sparkY[sparkY.length - 1]} r="2" fill={sparkColor}
+                    vectorEffect="non-scaling-stroke" style={{ filter: sparkGlow }} />
+                </svg>
 
                 {/* Center - Metrics */}
                 <div className="hidden md:flex items-center gap-6">
