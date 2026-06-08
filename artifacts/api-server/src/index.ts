@@ -1,5 +1,8 @@
 import app from "./app";
 import { logger } from "./lib/logger";
+import { validateExecutionStartup } from "./lib/executionSecurity";
+
+const execution = validateExecutionStartup();
 
 const rawPort = process.env["PORT"];
 
@@ -21,5 +24,8 @@ app.listen(port, (err) => {
     process.exit(1);
   }
 
-  logger.info({ port }, "Server listening");
+  logger.info(
+    { port, executionEnvironment: execution.environment, liveExecutionEnabled: execution.liveExecutionEnabled },
+    "Server listening",
+  );
 });
