@@ -49,6 +49,14 @@ taxa de acerto ou PnL bruto.
   Brain por outbox persistente;
 - o contrato de avaliação Quant Brain é `edge-v3` e valida proveniência,
   versão de feature, idade da predição e idade do dado de mercado;
+- auditoria de execução separa perda causada por latência/slippage/spread de
+  perda causada pela estratégia;
+- Symbol Rotation, Strategy Memory, Aggression Controller, Kill Switch, Live
+  Readiness e Position Sizing atuam antes de novas entradas;
+- Pipeline Integrity Audit marca outcomes elegíveis ou bloqueados para
+  aprendizado antes do sync com o Quant Brain;
+- score calibration do Quant Brain pode reduzir prioridade e sizing quando o
+  score bruto estiver superconfiante;
 - a máquina de estado operacional continua monitorando e fechando posições
   mesmo quando novas entradas estão pausadas.
 
@@ -79,6 +87,13 @@ src/lib/candleEdge.ts         candles completos e edge técnico
 src/lib/entryProtection.ts    confirmação e TP/SL anexado
 src/lib/executionRisk.ts      custo, exposição e correlação
 src/lib/executionSecurity.ts  isolamento demo/live e autorização
+src/lib/aggressionController.ts PAUSED/DEFENSIVE/NORMAL/BOOST/MAX_SNIPER
+src/lib/killSwitch.ts         breakers operacionais de entrada
+src/lib/live_readiness.ts     promoção demo/shadow/micro/limited/live
+src/lib/pipelineAuditor.ts    elegibilidade de treino e gaps de pipeline
+src/lib/positionSizing.ts     tier, margem, alavancagem e risco
+src/lib/strategyMemory.ts     regras maduras, decay, drift e recomendações
+src/lib/symbolRotation.ts     HOT/ACTIVE/REDUCED/PAUSED/RECOVERY por símbolo
 src/lib/serviceState.ts       HEALTHY/DEGRADED/SHADOW_ONLY/PAUSED
 src/lib/stackingPolicy.ts     gates marginais de stacking
 src/lib/vstOrderJournal.ts    idempotência e recovery VST
@@ -150,6 +165,10 @@ validação operacional independente.
 Uma entrada pode ser rejeitada por:
 
 - kill switch e estado do serviço;
+- live readiness do escopo símbolo/lado/playbook/regime;
+- pipeline sem proveniência ou sem elegibilidade de aprendizado;
+- aggression controller em `PAUSED` ou redução operacional;
+- symbol rotation em `PAUSED` ou limite por símbolo atingido;
 - sessão sem credenciais;
 - símbolo ou hora bloqueados;
 - regime BTC incompatível;
@@ -166,6 +185,27 @@ Uma entrada pode ser rejeitada por:
 
 TP e SL podem ser anexados à ordem pela BingX quando
 `SCALP_ATTACH_PROTECTION_ORDERS=true`.
+
+## Controles Adaptativos
+
+Os controles abaixo atuam juntos nas rotas live, bulk, sniper mass e autopilot.
+Eles bloqueiam apenas novas entradas; monitoramento, closes, watcher, Exit
+Intelligence e telemetria continuam rodando.
+
+| Controle | Endpoint | Papel |
+|---|---|---|
+| Aggression Controller | `GET /api/aggression/status` | ajusta agressividade por drawdown, slippage, estado do serviço, pressão de posições e telemetria |
+| Kill Switch | `GET /api/kill-switch/status` | transiciona entre `RUNNING`, `CAUTION`, `SOFT_PAUSE`, `HARD_PAUSE`, `RECOVERY` e `RESUME` |
+| Live Readiness | `GET /api/live-readiness/status` | aprova escopos para `DEMO_ONLY`, `SHADOW_LIVE`, `MICRO_LIVE`, `LIMITED_LIVE`, `STANDARD_LIVE` ou `SUSPENDED` |
+| Symbol Rotation | `GET /api/symbol-rotation/status` | calcula `rotationScore`, `sideBias`, alocação, limite por símbolo e estado HOT/ACTIVE/REDUCED/PAUSED/RECOVERY |
+| Position Sizing | `GET /api/position-sizing/status` | escolhe tier `MICRO`, `SCOUT`, `BASE`, `BOOST`, `AGGRESSIVE` ou `MAX_SNIPER` |
+| Strategy Memory | `GET /api/strategy-memory/status` | consolida regras maduras com evidência, decay, drift, conflitos e recomendações |
+| Pipeline Audit | `GET /api/pipeline/audit` | mostra health, gaps por etapa, elegíveis/bloqueados para treino e falhas críticas |
+| Execution Audit | `GET /api/execution/audit` | resume latência, slippage, spread, price move durante latência, drag e qualidade de execução |
+
+`POST /api/bot/sniper/mass` retorna um bloco `rotation` por candidato e usa
+`rotationScore`, `allocationWeight`, estado de agressividade e tier de sizing
+para ordenar candidatos, limitar posições e ajustar margem por trade.
 
 ## Stacking E Execução Em Massa
 
@@ -274,6 +314,10 @@ O backend:
 - envia avaliações para `POST /edge/evaluate`;
 - valida rigorosamente respostas `edge-v3`;
 - sincroniza trades em `/kb/trades` e `/kb/trades/batch`;
+- envia outcomes com timestamps/preços de execução, versões de estratégia,
+  config, modelo, policy e label;
+- consome auditoria de execução, score calibration, position sizing e demais
+  sidecars operacionais;
 - consulta saúde, modelo, signal edge e notícias para a tela IA Sniper;
 - mantém outcomes pendentes em
   `data/quant-brain-outbox.json` por default;
@@ -335,6 +379,21 @@ SCALP_PREVENT_HEDGED_POSITIONS=true
 Valores `0` podem desativar gates. Isso é útil para coleta em observação, mas
 não prova segurança para capital real.
 
+### Position Sizing
+
+```env
+POSITION_SIZING_ENABLED=true
+BASE_RISK_PCT=0.25
+MAX_RISK_PCT_PER_TRADE=0.75
+MAX_TOTAL_RISK_PCT=3
+MAX_SYMBOL_RISK_PCT=1
+MIN_MARGIN=1
+```
+
+O sizing combina score calibrado, rotação, qualidade de execução, drawdown,
+profundidade de stacking e risco global. Stacking não pode aumentar margem em
+sequência de perda por regra anti-martingale.
+
 ## Endpoints
 
 ```text
@@ -343,6 +402,15 @@ GET  /api/runtime/metrics
 GET  /api/service-state
 POST /api/service-state/pause              [admin]
 POST /api/service-state/reset              [admin]
+GET  /api/aggression/status
+GET  /api/kill-switch/status
+GET  /api/live-readiness/status
+GET  /api/symbol-rotation/status
+GET  /api/position-sizing/status
+GET  /api/strategy-memory/status
+GET  /api/pipeline/audit
+GET  /api/execution/audit
+GET  /api/score-calibration/status
 
 POST /api/bingx/connect
 POST /api/bingx/disconnect
