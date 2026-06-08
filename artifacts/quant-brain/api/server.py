@@ -34,6 +34,8 @@ from core.movement_sniper import evaluate_sniper_window, build_movement_features
 from core.signal_learning import finalize_due_signal_outcomes, score_signal_context
 from core.shadow_model import restore_shadow_model, shadow_model_status, train_shadow_model
 from core.shadow_sampler import shadow_sampler_status, sample_shadow_signals_once
+from core.exit_intelligence import evaluate_exit
+from core.exit_learning import record_exit_outcome as _record_exit_outcome, record_exit_evaluation, get_exit_stats
 from core.job_supervisor import JobSupervisor
 from core.candle_regime import analyze_macro_candle_regime, candle_regime_status
 from layers.tactical import process_tactical_cycle, get_active_alerts, get_snapshot_history
@@ -1019,6 +1021,143 @@ async def get_learning_metrics_endpoint(hours: int = Query(24, ge=1, le=168)):
     — the primary signal that the Coach Ranker is becoming a real teacher.
     """
     return await kb.get_learning_metrics(hours=hours)
+
+
+# ── Exit Intelligence endpoints ──────────────────────────────────────────────
+
+@app.post("/exit/evaluate")
+async def exit_evaluate_endpoint(body: dict):
+    """
+    Evaluate an open position and recommend an exit action.
+
+    Called by the demo monitor every cycle for each open position.
+    Fetches current market data internally (snapshot history + sniper window).
+    Never blocks — returns HOLD on any internal error.
+    """
+    symbol = body.get("symbol", "")
+    position_side = body.get("positionSide") or body.get("position_side") or "LONG"
+    if not symbol:
+        raise HTTPException(400, "symbol required")
+
+    try:
+        result = evaluate_exit(
+            symbol=symbol.upper(),
+            position_side=str(position_side).upper(),
+            entry_price=float(body.get("entryPrice", body.get("entry_price", 0))),
+            current_price=float(body.get("currentPrice", body.get("current_price", 0))),
+            unrealized_pnl_pct=float(body.get("unrealizedPnlPct", body.get("unrealized_pnl_pct", 0))),
+            age_seconds=float(body.get("ageSeconds", body.get("age_seconds", 0))),
+            tp_pct=float(body.get("tpPct", body.get("tp_pct", 0.3))),
+            sl_pct=float(body.get("slPct", body.get("sl_pct", 0.2))),
+            mfe_pct=float(body.get("mfePct", body.get("mfe_pct", 0))),
+            mae_pct=float(body.get("maePct", body.get("mae_pct", 0))),
+            aggressive_score=float(body.get("aggressiveScore", body.get("aggressive_score", 0.5))),
+            campaign_depth=int(body.get("campaignDepth", body.get("campaign_depth", 1))),
+            campaign_drawdown_pct=float(body.get("campaignDrawdownPct", body.get("campaign_drawdown_pct", 0))),
+            btc_regime=str(body.get("btcRegime", body.get("btc_regime", "NEUTRAL"))),
+        )
+    except Exception as exc:
+        # Never crash the monitor — return safe HOLD
+        return {
+            "action": "HOLD",
+            "confidence": 0.5,
+            "reason": f"evaluation_error: {exc}",
+            "shouldClose": False,
+            "shouldStack": True,
+            "stackingAction": None,
+            "protectionLevel": "normal",
+            "suggestedStopPct": float(body.get("slPct", 0.2)),
+            "suggestedTakeProfitPct": float(body.get("tpPct", 0.3)),
+            "adaptiveTpSl": {"tpPct": float(body.get("tpPct", 0.3)), "slPct": float(body.get("slPct", 0.2)), "rationale": "fallback"},
+            "context": {},
+            "version": "exit-intelligence-v1",
+        }
+
+    # Persist evaluation for outcome correlation (fire-and-forget — don't let
+    # DB errors block the response)
+    source_id = str(body.get("orderId") or "")
+    if source_id:
+        try:
+            await record_exit_evaluation(
+                source_id=source_id,
+                symbol=symbol.upper(),
+                side=str(position_side).upper(),
+                action=result["action"],
+                confidence=float(result["confidence"]),
+                reason=str(result["reason"]),
+                suggested_stop_pct=float(result["suggestedStopPct"]),
+                suggested_tp_pct=float(result["suggestedTakeProfitPct"]),
+                should_close=result["shouldClose"],
+                should_stack=result["shouldStack"],
+                protection_level=str(result["protectionLevel"]),
+                unrealized_pnl_pct=float(body.get("unrealizedPnlPct", 0)),
+                mfe_pct=float(body.get("mfePct", 0)),
+                age_seconds=float(body.get("ageSeconds", 0)),
+                momentum_score=float((result.get("context") or {}).get("momentumScore", 0.5)),
+            )
+        except Exception:
+            pass
+
+    return result
+
+
+@app.post("/exit/record-outcome")
+async def exit_record_outcome_endpoint(body: dict):
+    """
+    Record post-trade exit outcome for learning analysis.
+
+    Called after a demo trade closes. Classifies exit quality and persists
+    for Coach Ranker feedback.
+    """
+    required = ["sourceId", "symbol", "pnlPct", "mfePct", "maePct", "ageSeconds", "tpPct", "slPct", "exitReason"]
+    for r in required:
+        if r not in body:
+            raise HTTPException(400, f"Required field: {r}")
+    side = body.get("positionSide") or body.get("side") or "LONG"
+    try:
+        result = await _record_exit_outcome(
+            source_id=str(body["sourceId"]),
+            symbol=str(body["symbol"]).upper(),
+            side=str(side).upper(),
+            is_demo=bool(body.get("isDemo", True)),
+            entry_price=float(body.get("entryPrice", 0)),
+            exit_price=float(body.get("exitPrice", 0)),
+            pnl_pct=float(body["pnlPct"]),
+            mfe_pct=float(body["mfePct"]),
+            mae_pct=float(body["maePct"]),
+            age_seconds=float(body["ageSeconds"]),
+            tp_pct=float(body["tpPct"]),
+            sl_pct=float(body["slPct"]),
+            exit_reason=str(body["exitReason"]),
+            exit_action_taken=str(body.get("exitActionTaken") or ""),
+            entry_aggressive_score=float(body.get("aggressiveScore", 0)),
+            btc_regime=str(body.get("btcRegime") or "NEUTRAL"),
+            hour_utc=int(body.get("hourUtc", 0)),
+            campaign_id=str(body.get("campaignId") or ""),
+            expected_duration_sec=float(body.get("expectedDurationSec", 300)),
+        )
+        _response_cache.clear()
+        return {"ok": True, **result}
+    except Exception as exc:
+        raise HTTPException(500, f"Failed to record exit outcome: {exc}") from exc
+
+
+@app.get("/exit/stats")
+@cache_response(ttl_seconds=60)
+async def exit_stats_endpoint(
+    symbol: str | None = Query(None),
+    side: str | None = Query(None),
+    days: int = Query(30, ge=1, le=365),
+):
+    """
+    Exit quality analytics — win-rate / PnL / MFE averages by label and action.
+    Used by the Intelligence page and Coach Ranker learning signal.
+    """
+    return await get_exit_stats(
+        symbol=symbol.upper() if symbol else None,
+        side=side.upper() if side else None,
+        days=days,
+    )
 
 
 @app.post("/models/sniper/train")

@@ -399,6 +399,13 @@ async def init_db():
             "pnl_usdt": "REAL",
             "slippage_bps": "REAL DEFAULT 0",
             "fee_paid_usdt": "REAL DEFAULT 0",
+            # Exit intelligence fields — added via migration for existing DBs
+            "mfe_pct": "REAL",
+            "mae_pct": "REAL",
+            "gave_back_pct": "REAL",
+            "exit_quality": "TEXT",
+            "exit_action_taken": "TEXT",
+            "entry_aggressive_score": "REAL",
         }
         for name, definition in trade_migrations.items():
             if name not in trade_columns:
@@ -468,6 +475,69 @@ async def init_db():
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_lifecycle_symbol_ts "
             "ON signal_lifecycle_events(symbol, ts)"
+        )
+
+        # ── Exit Intelligence tables ──────────────────────────────────────────
+        # exit_outcomes: post-trade analysis record (1 per closed demo trade)
+        # exit_evaluations: every QB exit recommendation (many per trade lifecycle)
+        await db.executescript(
+            """CREATE TABLE IF NOT EXISTS exit_outcomes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_id TEXT UNIQUE,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                is_demo INTEGER DEFAULT 1,
+                entry_price REAL,
+                exit_price REAL,
+                pnl_pct REAL,
+                mfe_pct REAL,
+                mae_pct REAL,
+                gave_back_pct REAL,
+                age_seconds REAL,
+                tp_pct REAL,
+                sl_pct REAL,
+                exit_quality TEXT,
+                exit_reason TEXT,
+                exit_action_taken TEXT,
+                entry_aggressive_score REAL,
+                btc_regime TEXT,
+                hour_utc INTEGER,
+                campaign_id TEXT,
+                ts REAL NOT NULL
+            )"""
+        )
+        await db.executescript(
+            """CREATE TABLE IF NOT EXISTS exit_evaluations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_id TEXT,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                action TEXT NOT NULL,
+                confidence REAL,
+                reason TEXT,
+                suggested_stop_pct REAL,
+                suggested_tp_pct REAL,
+                should_close INTEGER DEFAULT 0,
+                should_stack INTEGER DEFAULT 1,
+                protection_level TEXT,
+                unrealized_pnl_pct REAL,
+                mfe_pct REAL,
+                age_seconds REAL,
+                momentum_score REAL,
+                ts REAL NOT NULL
+            )"""
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_exit_outcomes_symbol_ts "
+            "ON exit_outcomes(symbol, ts)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_exit_outcomes_quality "
+            "ON exit_outcomes(exit_quality)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_exit_evaluations_source "
+            "ON exit_evaluations(source_id)"
         )
 
         await db.commit()
@@ -1730,4 +1800,186 @@ async def get_learning_metrics(hours: int = 24) -> dict:
             "finalized": int(totals["finalized"] or 0) if totals else 0,
             "pending": int(totals["pending"] or 0) if totals else 0,
         },
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Exit Intelligence — persistence helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def record_exit_outcome_row(
+    *,
+    source_id: str,
+    symbol: str,
+    side: str,
+    is_demo: int = 1,
+    entry_price: float = 0.0,
+    exit_price: float = 0.0,
+    pnl_pct: float,
+    mfe_pct: float,
+    mae_pct: float,
+    gave_back_pct: float,
+    age_seconds: float,
+    tp_pct: float,
+    sl_pct: float,
+    exit_quality: str,
+    exit_reason: str,
+    exit_action_taken: str = "",
+    entry_aggressive_score: float = 0.0,
+    btc_regime: str = "NEUTRAL",
+    hour_utc: int = 0,
+    campaign_id: str = "",
+) -> None:
+    """Insert (or upsert) one exit outcome record."""
+    ts = __import__("time").time()
+    async with connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT INTO exit_outcomes
+               (source_id, symbol, side, is_demo, entry_price, exit_price,
+                pnl_pct, mfe_pct, mae_pct, gave_back_pct, age_seconds,
+                tp_pct, sl_pct, exit_quality, exit_reason, exit_action_taken,
+                entry_aggressive_score, btc_regime, hour_utc, campaign_id, ts)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(source_id) DO UPDATE SET
+                 exit_quality=excluded.exit_quality,
+                 gave_back_pct=excluded.gave_back_pct,
+                 mfe_pct=excluded.mfe_pct,
+                 mae_pct=excluded.mae_pct,
+                 pnl_pct=excluded.pnl_pct,
+                 exit_action_taken=excluded.exit_action_taken""",
+            (source_id, symbol, side, is_demo, entry_price, exit_price,
+             pnl_pct, mfe_pct, mae_pct, gave_back_pct, age_seconds,
+             tp_pct, sl_pct, exit_quality, exit_reason, exit_action_taken,
+             entry_aggressive_score, btc_regime, hour_utc, campaign_id, ts),
+        )
+        await db.commit()
+
+
+async def record_exit_evaluation_row(
+    *,
+    source_id: str,
+    symbol: str,
+    side: str,
+    action: str,
+    confidence: float,
+    reason: str,
+    suggested_stop_pct: float,
+    suggested_tp_pct: float,
+    should_close: int,
+    should_stack: int,
+    protection_level: str,
+    unrealized_pnl_pct: float,
+    mfe_pct: float,
+    age_seconds: float,
+    momentum_score: float,
+) -> None:
+    """Insert one exit evaluation record (each QB recommendation stored)."""
+    ts = __import__("time").time()
+    async with connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT INTO exit_evaluations
+               (source_id, symbol, side, action, confidence, reason,
+                suggested_stop_pct, suggested_tp_pct, should_close, should_stack,
+                protection_level, unrealized_pnl_pct, mfe_pct, age_seconds,
+                momentum_score, ts)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (source_id, symbol, side, action, confidence, reason,
+             suggested_stop_pct, suggested_tp_pct, should_close, should_stack,
+             protection_level, unrealized_pnl_pct, mfe_pct, age_seconds,
+             momentum_score, ts),
+        )
+        await db.commit()
+
+
+async def query_exit_stats(
+    symbol: str | None = None,
+    side: str | None = None,
+    days: int = 30,
+) -> dict:
+    """
+    Exit quality analytics — win-rate / PnL / MFE averages by quality label.
+    Used by the /exit/stats endpoint and as a Coach Ranker learning signal.
+    """
+    since = __import__("time").time() - days * 86400
+    filters: list[str] = ["ts >= ?"]
+    params: list = [since]
+    if symbol:
+        filters.append("symbol = ?")
+        params.append(symbol.upper())
+    if side:
+        filters.append("side = ?")
+        params.append(side.upper())
+    where = " AND ".join(filters)
+
+    async with connect(DB_PATH) as db:
+        # Quality breakdown
+        quality_rows = await (await db.execute(
+            f"""SELECT exit_quality,
+                       COUNT(*) as cnt,
+                       AVG(pnl_pct) as avg_pnl,
+                       SUM(CASE WHEN pnl_pct > 0 THEN 1 ELSE 0 END) * 1.0 / COUNT(*) as win_rate,
+                       AVG(mfe_pct) as avg_mfe,
+                       AVG(mae_pct) as avg_mae,
+                       AVG(gave_back_pct) as avg_gave_back
+               FROM exit_outcomes
+               WHERE {where}
+               GROUP BY 1
+               ORDER BY cnt DESC""",
+            params,
+        )).fetchall()
+
+        # Action breakdown (what recommendations led to which outcomes)
+        action_rows = await (await db.execute(
+            f"""SELECT exit_action_taken,
+                       COUNT(*) as cnt,
+                       AVG(pnl_pct) as avg_pnl,
+                       SUM(CASE WHEN pnl_pct > 0 THEN 1 ELSE 0 END) * 1.0 / COUNT(*) as win_rate,
+                       AVG(gave_back_pct) as avg_gave_back
+               FROM exit_outcomes
+               WHERE {where} AND exit_action_taken != ''
+               GROUP BY 1
+               ORDER BY cnt DESC""",
+            params,
+        )).fetchall()
+
+        # Symbol breakdown
+        symbol_rows = await (await db.execute(
+            f"""SELECT symbol,
+                       COUNT(*) as cnt,
+                       AVG(pnl_pct) as avg_pnl,
+                       AVG(mfe_pct) as avg_mfe,
+                       AVG(gave_back_pct) as avg_gave_back
+               FROM exit_outcomes
+               WHERE {where}
+               GROUP BY 1
+               ORDER BY cnt DESC
+               LIMIT 20""",
+            params,
+        )).fetchall()
+
+        # Overall summary
+        summary = await (await db.execute(
+            f"""SELECT COUNT(*) as total,
+                       AVG(pnl_pct) as avg_pnl,
+                       AVG(mfe_pct) as avg_mfe,
+                       AVG(mae_pct) as avg_mae,
+                       AVG(gave_back_pct) as avg_gave_back,
+                       AVG(age_seconds) as avg_age_sec,
+                       SUM(CASE WHEN pnl_pct > 0 THEN 1 ELSE 0 END) * 1.0 / COUNT(*) as win_rate
+               FROM exit_outcomes
+               WHERE {where}""",
+            params,
+        )).fetchone()
+
+    def _fmt(row: dict) -> dict:
+        return {k: (round(v, 4) if isinstance(v, float) else v) for k, v in dict(row).items()}
+
+    return {
+        "days": days,
+        "symbol": symbol,
+        "side": side,
+        "summary": _fmt(summary) if summary else {},
+        "byQuality": [_fmt(r) for r in quality_rows],
+        "byAction": [_fmt(r) for r in action_rows],
+        "bySymbol": [_fmt(r) for r in symbol_rows],
     }

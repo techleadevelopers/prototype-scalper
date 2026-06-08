@@ -3,7 +3,7 @@ import { createHmac, randomUUID } from "crypto";
 import type { Request, Response } from "express";
 import { getBotConfig } from "../lib/botConfig";
 import { getEngine, recordTradeOutcome, updateTradeOutcome } from "../lib/telemetryStore";
-import { evaluateQuantBrainEdge, quantBrainGateMode, syncQuantBrainOutcome, reportSignalLifecycle } from "../lib/quantBrainClient";
+import { evaluateQuantBrainEdge, quantBrainGateMode, syncQuantBrainOutcome, reportSignalLifecycle, evaluateExit, recordExitOutcome } from "../lib/quantBrainClient";
 import type { BtcRegime, TradeOutcome } from "../lib/adaptiveEngine";
 import { feeDragRejectReason } from "../lib/executionRisk";
 import { buildTelemetryState } from "./telemetry";
@@ -95,6 +95,7 @@ interface DemoOpenTrade {
   leverage: number;
   marginUsed: number;
   expectedTpProfit: number;
+  aggressiveScore?: number;
 }
 
 declare module "express-session" {
@@ -1606,6 +1607,9 @@ interface DemoSniperState {
 
 // Module-level open trade registry (survives session loss, keyed by orderId)
 const sniperOpenTrades = new Map<string, DemoOpenTrade>();
+// Campaigns where exit intelligence has requested stacking be paused.
+// Cleared when ALLOW_STACKING fires or when the campaign fully closes.
+const sniperStackingBlockedCampaigns = new Set<string>();
 const sniperRecordedIds = new Set<string>();
 
 const demoSniper: DemoSniperState = {
@@ -1851,6 +1855,12 @@ async function runDemoSniperCycle(): Promise<void> {
         reportSignalLifecycle({ eventType: "duplicate_rejected", symbol: c.symbol, side: c.positionSide, score: c.score, isDemo: true, riskProfile: config.decisionProfile, metadata: { campaignAlreadyHasEntry } });
         skipped++; break;
       }
+      // Exit intelligence stacking gate: blocked if a live position in this campaign
+      // received CANCEL_STACKING from QB during the monitor cycle.
+      if (sniperStackingBlockedCampaigns.has(campaignIdPreview)) {
+        reportSignalLifecycle({ eventType: "duplicate_rejected", symbol: c.symbol, side: c.positionSide, score: c.score, isDemo: true, riskProfile: config.decisionProfile, metadata: { reason: "exit_intelligence_cancel_stacking", campaignId: campaignIdPreview } });
+        skipped++; break;
+      }
 
       const fallback = isFallbackMode();
 
@@ -1907,6 +1917,7 @@ async function runDemoSniperCycle(): Promise<void> {
           leverage: config.leverage,
           marginUsed: config.marginPerTrade,
           expectedTpProfit: config.marginPerTrade * config.leverage * (config.takeProfitPct / 100),
+          aggressiveScore: typeof c.score === "number" ? c.score : undefined,
         });
         reportSignalLifecycle({ eventType: "position_opened", symbol: c.symbol, side: c.positionSide, score: c.score, isDemo: true, riskProfile: config.decisionProfile, metadata: { orderId, entryPrice, leverage: config.leverage, margin: config.marginPerTrade } });
 
@@ -2043,6 +2054,67 @@ async function runDemoSniperMonitor(): Promise<void> {
         const markPrice = openMarkPrices.get(key);
         if (markPrice && markPrice > 0) {
           void updateOpenTradeMfe(storeEntry.tradeId, markPrice).catch(() => {});
+
+          // ── Exit Intelligence (fire-and-forget, never blocks monitor) ──────
+          const ageSeconds = (Date.now() - entry.entryTime) / 1000;
+          const margin = entry.marginUsed || 1;
+          const unrealizedPnl = entry.positionSide === "LONG"
+            ? (markPrice - entry.entryPrice) * entry.quantity
+            : (entry.entryPrice - markPrice) * entry.quantity;
+          const unrealizedPnlPct = (unrealizedPnl / margin) * 100;
+          const mfePct = (storeEntry.mfe / margin) * 100;
+          const maePct = (storeEntry.mae / margin) * 100;
+          const campaignDepth = getCampaignOpenCount(storeEntry.campaignId);
+          // Compute campaign drawdown from all open trades in the same campaign
+          const campaignTrades = getOpenTrades().filter(
+            (t) => t.campaignId === storeEntry.campaignId,
+          );
+          const totalCampaignMargin = campaignTrades.reduce(
+            (s, t) => s + (t.marginUsed || 0), margin,
+          );
+          const totalCampaignMae = campaignTrades.reduce(
+            (s, t) => s + (t.mae || 0), 0,
+          );
+          const campaignDrawdownPct = totalCampaignMargin > 0
+            ? (totalCampaignMae / totalCampaignMargin) * 100
+            : 0;
+
+          void evaluateExit({
+            symbol: entry.symbol,
+            positionSide: entry.positionSide,
+            orderId: entry.orderId,
+            entryPrice: entry.entryPrice,
+            currentPrice: markPrice,
+            unrealizedPnlPct,
+            ageSeconds,
+            tpPct: config.takeProfitPct,
+            slPct: config.stopLossPct,
+            mfePct,
+            maePct,
+            aggressiveScore: entry.aggressiveScore,
+            campaignDepth,
+            campaignDrawdownPct,
+            btcRegime: entry.btcRegime,
+          }).then((exitEval) => {
+            if (!exitEval) return;
+            // Update stacking gate based on QB recommendation
+            const se = getOpenTradeByOrderId(orderId);
+            if (!se) return;
+            if (exitEval.stackingAction === "CANCEL_STACKING") {
+              sniperStackingBlockedCampaigns.add(se.campaignId);
+            } else if (exitEval.stackingAction === "ALLOW_STACKING") {
+              sniperStackingBlockedCampaigns.delete(se.campaignId);
+            }
+            // Auto-close if QB recommends it and position is still live
+            if (exitEval.shouldClose && !sniperRecordedIds.has(orderId) && demoSniper.creds) {
+              void closeDemoMarket(
+                demoSniper.creds,
+                entry.symbol,
+                entry.positionSide,
+                entry.quantity,
+              ).catch(() => {});
+            }
+          }).catch(() => {});
         }
       }
       continue;
@@ -2126,6 +2198,36 @@ async function runDemoSniperMonitor(): Promise<void> {
       sniperRecordedIds.add(orderId);
       sniperOpenTrades.delete(orderId);
 
+      // ── Exit Outcome Recording (fire-and-forget) ──────────────────────────
+      // Enrich QB with post-trade quality classification for Coach Ranker learning.
+      {
+        const se = getOpenTradeByOrderId(orderId);
+        const margin = entry.marginUsed || 1;
+        const mfePctRecord = se ? (se.mfe / margin) * 100 : 0;
+        const maePctRecord = se ? (se.mae / margin) * 100 : 0;
+        const pnlPctRecord = (realizedPnl / margin) * 100;
+        const ageSecondsRecord = (exitTime - entry.entryTime) / 1000;
+        recordExitOutcome({
+          sourceId: entry.orderId,
+          symbol: entry.symbol,
+          positionSide: entry.positionSide,
+          entryPrice: entry.entryPrice,
+          exitPrice,
+          pnlPct: pnlPctRecord,
+          mfePct: mfePctRecord,
+          maePct: maePctRecord,
+          ageSeconds: ageSecondsRecord,
+          tpPct: config.takeProfitPct,
+          slPct: config.stopLossPct,
+          exitReason,
+          aggressiveScore: entry.aggressiveScore,
+          btcRegime: entry.btcRegime,
+          hourUtc: entry.hourUtc,
+          campaignId: se?.campaignId ?? "",
+          isDemo: true,
+        });
+      }
+
       // Close in durable store — idempotent
       const storeEntry = getOpenTradeByOrderId(orderId);
       if (storeEntry) {
@@ -2201,6 +2303,9 @@ async function runDemoSniperMonitor(): Promise<void> {
 
       // Single QB sync per campaign — the ML training boundary
       void syncQuantBrainOutcome(mlOutcome).catch(() => {});
+
+      // Exit intelligence cleanup — release stacking gate for closed campaigns
+      sniperStackingBlockedCampaigns.delete(campaignId);
 
       // Circuit breaker at campaign level
       if (co.realizedPnl > 0) recordTradeWin();

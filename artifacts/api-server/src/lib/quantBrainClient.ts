@@ -482,6 +482,105 @@ export interface QuantBrainIntelligence {
   errors: Record<string, string>;
 }
 
+// ── Exit Intelligence ─────────────────────────────────────────────────────────
+
+export interface ExitEvalInput {
+  symbol: string;
+  positionSide: "LONG" | "SHORT";
+  orderId: string;
+  entryPrice: number;
+  currentPrice: number;
+  unrealizedPnlPct: number;
+  ageSeconds: number;
+  tpPct: number;
+  slPct: number;
+  mfePct: number;
+  maePct: number;
+  aggressiveScore?: number;
+  campaignDepth: number;
+  campaignDrawdownPct: number;
+  btcRegime?: string;
+}
+
+export interface ExitEvalResult {
+  action: "HOLD" | "MOVE_STOP_TO_BREAKEVEN" | "TIGHTEN_STOP" | "TAKE_PARTIAL"
+    | "CLOSE_NOW" | "LET_WINNER_RUN" | "CANCEL_STACKING" | "ALLOW_STACKING";
+  confidence: number;
+  reason: string;
+  suggestedStopPct: number;
+  suggestedTakeProfitPct: number;
+  shouldClose: boolean;
+  shouldStack: boolean;
+  stackingAction: string | null;
+  protectionLevel: "normal" | "elevated" | "critical";
+  adaptiveTpSl: { tpPct: number; slPct: number; rationale: string };
+  context: {
+    momentumScore: number;
+    sniperDecision: string;
+    momentumAligned: boolean;
+    momentumReversed: boolean;
+    momentumWaning: boolean;
+    spreadBps: number;
+    spreadSpike: boolean;
+    pnlVsTp: number;
+    mfeVsTp: number;
+    gaveBackRatio: number;
+    ageRatio: number;
+    expectedDurationSec: number;
+  };
+  version: string;
+  evaluatedAt: number;
+}
+
+export interface ExitOutcomePayload {
+  sourceId: string;
+  symbol: string;
+  positionSide: "LONG" | "SHORT";
+  entryPrice?: number;
+  exitPrice?: number;
+  pnlPct: number;
+  mfePct: number;
+  maePct: number;
+  ageSeconds: number;
+  tpPct: number;
+  slPct: number;
+  exitReason: string;
+  exitActionTaken?: string;
+  aggressiveScore?: number;
+  btcRegime?: string;
+  hourUtc?: number;
+  campaignId?: string;
+  isDemo?: boolean;
+}
+
+const EXIT_EVAL_TIMEOUT_MS = 4_000;
+const EXIT_RECORD_TIMEOUT_MS = 5_000;
+
+/**
+ * Evaluate an open position for exit. Fire-and-forget friendly — returns null
+ * on QB unavailability so callers can safely ignore the result.
+ */
+export async function evaluateExit(
+  input: ExitEvalInput,
+): Promise<ExitEvalResult | null> {
+  if (!quantBrainEnabled()) return null;
+  try {
+    return await postJson<ExitEvalResult>("/exit/evaluate", input, EXIT_EVAL_TIMEOUT_MS);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Record post-trade exit outcome for QB learning. Fire-and-forget.
+ * Never blocks — silently drops on QB unavailability.
+ */
+export function recordExitOutcome(payload: ExitOutcomePayload): void {
+  if (!quantBrainEnabled()) return;
+  postJson<{ ok: boolean }>("/exit/record-outcome", payload, EXIT_RECORD_TIMEOUT_MS)
+    .catch(() => {});
+}
+
 export async function getQuantBrainIntelligence(
   input: QuantBrainEdgeInput,
 ): Promise<QuantBrainIntelligence> {
