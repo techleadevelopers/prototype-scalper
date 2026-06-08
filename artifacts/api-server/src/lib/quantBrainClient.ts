@@ -4,8 +4,9 @@ import fs from "fs";
 import path from "path";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
-import { canonicalMarketEventId } from "./marketDataQuality";
+import { canonicalMarketEventId, normalizeMarketSymbol } from "./marketDataQuality";
 import { validateLearningEligibility } from "./pipelineAuditor";
+import { logger } from "./logger";
 
 export const QUANT_BRAIN_CONTRACT_VERSION = "edge-v3";
 export const DEFAULT_FEATURE_VERSION = "sniper-v1";
@@ -17,6 +18,10 @@ const MAX_PREDICTION_AGE_MS = Math.max(
 const MAX_MARKET_DATA_AGE_MS = Math.max(
   1_000,
   Number(process.env["QUANT_BRAIN_MAX_MARKET_DATA_AGE_MS"] ?? 30_000),
+);
+const MAX_FEATURE_AGE_MS = Math.max(
+  1_000,
+  Number(process.env["QUANT_BRAIN_MAX_FEATURE_AGE_MS"] ?? 30_000),
 );
 
 // Keep Quant Brain calls bounded. Sniper execution must never wait minutes for
@@ -74,16 +79,36 @@ const OUTCOME_OUTBOX_PATH = process.env["QUANT_BRAIN_OUTBOX_PATH"]
   ?? path.join(process.cwd(), "data", "quant-brain-outbox.json");
 let outcomeSyncTimer: NodeJS.Timeout | null = null;
 let outcomeFlushInFlight = false;
+let outcomeOutboxLock: Promise<void> = Promise.resolve();
 let outcomeFlushFailures = 0;
 let outcomeFlushBatches = 0;
 let outcomeFlushRecords = 0;
 let retryBudgetUsed = 0;
 let retryBudgetResetAt = Date.now() + 60_000;
+const requestLatencySamples: number[] = [];
+const MAX_REQUEST_LATENCY_SAMPLES = 512;
+let requestCount = 0;
+let requestErrorCount = 0;
+let requestTimeoutCount = 0;
+let lastRequestError: string | null = null;
+let lastRequestErrorAt: number | null = null;
 let tradeSummaryCache: { value: QuantTradeSummary | null; expiresAt: number } | null = null;
 const recentTradesCache = new Map<string, { value: TradeOutcome[]; expiresAt: number }>();
 const intelligenceEdgeCache = new Map<string, { value: QuantBrainEdgeResult; expiresAt: number; staleUntil: number }>();
 const intelligenceEdgeInflight = new Map<string, Promise<QuantBrainEdgeResult>>();
 const sidecarCache = new Map<string, { value: unknown; expiresAt: number; staleUntil: number }>();
+
+async function withOutcomeOutboxLock<T>(fn: () => Promise<T>): Promise<T> {
+  const previous = outcomeOutboxLock;
+  let release!: () => void;
+  outcomeOutboxLock = new Promise<void>((resolve) => { release = resolve; });
+  await previous;
+  try {
+    return await fn();
+  } finally {
+    release();
+  }
+}
 
 // Max entries per unbounded Map — evict oldest when exceeded to prevent memory leak
 const MAX_CACHE_ENTRIES = 500;
@@ -155,6 +180,28 @@ function quantBrainUrl(): string | null {
 
 function quantBrainEnabled(): boolean {
   return process.env["QUANT_BRAIN_ENABLED"] !== "false";
+}
+
+function rememberRequestLatency(value: number): void {
+  requestLatencySamples.push(value);
+  if (requestLatencySamples.length > MAX_REQUEST_LATENCY_SAMPLES) {
+    requestLatencySamples.splice(0, requestLatencySamples.length - MAX_REQUEST_LATENCY_SAMPLES);
+  }
+}
+
+function percentile(values: number[], quantile: number): number {
+  if (values.length === 0) return 0;
+  const ordered = [...values].sort((a, b) => a - b);
+  const index = Math.min(ordered.length - 1, Math.floor((ordered.length - 1) * quantile));
+  return Number(ordered[index].toFixed(2));
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function isTimeoutError(error: unknown): boolean {
+  return error instanceof Error && (error.name === "AbortError" || /aborted|timeout/i.test(error.message));
 }
 
 function quantBrainHeaders(): Record<string, string> {
@@ -285,7 +332,19 @@ const OutcomeAckSchema = z.object({
   duplicate: z.boolean(),
 });
 
-function outcomeToQuantPayload(outcome: TradeOutcome): Record<string, unknown> {
+const OutcomeBatchAckItemSchema = z.object({
+  sourceId: z.string().min(1),
+  recorded: z.boolean(),
+  duplicate: z.boolean(),
+  blockedReasons: z.array(z.string()),
+  error: z.string().optional(),
+});
+
+const OutcomeBatchAckSchema = z.object({
+  items: z.array(OutcomeBatchAckItemSchema),
+});
+
+export function tradeOutcomeToQuantPayload(outcome: TradeOutcome): Record<string, unknown> {
   return {
     id: outcome.id,
     symbol: outcome.symbol,
@@ -349,12 +408,14 @@ function outcomeToQuantPayload(outcome: TradeOutcome): Record<string, unknown> {
     recommendedLeverage: outcome.recommendedLeverage,
     maxLossIfStop: outcome.maxLossIfStop,
     notional: outcome.notional,
+    sizing: outcome.sizing,
     modelVersion: outcome.modelVersion,
     aggressiveScore: outcome.aggressiveScore,
     executionPriority: outcome.executionPriority,
     coachScore: outcome.coachScore,
     playbookScore: outcome.playbookScore,
     playbook: outcome.playbook,
+    setup: outcome.setup,
     mlProbability: outcome.mlProbability ?? outcome.calibratedProbability,
     calibratedProbability: outcome.calibratedProbability ?? outcome.mlProbability,
     executionQuality: outcome.executionQuality,
@@ -375,6 +436,10 @@ function outcomeToQuantPayload(outcome: TradeOutcome): Record<string, unknown> {
   };
 }
 
+export function tradeOutcomesToQuantBatchPayload(outcomes: TradeOutcome[]): Record<string, unknown>[] {
+  return outcomes.map(tradeOutcomeToQuantPayload);
+}
+
 async function requestJson<T>(
   path: string,
   init: RequestInit,
@@ -392,6 +457,8 @@ async function requestJson<T>(
   const attempts = retryable ? 2 : 1;
   const attemptTimeoutMs = Math.max(1_000, timeoutMs);
   let lastError: unknown;
+  const startedAt = Date.now();
+  requestCount += 1;
 
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     const controller = new AbortController();
@@ -403,7 +470,9 @@ async function requestJson<T>(
         signal: controller.signal,
       });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      return await response.json() as T;
+      const value = await response.json() as T;
+      rememberRequestLatency(Date.now() - startedAt);
+      return value;
     } catch (error) {
       lastError = error;
       if (attempt + 1 < attempts && consumeRetryBudget()) {
@@ -417,6 +486,11 @@ async function requestJson<T>(
     }
   }
 
+  requestErrorCount += 1;
+  if (isTimeoutError(lastError)) requestTimeoutCount += 1;
+  lastRequestError = errorMessage(lastError);
+  lastRequestErrorAt = Date.now();
+  rememberRequestLatency(lastRequestErrorAt - startedAt);
   throw lastError instanceof Error ? lastError : new Error("Quant Brain unavailable");
 }
 
@@ -580,6 +654,7 @@ export async function getQuantBrainExecutionAudit(hours = 24): Promise<unknown |
 export async function syncQuantBrainOutcome(
   outcome: TradeOutcome,
 ): Promise<{ synced: boolean; error?: string }> {
+  return withOutcomeOutboxLock(async () => {
   if (!quantBrainEnabled()) return { synced: false, error: "disabled" };
   const eligibility = validateLearningEligibility(outcome);
   if (!eligibility.learningEligible) {
@@ -592,7 +667,7 @@ export async function syncQuantBrainOutcome(
   evictOldestPending();
   persistOutcomeOutbox();
   try {
-    const rawAck = await postJson<unknown>("/kb/trades", outcomeToQuantPayload(outcome), 30_000);
+    const rawAck = await postJson<unknown>("/kb/trades", tradeOutcomeToQuantPayload(outcome), 30_000);
     const ack = OutcomeAckSchema.parse(rawAck);
     if (ack.sourceId !== outcome.id) {
       throw new Error(`outcome acknowledgement mismatch: expected ${outcome.id}, got ${ack.sourceId}`);
@@ -606,24 +681,67 @@ export async function syncQuantBrainOutcome(
       error: err instanceof Error ? err.message : "unknown error",
     };
   }
+  });
 }
 
-async function flushPendingQuantBrainOutcomes(): Promise<void> {
+function persistBatchAckFailure(outcome: TradeOutcome, ack: z.infer<typeof OutcomeBatchAckItemSchema>): void {
+  const mutable = outcome as TradeOutcome & {
+    quantBrainLastAckAt?: number;
+    quantBrainLastError?: string;
+    quantBrainBlockedReasons?: string[];
+  };
+  mutable.quantBrainLastAckAt = Date.now();
+  if (ack.error) mutable.quantBrainLastError = ack.error;
+  if (ack.blockedReasons.length > 0) mutable.quantBrainBlockedReasons = ack.blockedReasons;
+}
+
+export async function flushPendingQuantBrainOutcomes(): Promise<void> {
+  return withOutcomeOutboxLock(async () => {
   if (!quantBrainEnabled() || pendingOutcomes.size === 0 || outcomeFlushInFlight) return;
   const batch = Array.from(pendingOutcomes.values()).slice(0, OUTCOME_SYNC_BATCH_SIZE);
   // Parallel flush — never wait 30s × N sequentially when QB is slow/down
   outcomeFlushInFlight = true;
   try {
-    await postJson<unknown>("/kb/trades/batch", batch.map(outcomeToQuantPayload), 30_000);
-    for (const outcome of batch) pendingOutcomes.delete(outcome.id);
-    persistOutcomeOutbox();
+    const rawAck = await postJson<unknown>("/kb/trades/batch", tradeOutcomesToQuantBatchPayload(batch), 30_000);
+    const ack = OutcomeBatchAckSchema.parse(rawAck);
+    const ackBySourceId = new Map(ack.items.map((item) => [item.sourceId, item]));
+    let changed = false;
+    let removed = 0;
+    for (const outcome of batch) {
+      const itemAck = ackBySourceId.get(outcome.id);
+      if (!itemAck) {
+        logger.warn({ sourceId: outcome.id }, "quant brain batch ack missing sourceId");
+        continue;
+      }
+      if (itemAck.recorded || itemAck.duplicate) {
+        pendingOutcomes.delete(outcome.id);
+        changed = true;
+        removed++;
+        logger.info({
+          sourceId: outcome.id,
+          recorded: itemAck.recorded,
+          duplicate: itemAck.duplicate,
+        }, "quant brain batch ack accepted");
+      } else {
+        persistBatchAckFailure(outcome, itemAck);
+        changed = true;
+        logger.warn({
+          sourceId: outcome.id,
+          blockedReasons: itemAck.blockedReasons,
+          error: itemAck.error,
+        }, "quant brain batch ack kept pending");
+      }
+    }
+    if (changed) persistOutcomeOutbox();
     outcomeFlushBatches++;
-    outcomeFlushRecords += batch.length;
-  } catch {
+    outcomeFlushRecords += removed;
+  } catch (err) {
+    logger.warn({ err }, "quant brain batch ack invalid or failed; keeping pending outcomes");
     outcomeFlushFailures++;
   } finally {
     outcomeFlushInFlight = false;
   }
+  });
 }
 
 export function startQuantBrainOutcomeSync(initialOutcomes: TradeOutcome[] = []): void {
@@ -656,6 +774,43 @@ export function getQuantBrainQueueStats() {
   };
 }
 
+export function getQuantBrainOperationalStats() {
+  return {
+    enabled: quantBrainEnabled(),
+    gateMode: quantBrainGateMode(),
+    urlConfigured: Boolean(quantBrainUrl()),
+    requestCount,
+    requestErrorCount,
+    requestTimeoutCount,
+    errorRate: requestCount > 0 ? requestErrorCount / requestCount : 0,
+    timeoutRate: requestCount > 0 ? requestTimeoutCount / requestCount : 0,
+    latencyMs: {
+      samples: requestLatencySamples.length,
+      p50: percentile(requestLatencySamples, 0.50),
+      p95: percentile(requestLatencySamples, 0.95),
+      p99: percentile(requestLatencySamples, 0.99),
+    },
+    lastRequestError,
+    lastRequestErrorAt,
+  };
+}
+
+export function _resetQuantBrainOutcomeStateForTesting(): void {
+  pendingOutcomes.clear();
+  if (outcomeSyncTimer) clearInterval(outcomeSyncTimer);
+  outcomeSyncTimer = null;
+  outcomeFlushInFlight = false;
+  outcomeFlushFailures = 0;
+  outcomeFlushBatches = 0;
+  outcomeFlushRecords = 0;
+  persistOutcomeOutbox();
+}
+
+export function _enqueueQuantBrainOutcomeForTesting(outcome: TradeOutcome): void {
+  pendingOutcomes.set(outcome.id, outcome);
+  persistOutcomeOutbox();
+}
+
 export interface SentimentContext {
   direction: "BULL" | "BEAR" | "NEUTRAL";
   confidence: number;
@@ -676,6 +831,7 @@ export interface QuantBrainEdgeInput {
   currentWinRate?: number;
   currentProfitFactor?: number;
   config: BotConfig;
+  costModel?: unknown;
   sentimentContext?: SentimentContext;
   // Contract v2 — signal provenance & lifecycle
   signalId?: string;
@@ -733,11 +889,28 @@ export function validateQuantBrainEdgeResponse(
   if (
     result.signalId !== request.signalId
     || result.marketEventId !== request.marketEventId
-    || result.symbol !== request.symbol.toUpperCase()
+    || normalizeMarketSymbol(result.symbol) !== normalizeMarketSymbol(request.symbol)
     || result.side !== request.side
     || result.positionSide !== request.positionSide
   ) {
     throw new Error("prediction provenance mismatch");
+  }
+  if (request.candleIsComplete === false) {
+    throw new Error("incomplete candle rejected");
+  }
+  if (request.featureTimestampMs !== undefined) {
+    if (!Number.isSafeInteger(request.featureTimestampMs) || request.featureTimestampMs <= 0) {
+      throw new Error("invalid feature timestamp");
+    }
+    if (request.featureTimestampMs > request.requestTimestamp) {
+      throw new Error("feature timestamp is in the future");
+    }
+    if (request.requestTimestamp - request.featureTimestampMs > MAX_FEATURE_AGE_MS) {
+      throw new Error("stale feature timestamp");
+    }
+    if (result.predictionTimestamp + 1_000 < request.featureTimestampMs) {
+      throw new Error("prediction predates feature timestamp");
+    }
   }
   if (now - result.predictionTimestamp > MAX_PREDICTION_AGE_MS) {
     throw new Error("stale prediction timestamp");
