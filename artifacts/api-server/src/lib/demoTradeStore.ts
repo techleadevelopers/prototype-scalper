@@ -75,6 +75,16 @@ export interface DemoTradeEntry {
   btcRegime: string;
   hourUtc: number;
   edgeScore: number | null;
+  stackingDepth?: number;
+  controlMaxEntries?: 1 | 3 | 5 | 10;
+  edgeAtInsertion?: number;
+  calibratedProbability?: number | null;
+  uncertaintyType?: string | null;
+  marketEventId?: string | null;
+  predictionId?: string | null;
+  featureVersion?: string | null;
+  stateFingerprint?: string | null;
+  correlationAdjustedExposure?: number;
   modelVersion: string | null;
   fallbackMode: boolean;
   mfe: number;
@@ -111,6 +121,12 @@ export interface DemoClosedTrade extends DemoTradeEntry {
  */
 export interface DemoCampaignOutcome {
   campaignId: string;
+  signalId: string;
+  marketEventId: string | null;
+  predictionId: string | null;
+  clientOrderId: string | null;
+  exchangeOrderId: string;
+  featureVersion: string | null;
   symbol: string;
   positionSide: "LONG" | "SHORT";
   side: "BUY" | "SELL";
@@ -267,6 +283,17 @@ export function resolveCampaignId(symbol: string, positionSide: "LONG" | "SHORT"
   return newId;
 }
 
+export function getActiveCampaignId(
+  symbol: string,
+  positionSide: "LONG" | "SHORT",
+  entryTime: number,
+): string | null {
+  const existing = _campaigns.get(`${symbol}:${positionSide}`);
+  return existing && (entryTime - existing.lastEntryAt) <= CAMPAIGN_WINDOW_MS
+    ? existing.campaignId
+    : null;
+}
+
 // ========== OPEN TRADE OPERATIONS ==========
 
 export async function persistOpenTrade(entry: Omit<DemoTradeEntry, "tradeId" | "campaignId" | "signalId"> & {
@@ -284,12 +311,16 @@ export async function persistOpenTrade(entry: Omit<DemoTradeEntry, "tradeId" | "
   const release = await acquireLock();
   try {
     const now = entry.entryTime || Date.now();
+    const campaignId = entry.campaignId ?? resolveCampaignId(entry.symbol, entry.positionSide, now);
+    const campaignSignalId = Array.from(_openTrades.values()).find(
+      (open) => open.campaignId === campaignId,
+    )?.signalId;
     const full: DemoTradeEntry = {
       ...entry,
       clientOrderId: entry.clientOrderId ?? null,
       tradeId: entry.tradeId ?? crypto.randomUUID(),
-      campaignId: entry.campaignId ?? resolveCampaignId(entry.symbol, entry.positionSide, now),
-      signalId: entry.signalId ?? crypto.randomUUID(),
+      campaignId,
+      signalId: entry.signalId ?? campaignSignalId ?? crypto.randomUUID(),
       mfe: entry.mfe ?? 0,
       mae: entry.mae ?? 0,
       mfeAt: entry.mfeAt ?? null,
@@ -307,6 +338,10 @@ export async function persistOpenTrade(entry: Omit<DemoTradeEntry, "tradeId" | "
 
     _openTrades.set(full.tradeId, full);
     _openByOrderId.set(full.orderId, full.tradeId);
+    _campaigns.set(`${full.symbol}:${full.positionSide}`, {
+      campaignId: full.campaignId,
+      lastEntryAt: full.entryTime,
+    });
     await rewriteOpenFile();
     return full;
   } finally {
@@ -523,6 +558,12 @@ export function buildCampaignOutcome(trades: DemoClosedTrade[]): DemoCampaignOut
 
   return {
     campaignId: first.campaignId,
+    signalId: first.signalId,
+    marketEventId: first.marketEventId ?? null,
+    predictionId: first.predictionId ?? null,
+    clientOrderId: first.clientOrderId,
+    exchangeOrderId: first.orderId,
+    featureVersion: first.featureVersion ?? null,
     symbol: first.symbol,
     positionSide: first.positionSide,
     side: first.side,
