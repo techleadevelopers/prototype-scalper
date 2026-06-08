@@ -63,6 +63,8 @@ def evaluate_exit(
     campaign_depth: int = 1,
     campaign_drawdown_pct: float = 0.0,
     btc_regime: str = "NEUTRAL",
+    regime_playbook: dict[str, Any] | None = None,
+    playbook: str | None = None,
 ) -> dict[str, Any]:
     """
     Evaluate an open position and recommend an exit action.
@@ -74,6 +76,11 @@ def evaluate_exit(
     unrealized_pnl_pct  Current unrealized P&L as % of margin
     campaign_drawdown_pct  Current campaign drawdown as % of margin (negative = loss)
     """
+    playbook_ctx = regime_playbook or {}
+    active_playbook = str(playbook or playbook_ctx.get("playbook") or "").upper()
+    active_regime = str(playbook_ctx.get("regime") or "").upper()
+    exit_policy = playbook_ctx.get("exitPolicy") or {}
+
     # ── Current market momentum via QB internal data ─────────────────────────
     target_moves: dict[str, float] = {
         "configured": tp_pct,
@@ -118,6 +125,12 @@ def evaluate_exit(
     pnl_vs_tp = unrealized_pnl_pct / tp_pct if tp_pct > 0 else 0.0
     mfe_vs_tp = mfe_pct / tp_pct if tp_pct > 0 else 0.0
     expected_dur = _expected_duration_sec(tp_pct, aggressive_score)
+    if active_playbook == "RANGE_QUICK_SCALP":
+        expected_dur *= 0.65
+    if active_regime == "LOW_LIQUIDITY" or exit_policy.get("reduceTimeInPosition"):
+        expected_dur *= 0.55
+    if active_regime == "NEWS_SPIKE":
+        expected_dur *= 0.70
     age_ratio = age_seconds / max(expected_dur, 60)
 
     # ── Defaults ─────────────────────────────────────────────────────────────
@@ -135,7 +148,38 @@ def evaluate_exit(
     # =========================================================================
 
     # 1. CRITICAL — Gave back > 55 % of peak (and peak was meaningful)
-    if mfe_vs_tp >= 0.80 and gave_back_ratio > 0.55:
+    if active_regime == "LOW_LIQUIDITY" and age_ratio > 1.1 and unrealized_pnl_pct <= 0:
+        action = "CLOSE_NOW"
+        confidence = 0.82
+        reason = "low_liquidity_time_risk"
+        should_close = True
+        protection_level = "critical"
+
+    elif active_regime == "HIGH_VOLATILITY_CHAOS" and pnl_vs_tp >= 0.35:
+        action = "MOVE_STOP_TO_BREAKEVEN"
+        confidence = 0.82
+        reason = "chaos_breakeven_fast"
+        suggested_stop = 0.0
+        protection_level = "elevated"
+        tp_rationale = "chaos_fast_breakeven"
+
+    elif active_regime == "NEWS_SPIKE" and mfe_vs_tp >= 0.35 and (momentum_waning or spread_spike):
+        action = "TIGHTEN_STOP"
+        confidence = 0.78
+        reason = "news_spike_tight_trailing"
+        suggested_stop = max(0.02, sl_pct * 0.35)
+        protection_level = "elevated"
+        tp_rationale = "news_tight_trailing"
+
+    elif active_playbook == "RANGE_QUICK_SCALP" and pnl_vs_tp >= 0.82:
+        action = "CLOSE_NOW"
+        confidence = 0.80
+        reason = "range_scalp_take_profit_fast"
+        should_close = True
+        protection_level = "elevated"
+        tp_rationale = "range_fast_tp"
+
+    elif mfe_vs_tp >= 0.80 and gave_back_ratio > 0.55:
         action = "CLOSE_NOW"
         confidence = 0.88
         reason = "gave_back_too_much_from_peak"
@@ -212,17 +256,21 @@ def evaluate_exit(
 
     # 10. LET WINNER RUN — High quality setup, momentum still expanding
     elif (
-        aggressive_score >= 0.75
+        aggressive_score >= (0.70 if active_playbook in {"MOMENTUM_BREAKOUT_SCALP", "BTC_LEAD_ALT_FOLLOW"} else 0.75)
         and momentum_score >= 0.68
         and momentum_aligned
         and pnl_vs_tp < 0.55
         and not spread_spike
         and age_seconds < expected_dur * 0.80
+        and active_playbook != "RANGE_QUICK_SCALP"
     ):
         action = "LET_WINNER_RUN"
         confidence = 0.62
         reason = "high_quality_momentum_expanding"
-        suggested_tp = round(tp_pct * 1.35, 4)
+        suggested_tp = round(
+            tp_pct * (1.45 if active_playbook in {"MOMENTUM_BREAKOUT_SCALP", "BTC_LEAD_ALT_FOLLOW"} else 1.35),
+            4,
+        )
         protection_level = "normal"
         tp_rationale = "extend_winner"
 
@@ -233,6 +281,12 @@ def evaluate_exit(
     stacking_action: str | None = None
 
     if campaign_drawdown_pct < -(sl_pct * 1.20):
+        should_stack = False
+        stacking_action = "CANCEL_STACKING"
+    elif active_regime in {"HIGH_VOLATILITY_CHAOS", "LOW_LIQUIDITY", "RECOVERY_AFTER_DRAWDOWN"}:
+        should_stack = False
+        stacking_action = "CANCEL_STACKING"
+    elif active_playbook == "RANGE_QUICK_SCALP" and campaign_depth >= 2:
         should_stack = False
         stacking_action = "CANCEL_STACKING"
     elif momentum_reversed or momentum_score < 0.28:
@@ -282,7 +336,9 @@ def evaluate_exit(
             "gaveBackRatio": round(gave_back_ratio, 3),
             "ageRatio": round(age_ratio, 3),
             "expectedDurationSec": round(expected_dur, 1),
+            "regime": active_regime or None,
+            "playbook": active_playbook or None,
         },
-        "version": "exit-intelligence-v1",
+        "version": "exit-intelligence-v2-playbook",
         "evaluatedAt": time.time(),
     }
