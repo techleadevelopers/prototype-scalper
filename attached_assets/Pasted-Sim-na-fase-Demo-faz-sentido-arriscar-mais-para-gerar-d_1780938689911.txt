@@ -1,0 +1,71 @@
+Sim, na fase Demo faz sentido arriscar mais para gerar dados. Mas a IA só vira “professor de scalping” se o sistema estiver aprendendo com dados bons e labels corretos. Pelo código, vocês já têm a base para isso, mas tem alguns pontos que precisam ficar muito claros.
+
+Hoje o sistema já registra:
+
+decisão do sniper
+contexto do mercado
+features do alt/BTC
+resultado depois da janela
+se bateu target antes do stop
+PnL real/demo
+contexto por símbolo, lado, regime e horário
+treino de shadow model com validação temporal
+Isso é o caminho certo.
+
+O risco é outro: se o Demo estiver operando muito, mas os labels forem ruins, a IA aprende errado. Exemplo: se uma operação fecha por monitor atrasado, preço errado, spread mal calculado ou evento duplicado, o modelo acha que aquele setup foi bom/ruim sem ser verdade.
+
+Para virar professor de verdade, a prioridade é:
+
+1. Operar agressivo no Demo.
+2. Registrar tudo.
+3. Separar decisão, execução e resultado.
+4. Aprender só com trades finalizados corretamente.
+5. Não deixar o modelo bloquear demais no começo.
+6. Usar o modelo primeiro para ranking, não para veto.
+Na fase atual, eu colocaria assim:
+
+Quant Brain = aluno/analista
+Sniper momentum = executor principal
+Demo VST = laboratório real
+Shadow model = professor em formação
+Realized PnL = prova final
+Ou seja: a IA ainda não deve mandar sozinha. Ela deve observar, ranquear e aprender. Quando tiver muitas amostras por contexto, aí sim começa a virar autoridade.
+
+O melhor pedido para o Replit agora seria:
+
+Estamos em fase Demo agressiva. O objetivo não é reduzir trades, é gerar aprendizado real para o sniper.
+
+Implementar modo `DEMO_LEARNING_AGGRESSIVE`:
+
+- Sniper momentum continua sendo autoridade principal.
+- Quant Brain não deve bloquear por EV/Sharpe/Kelly enquanto houver pouca amostra.
+- Quant Brain deve registrar todos os sinais: allow, wait, block, executados e não executados.
+- Aprendizado deve diferenciar:
+  - signal_generated
+  - signal_executed
+  - order_placed
+  - position_opened
+  - tp_hit
+  - sl_hit
+  - timeout
+  - manual_close
+  - api_error
+  - duplicate_rejected
+- Shadow model deve ranquear candidatos, não bloquear.
+- Depois de N trades por contexto, começar a penalizar setups ruins.
+- Só virar hard reject quando contexto tiver amostra suficiente e performance claramente negativa.
+E uma regra boa:
+
+0-50 trades por contexto: aprender, não bloquear
+50-150 trades: penalizar ranking
+150+ trades: permitir hard reject se comprovadamente ruim
+Para saber se a IA está evoluindo, acompanhe estas métricas:
+
+1. Win rate por contexto está estabilizando?
+2. Profit factor por símbolo/lado melhora com o tempo?
+3. O modelo está separando bons e ruins? AUC > 0.60 já é começo.
+4. Trades com score alto performam melhor que score baixo?
+5. Stacking depth 2, 3, 4 adiciona lucro ou só aumenta drawdown?
+6. O bot está aprendendo horários/símbolos ruins?
+7. O PnL após aplicar ranking é melhor que o baseline sem ranking?
+Se a resposta for sim, a IA está virando professor. Se ela só adiciona filtros e reduz operação sem melhorar PnL, ela está virando burocrata, não sniper.

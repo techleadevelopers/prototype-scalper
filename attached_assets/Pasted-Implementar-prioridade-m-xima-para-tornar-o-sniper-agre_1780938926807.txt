@@ -1,0 +1,144 @@
+Implementar prioridade máxima para tornar o sniper agressivo e escalável em Demo VST.
+
+Objetivo: operar vários scalps curtos em massa, com aprendizado real, sem transformar Quant Brain em juiz defensivo.
+
+## 1. Criar modo DEMO_LEARNING_AGGRESSIVE
+
+Config:
+
+QUANT_BRAIN_DECISION_PROFILE=demo_learning_aggressive
+
+Nesse modo:
+- Momentum/candle/volume são autoridade principal.
+- EV/Sharpe/Kelly/ML não bloqueiam em cold start.
+- Histórico ruim vira penalidade de ranking, não reject.
+- Só hard blocks fatais bloqueiam.
+
+## 2. Separar Quant Brain em Judge + Coach Ranker
+
+Judge Sniper bloqueia apenas:
+- dados stale/gapped
+- side mismatch
+- marketEventId duplicado
+- spread/liquidez absurda
+- maxConcurrentPositions
+- maxSessionLoss
+- hedge inválido
+- custo maior ou muito próximo do TP
+- símbolo fora da allowlist
+
+Coach Ranker calcula:
+- aggressiveScore
+- executionPriority
+- learningMode
+- score bucket
+- soft penalties
+- rank no ciclo
+
+## 3. Criar aggressiveScore
+
+Usar:
+
+aggressiveScore =
+  momentumScore * 0.35
++ candleScore * 0.20
++ volumeOiScore * 0.15
++ btcAlignmentScore * 0.10
++ dataFreshnessScore * 0.10
++ realizedEdgeScore * 0.05
++ shadowMlScore * 0.05
+- softPenalties
+
+Thresholds:
+- >= 0.55 allow
+- >= 0.68 priority
+- >= 0.78 aggressive/stacking
+
+## 4. Corrigir side mismatch
+
+Em `core/edge_gate.py`:
+
+Se sniper_decision == ALLOW_LONG e position_side != LONG:
+reject SNIPER_SIDE_MISMATCH
+
+Se sniper_decision == ALLOW_SHORT e position_side != SHORT:
+reject SNIPER_SIDE_MISMATCH
+
+Isso é hard block obrigatório.
+
+## 5. Corrigir volume_ratio
+
+Em `core/feature_engine.py`, não calcular volume_ratio com ticker 24h.
+
+Usar candles recentes:
+- pegar volume do último candle 1m ou 5m
+- média dos últimos 20 candles
+- volume_ratio = current_volume / avg_volume
+
+Para scalp curto, volume ratio precisa ser real.
+
+## 6. Implementar Mass Sniper Ranking
+
+No fluxo `/api/bot/sniper/mass`:
+
+- receber candidatos
+- chamar Quant Brain Judge/Coach
+- remover só hard rejects
+- ordenar por aggressiveScore desc
+- executar top N até:
+  - maxConcurrentPositions
+  - sniperMaxCandidatesPerCycle
+  - maxMarginUtilization
+  - maxPositionsPerSymbol
+  - cooldown/campaign rules
+
+Não exigir EV positivo comprovado em Demo Learning Aggressive.
+
+## 7. Stacking agressivo inteligente
+
+Regras:
+- depth 1-2: allow se Judge passa e aggressiveScore >= 0.55
+- depth 3-5: aggressiveScore >= 0.68
+- depth 6+: aggressiveScore >= 0.78 e campanha sem drawdown grave
+
+ML ajuda, mas não bloqueia cedo em cold start.
+
+## 8. Aprendizado obrigatório
+
+Registrar todo ciclo:
+- signal_generated
+- signal_executed
+- order_placed
+- position_opened
+- tp_hit
+- sl_hit
+- timeout
+- manual_close
+- api_error
+- duplicate_rejected
+
+Criar relatório:
+- win rate por score bucket
+- PnL por score bucket
+- profit factor por score bucket
+- melhores símbolos/lados
+- piores símbolos/lados
+- stacking depth performance
+- score alto performa melhor que score baixo?
+- Coach Ranker melhora contra baseline?
+
+## 9. Regra de amostra
+
+0-50 samples por contexto:
+- não bloquear por histórico
+- aprender
+
+50-150 samples:
+- histórico penaliza ranking
+
+150+ samples:
+- histórico pode virar hard reject se for comprovadamente tóxico
+
+## Resultado esperado
+
+O bot deve operar bastante em Demo, abrir várias posições quando houver momentum, e aprender quais setups realmente dão dinheiro. Quant Brain deve bloquear erro fatal, ranquear oportunidade e ensinar o sniper, não travar operação por excesso de defesa.

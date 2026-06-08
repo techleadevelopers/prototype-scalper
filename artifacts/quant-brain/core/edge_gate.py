@@ -363,6 +363,84 @@ async def _get_recent_returns(symbol: str, side: str, days: int = 30) -> list[fl
 
 # ========== FUNÇÃO PRINCIPAL EXISTENTE (COM ADIÇÕES) ==========
 
+def _compute_aggressive_score(
+    sniper: dict,
+    signal_edge: dict,
+    shadow_ml: dict,
+    btc_regime: str,
+    data_quality: dict,
+    score_penalties: float,
+    position_side: str,
+) -> float:
+    """
+    Aggressive composite score for entry decisions.
+    aggressiveScore = momentum*0.35 + candle*0.20 + volumeOI*0.15
+                    + btcAlignment*0.10 + freshData*0.10
+                    + realizedEdge*0.05 + shadowML*0.05 - penalties
+    """
+    alt_features = sniper.get("altFeatures") or {}
+    btc_features = sniper.get("btcFeatures") or {}
+
+    # 1. Momentum — sniper's 0-1 score (price accel, RSI, spread all baked in)
+    momentum_score = max(0.0, min(1.0, float(sniper.get("score", 0.0))))
+
+    # 2. Candle — use candleScore if provided, else derive from momentum
+    candle_score = max(0.0, min(1.0, float(sniper.get("candleScore", momentum_score * 0.85))))
+
+    # 3. Volume / OI — volume above average + OI moving = bullish confirmation
+    volume_ratio = float(alt_features.get("volume_ratio", 1.0))
+    oi_change_pct = float(alt_features.get("oi_change_pct", 0.0))
+    volume_oi_score = min(1.0, max(0.0,
+        0.50
+        + min(0.30, (volume_ratio - 1.0) * 0.15)
+        + min(0.20, abs(oi_change_pct) * 0.05)
+    ))
+
+    # 4. BTC alignment — regime match boosts, counter-regime reduces but does NOT block
+    want_long = position_side == "LONG"
+    btc_price_change = float(btc_features.get("price_change_pct", 0.0))
+    if btc_regime == "BULL" and want_long:
+        btc_alignment_score = 0.80
+    elif btc_regime == "BEAR" and not want_long:
+        btc_alignment_score = 0.80
+    elif btc_regime == "NEUTRAL":
+        btc_alignment_score = 0.50
+    else:
+        btc_alignment_score = 0.38  # counter-regime allowed, just lower score
+    if abs(btc_price_change) > 0.5:
+        btc_alignment_score = min(1.0, btc_alignment_score + 0.10)
+
+    # 5. Fresh data — average 1m/5m/BTC coverage
+    coverages = [
+        float((data_quality.get("alt1m") or {}).get("coveragePct", 0.0)),
+        float((data_quality.get("alt5m") or {}).get("coveragePct", 0.0)),
+        float((data_quality.get("btc1m") or {}).get("coveragePct", 0.0)),
+    ]
+    fresh_data_score = sum(coverages) / max(len(coverages), 1)
+
+    # 6. Realized edge — neutral when samples are too low (learning mode)
+    edge_score = float(signal_edge.get("score", 0.5))
+    edge_samples = int((signal_edge.get("symbolSide") or {}).get("samples", 0))
+    realized_edge_score = 0.50 if edge_samples < 5 else max(0.0, min(1.0, edge_score))
+
+    # 7. Shadow ML — neutral when no model yet
+    if shadow_ml.get("available") and shadow_ml.get("calibratedProbability") is not None:
+        shadow_ml_score = max(0.0, min(1.0, float(shadow_ml["calibratedProbability"])))
+    else:
+        shadow_ml_score = 0.50
+
+    raw = (
+        momentum_score      * 0.35
+        + candle_score      * 0.20
+        + volume_oi_score   * 0.15
+        + btc_alignment_score * 0.10
+        + fresh_data_score  * 0.10
+        + realized_edge_score * 0.05
+        + shadow_ml_score   * 0.05
+    )
+    return max(0.0, min(1.0, raw - score_penalties))
+
+
 async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
     symbol = str(payload.get("symbol", "")).upper()
     if symbol and not symbol.endswith("-USDT"):
@@ -373,6 +451,17 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
     hour_utc = int(payload.get("hourUtc", payload.get("hour_utc", now_hour)))
     config = payload.get("config") or {}
     gate_rejects: list[str] = []
+    # Risk profile controls how aggressively the gate filters entries.
+    # aggressive / sniper_max: EV/ML adjust ranking only; hard-blocks are minimal.
+    # balanced: EV becomes a penalty, hard-blocks remain.
+    # conservative: full defensive gating (original behaviour).
+    risk_profile = str(
+        config.get("riskProfile")
+        or payload.get("riskProfile")
+        or "balanced"
+    ).lower()
+    is_aggressive = risk_profile in ("aggressive", "sniper_max")
+    score_penalties: float = 0.0
 
     # ── Signal expiry check (contract v2) ──────────────────────────────────────
     signal_id = payload.get("signalId")
@@ -511,13 +600,29 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
     if sniper["decision"].startswith("BLOCK_"):
         gate_rejects.append(f"SNIPER_{sniper['decision']}: {','.join(sniper['reasons'])}")
     elif sniper["decision"] == "WAIT":
-        gate_rejects.append(f"SNIPER_WAIT: {','.join(sniper['reasons'])}")
+        if is_aggressive:
+            # In aggressive mode WAIT is not a blocker — momentum is the authority.
+            # Penalise the score instead.
+            score_penalties += 0.08
+        else:
+            gate_rejects.append(f"SNIPER_WAIT: {','.join(sniper['reasons'])}")
 
     if signal_edge["verdict"] == "toxic_context":
-        gate_rejects.append(
-            "SIGNAL_EDGE_REJECT: target-hit context degraded "
-            f"(score {signal_edge['score']:.4f})"
-        )
+        _se_samples = int((signal_edge.get("symbolSide") or {}).get("samples", 0))
+        if is_aggressive:
+            # In aggressive mode only block if truly destroyed with meaningful sample size
+            if _se_samples >= 30 and float(signal_edge.get("score", 1.0)) < 0.20:
+                gate_rejects.append(
+                    "SIGNAL_EDGE_REJECT: target-hit context severely degraded "
+                    f"(score {signal_edge['score']:.4f}, samples {_se_samples})"
+                )
+            else:
+                score_penalties += 0.05
+        else:
+            gate_rejects.append(
+                "SIGNAL_EDGE_REJECT: target-hit context degraded "
+                f"(score {signal_edge['score']:.4f})"
+            )
 
     margin = max(_num(config.get("marginPerTrade"), 1.0), 0.01)
     leverage = max(_num(config.get("leverage"), 1.0), 1.0)
@@ -525,7 +630,9 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
     configured_target_pct = float(signal_memory["targetMovesPct"].get("configured", 0.0))
     net_target_pct = configured_target_pct - cost_pct
     min_edge_over_cost_pct = _num(config.get("minEdgeOverCostPct"), 0.03)
-    if net_target_pct <= min_edge_over_cost_pct:
+    # In aggressive mode only block if TP is truly eaten by costs (net negative).
+    _cost_threshold = 0.0 if is_aggressive else min_edge_over_cost_pct
+    if net_target_pct <= _cost_threshold:
         gate_rejects.append(
             "COST_EDGE_REJECT: target movement does not clear execution costs and noise"
         )
@@ -543,8 +650,20 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
     net_target_usdt = max(0.0, net_target_pct) / 100 * notional
     loss_usdt = (stop_move_pct + cost_pct) / 100 * notional
     net_ev_usdt = hit_probability * net_target_usdt - (1 - hit_probability) * loss_usdt
-    if effective_stats.get("samples", 0) >= signal_edge["minSamples"] and net_ev_usdt <= 0:
-        gate_rejects.append(f"NET_EV_REJECT: expected value {net_ev_usdt:.4f} USDT")
+    _ev_samples = effective_stats.get("samples", 0)
+    if is_aggressive:
+        # In aggressive mode: only hard-block if large confirmed sample AND strongly negative EV.
+        # Otherwise let the score penalty system handle it.
+        if _ev_samples >= 30 and net_ev_usdt < -0.50:
+            gate_rejects.append(
+                f"NET_EV_REJECT: expected value {net_ev_usdt:.4f} USDT "
+                f"(hard-block: {_ev_samples} samples, strongly negative)"
+            )
+        elif _ev_samples >= signal_edge["minSamples"] and net_ev_usdt < 0:
+            score_penalties += 0.06  # EV negative but not yet confirmed catastrophe
+    else:
+        if _ev_samples >= signal_edge["minSamples"] and net_ev_usdt <= 0:
+            gate_rejects.append(f"NET_EV_REJECT: expected value {net_ev_usdt:.4f} USDT")
 
     shadow_ml = predict_shadow({
         "symbol": symbol,
@@ -569,8 +688,11 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
 
     if news_context["action"] == "block":
         gate_rejects.append("NEWS_RISK_REJECT: active high-impact event blocks entries")
-    elif news_context["action"] == "reduce_aggression" and signal_edge["score"] < 0.72:
-        gate_rejects.append("NEWS_RISK_REDUCE: news risk requires stronger target-hit edge")
+    elif news_context["action"] == "reduce_aggression":
+        if is_aggressive:
+            score_penalties += 0.06
+        elif signal_edge["score"] < 0.72:
+            gate_rejects.append("NEWS_RISK_REDUCE: news risk requires stronger target-hit edge")
 
     recommendation = await recommend_entry({
         "symbol": symbol,
@@ -582,8 +704,19 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
 
     stats = recommendation.get("stats", {}).get("symbolSide", {})
     samples = int(stats.get("samples", 0) or 0)
-    if samples >= recommendation.get("minSamplesForLiveGate", 8) and not recommendation.get("shadowRecommendation"):
-        gate_rejects.append(f"REALIZED_EDGE_REJECT: score {recommendation.get('score', 0):.4f}")
+    _realized_min = recommendation.get("minSamplesForLiveGate", 8)
+    if is_aggressive:
+        # In aggressive mode: only block if large sample AND score is genuinely toxic
+        if samples >= 20 and not recommendation.get("shadowRecommendation") and float(recommendation.get("score", 1.0)) < 0.25:
+            gate_rejects.append(
+                f"REALIZED_EDGE_REJECT: score {recommendation.get('score', 0):.4f} "
+                f"(hard-block: {samples} samples, toxic)"
+            )
+        elif samples >= _realized_min and not recommendation.get("shadowRecommendation"):
+            score_penalties += 0.05  # Not blocking, but reducing ranking
+    else:
+        if samples >= _realized_min and not recommendation.get("shadowRecommendation"):
+            gate_rejects.append(f"REALIZED_EDGE_REJECT: score {recommendation.get('score', 0):.4f}")
 
     # ========== NOVOS GATES DE EXCELÊNCIA ==========
 
@@ -591,17 +724,23 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
     volatility_regime, current_vol, vol_history = _calculate_volatility_regime_from_history(alt_history)
     adjusted_stop = _calculate_volatility_adjusted_stop(current_vol, stop_move_pct, volatility_regime)
 
-    # Threshold 2.5% to allow normal alt-coin volatility without blocking
-    if volatility_regime == "HIGH" and current_vol > 2.5:
-        gate_rejects.append(f"HIGH_VOLATILITY_REJECT: current vol {current_vol:.2f}% > 2.5%")
+    # Aggressive: raise threshold to 4%; below that add penalty instead of blocking
+    _vol_hard_threshold = 4.0 if is_aggressive else 2.5
+    if volatility_regime == "HIGH" and current_vol > _vol_hard_threshold:
+        gate_rejects.append(f"HIGH_VOLATILITY_REJECT: current vol {current_vol:.2f}% > {_vol_hard_threshold}%")
+    elif is_aggressive and volatility_regime == "HIGH" and current_vol > 2.5:
+        score_penalties += 0.08
 
     # 2. Sharpe Ratio de trades realizados
     recent_returns = await _get_recent_returns(symbol, position_side, days=30)
     realized_sharpe = _calculate_sharpe_from_trades(recent_returns)
 
-    # min 25 samples before Sharpe gate activates; threshold 0.3 to avoid blocking early-stage operation
+    # min 25 samples before Sharpe gate activates; in aggressive mode convert to score penalty
     if len(recent_returns) >= 25 and realized_sharpe < 0.3:
-        gate_rejects.append(f"LOW_REALIZED_SHARPE_REJECT: Sharpe {realized_sharpe:.2f} < 0.3")
+        if is_aggressive:
+            score_penalties += 0.05
+        else:
+            gate_rejects.append(f"LOW_REALIZED_SHARPE_REJECT: Sharpe {realized_sharpe:.2f} < 0.3")
 
     # 3. Correlação e Penalidade
     correlation = _calculate_correlation_from_history(alt_history, btc_history)
@@ -616,7 +755,10 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
     )
 
     if correlation_penalty < 0.7 and len(symbols_in_position) > 0:
-        gate_rejects.append(f"CORRELATION_PENALTY: {symbol} correlated with existing positions")
+        if is_aggressive:
+            score_penalties += 0.05
+        else:
+            gate_rejects.append(f"CORRELATION_PENALTY: {symbol} correlated with existing positions")
 
     # 4. Regime Confidence
     btc_trend_strength = sniper.get("btcFeatures", {}).get("price_change_pct", 0)
@@ -626,7 +768,10 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
 
     # Threshold 0.4 to allow entries in ambiguous but not chaotic regimes
     if regime_confidence["regime_confidence"] < 0.4:
-        gate_rejects.append(f"LOW_REGIME_CONFIDENCE: confidence {regime_confidence['regime_confidence']:.2f}")
+        if is_aggressive:
+            score_penalties += 0.05
+        else:
+            gate_rejects.append(f"LOW_REGIME_CONFIDENCE: confidence {regime_confidence['regime_confidence']:.2f}")
 
     # 5. Bootstrap EV Confidence
     ev_bootstrap = _calculate_bootstrap_ev_confidence(
@@ -635,7 +780,10 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
     )
 
     if ev_bootstrap["reliable"] and ev_bootstrap["ev_positive_confidence"] < 0.8:
-        gate_rejects.append(f"LOW_EV_CONFIDENCE: EV positive confidence {ev_bootstrap['ev_positive_confidence']:.0%}")
+        if is_aggressive:
+            score_penalties += 0.05
+        else:
+            gate_rejects.append(f"LOW_EV_CONFIDENCE: EV positive confidence {ev_bootstrap['ev_positive_confidence']:.0%}")
 
     # 6. Kelly Optimal Position Size
     equity_usdt = _num(payload.get("equityUsdt", 1000.0), 1000.0)
@@ -647,12 +795,7 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
     )
 
     suggested_margin = optimal_size["optimal_margin_usdt"]
-    if (
-        effective_stats.get("samples", 0) >= signal_edge["minSamples"]
-        and suggested_margin < 0.5
-        and equity_usdt >= 100
-    ):
-        gate_rejects.append(f"KELLY_REJECT: optimal margin {suggested_margin:.2f} USDT < 0.5")
+    # KELLY_REJECT removed — Kelly is used for position sizing guidance only, not as a hard gate.
 
     # 7. Microestrutura - Toxic Flow
     microstructure = data_quality["alt1m"].get("microstructure", {})
@@ -667,34 +810,56 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
     # 9. Divergência Preço-Volume
     delta_divergence = data_quality["alt1m"].get("deltaDivergence", {})
     if delta_divergence.get("divergence", False):
-        gate_rejects.append(f"DIVERGENCE: {delta_divergence.get('type', 'unknown')}")
+        if is_aggressive:
+            score_penalties += 0.05
+        else:
+            gate_rejects.append(f"DIVERGENCE: {delta_divergence.get('type', 'unknown')}")
 
     # 10. Structural Break
     structural_break = data_quality["alt5m"].get("structuralBreak", {})
     if structural_break.get("break_detected", False):
-        gate_rejects.append(f"STRUCTURAL_BREAK: {structural_break.get('direction', 'unknown')} break")
+        if is_aggressive:
+            score_penalties += 0.05
+        else:
+            gate_rejects.append(f"STRUCTURAL_BREAK: {structural_break.get('direction', 'unknown')} break")
 
-    allow = len(gate_rejects) == 0
-    score = min(
-        float(sniper.get("score", 0.0)),
-        float(recommendation.get("score", 0.5)),
-        float(signal_edge.get("score", 0.5)),
+    # ── Aggressive score (momentum-first composite) ───────────────────────────
+    aggressive_score = _compute_aggressive_score(
+        sniper=sniper,
+        signal_edge=signal_edge,
+        shadow_ml=shadow_ml,
+        btc_regime=btc_regime,
+        data_quality=data_quality,
+        score_penalties=score_penalties,
+        position_side=position_side,
     )
 
-    # Ajusta score com base na confiança do regime
-    score = score * regime_confidence["regime_confidence"]
+    allow = len(gate_rejects) == 0
 
-    # Penaliza por correlação
-    score = score * correlation_penalty
+    if is_aggressive:
+        # In aggressive mode, use the aggressive composite score as the primary score
+        score = aggressive_score
+    else:
+        score = min(
+            float(sniper.get("score", 0.0)),
+            float(recommendation.get("score", 0.5)),
+            float(signal_edge.get("score", 0.5)),
+        )
 
-    # Bônus para Sharpe alto
-    if realized_sharpe > 1.0 and score < 0.8:
-        score = min(0.85, score * 1.1)
+        # Ajusta score com base na confiança do regime
+        score = score * regime_confidence["regime_confidence"]
 
-    if news_context["action"] == "reduce_aggression":
-        score = min(score, max(0.0, score - 0.08))
-    if samples < recommendation.get("minSamplesForLiveGate", 8):
-        score = min(float(sniper.get("score", 0.0)), float(signal_edge.get("score", 0.5)))
+        # Penaliza por correlação
+        score = score * correlation_penalty
+
+        # Bônus para Sharpe alto
+        if realized_sharpe > 1.0 and score < 0.8:
+            score = min(0.85, score * 1.1)
+
+        if news_context["action"] == "reduce_aggression":
+            score = min(score, max(0.0, score - 0.08))
+        if samples < recommendation.get("minSamplesForLiveGate", 8):
+            score = min(float(sniper.get("score", 0.0)), float(signal_edge.get("score", 0.5)))
 
     # ── Sentiment alignment adjustment ──────────────────────────────────────────
     # Aligned 24h bias boosts score; counter-bias penalises it.
@@ -716,6 +881,9 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
         "allow": allow,
         "gateRejects": gate_rejects,
         "score": round(score, 4),
+        "aggressiveScore": round(aggressive_score, 4),
+        "scorePenalties": round(score_penalties, 4),
+        "riskProfile": risk_profile,
         "authority": "quant-brain",
         # Contract v2 — provenance & ML audit
         "signalId": signal_id,

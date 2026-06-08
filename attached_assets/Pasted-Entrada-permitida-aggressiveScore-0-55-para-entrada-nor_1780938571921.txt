@@ -1,0 +1,89 @@
+Entrada permitida:
+
+aggressiveScore >= 0.55 para entrada normal
+aggressiveScore >= 0.68 para entrada forte
+aggressiveScore >= 0.78 para stacking/aggressive burst
+EV não deve travar cold start
+Se samples históricos forem baixos:
+
+não bloquear
+usar sniper/momentum como autoridade
+marcar learningMode=true
+usar margem base menor ou normal
+Regra:
+
+if samples < minSamples:
+    do not reject by EV
+    allow if sniper momentum is strong
+Mass sniper
+O mass sniper deve abrir várias posições, mas por ranking:
+
+Gera todos candidatos.
+Remove só hard-blocks.
+Ordena por aggressiveScore.
+Executa até:
+maxConcurrentPositions
+sniperMaxCandidatesPerCycle
+maxMarginUtilization
+limite por símbolo/stacking
+Não exigir que todos tenham EV comprovado.
+
+Stacking
+Stacking deve ser permitido quando:
+
+mesma direção
+edge atual não desabou
+candle ainda confirma
+não passou cooldown mínimo
+campanha não está em drawdown grave
+Não exigir ML perfeito para stack inicial. Exigir ML só para stack profundo.
+
+Sugestão:
+
+depth 1-2: momentum/candle suficiente
+depth 3-5: exigir calibratedProbability >= 0.52 ou strong edge
+depth 6+: exigir calibratedProbability >= 0.58 e sem drawdown de campanha
+Alteração no edge gate
+Trocar rejects defensivos por score penalties.
+
+Exemplo:
+
+LOW_REGIME_CONFIDENCE: penalidade, não reject
+LOW_EV_CONFIDENCE: penalidade, não reject
+LOW_REALIZED_SHARPE: penalidade, não reject
+KELLY_REJECT: remover como reject
+REALIZED_EDGE_REJECT: só reject se amostra grande e muito negativa
+SIGNAL_EDGE_REJECT: só reject se contexto tóxico com amostra suficiente
+Regra para contexto tóxico
+if samples >= 30 and EV muito negativo:
+    reject
+elif samples >= 12 and performance ruim:
+    reduce score
+else:
+    do not block
+O que deve continuar agressivo
+Config recomendada para sniper demo/agressivo:
+
+maxConcurrentPositions: 10 a 20
+sniperMaxCandidatesPerCycle: 5 a 10
+positionStackingEnabled: true
+maxPositionsPerSymbol: 3 a 5
+sniperMinCombinedScore: 0.45 a 0.55
+quantBrainGateMode: shadow ou soft-enforce
+EV gates como soft penalty, não hard block
+Pedido para implementar
+Implementar modo novo:
+
+QUANT_BRAIN_RISK_PROFILE=aggressive
+Perfis:
+
+conservative: EV/ML bloqueiam mais
+balanced: EV vira penalty, hard blocks normais
+aggressive: momentum é autoridade, EV/ML só ajustam ranking
+sniper_max: só hard blocks críticos, abre por ranking até capacidade
+No modo aggressive/sniper_max:
+
+permitir operação mesmo sem histórico suficiente
+priorizar momentum real-time
+abrir múltiplas posições por ciclo
+usar EV histórico para reduzir tamanho/ranking, não para impedir entrada
