@@ -19,6 +19,7 @@ export const BINGX_ENDPOINTS: Record<ExecutionEnvironment, string> = {
 };
 
 const LIVE_CONFIRMATION = "I_ACKNOWLEDGE_REAL_MONEY";
+const MIN_ADMIN_TOKEN_LENGTH = 32;
 const SECRET_KEY_PATTERN = /(authorization|cookie|password|secret|token|api[-_]?key|signature)/i;
 const SECRET_VALUE_PATTERN = /((?:api[-_]?key|secret|token|authorization|signature)\s*[=:]\s*)[^\s,;]+/gi;
 
@@ -59,7 +60,10 @@ export function validateExecutionStartup(env: NodeJS.ProcessEnv = process.env): 
       throw new Error("Startup refused: REAL_EXECUTION_CONFIRMATION is invalid.");
     }
     required(env, "LIVE_ACCOUNT_ID");
-    required(env, "ADMIN_API_TOKEN");
+    const adminToken = required(env, "ADMIN_API_TOKEN");
+    if (adminToken.length < MIN_ADMIN_TOKEN_LENGTH) {
+      throw new Error(`Startup refused: ADMIN_API_TOKEN must be at least ${MIN_ADMIN_TOKEN_LENGTH} characters in live environment.`);
+    }
     if (env.LOAD_PERSISTED_CONFIG === "true") {
       throw new Error("Startup refused: live execution cannot load persisted runtime configuration.");
     }
