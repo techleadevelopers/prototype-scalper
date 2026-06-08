@@ -10,6 +10,7 @@ import json
 import os
 import time
 import asyncio
+import hashlib
 from collections import OrderedDict
 from dataclasses import dataclass, asdict
 from typing import Optional, Any
@@ -175,6 +176,28 @@ CREATE TABLE IF NOT EXISTS signal_outcomes (
     first_event_seconds REAL,
     max_favorable_pct REAL,
     max_adverse_pct REAL,
+    market_event_id TEXT,
+    feature_timestamp REAL,
+    decision_timestamp REAL,
+    reference_price REAL,
+    bid REAL,
+    ask REAL,
+    spread_bps REAL,
+    position_side TEXT,
+    playbook TEXT,
+    regime TEXT,
+    setup_type TEXT,
+    raw_score REAL,
+    calibrated_score REAL,
+    policy_version TEXT,
+    config_version TEXT,
+    feature_version TEXT,
+    label_version TEXT,
+    label_source TEXT,
+    outcome_source_id TEXT,
+    allowed INTEGER,
+    reject_reasons TEXT,
+    expires_at REAL,
     finalized INTEGER DEFAULT 0,
     created_at REAL NOT NULL,
     finalized_at REAL
@@ -434,6 +457,13 @@ async def init_db():
             "recommended_leverage": "REAL",
             "max_loss_if_stop": "REAL",
             "notional": "REAL",
+            "strategy_version": "TEXT",
+            "config_version": "TEXT",
+            "model_version": "TEXT",
+            "label_version": "TEXT",
+            "market_event_id": "TEXT",
+            "source_type": "TEXT",
+            "sizing_json": "TEXT",
         }
         for name, definition in trade_migrations.items():
             if name not in trade_columns:
@@ -457,6 +487,27 @@ async def init_db():
         signal_columns = await table_columns("signal_outcomes", DB_PATH)
         signal_migrations = {
             "market_event_id": "TEXT",
+            "feature_timestamp": "REAL",
+            "decision_timestamp": "REAL",
+            "reference_price": "REAL",
+            "bid": "REAL",
+            "ask": "REAL",
+            "spread_bps": "REAL",
+            "position_side": "TEXT",
+            "playbook": "TEXT",
+            "regime": "TEXT",
+            "setup_type": "TEXT",
+            "raw_score": "REAL",
+            "calibrated_score": "REAL",
+            "policy_version": "TEXT",
+            "config_version": "TEXT",
+            "feature_version": "TEXT",
+            "label_version": "TEXT",
+            "label_source": "TEXT",
+            "outcome_source_id": "TEXT",
+            "allowed": "INTEGER",
+            "reject_reasons": "TEXT",
+            "expires_at": "REAL",
         }
         for name, definition in signal_migrations.items():
             if name not in signal_columns:
@@ -469,6 +520,10 @@ async def init_db():
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_signal_hit_rate "
             "ON signal_outcomes(hit_configured)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_signal_market_event "
+            "ON signal_outcomes(market_event_id)"
         )
         await db.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_source_id "
@@ -629,9 +684,17 @@ async def record_trade_outcome(
     recommended_leverage: float | None = None,
     max_loss_if_stop: float | None = None,
     notional: float | None = None,
+    strategy_version: str | None = None,
+    config_version: str | None = None,
+    model_version: str | None = None,
+    label_version: str | None = None,
+    market_event_id: str | None = None,
+    source_type: str | None = None,
+    sizing: Any | None = None,
 ) -> bool:
     """Registra outcome de trade com métricas avançadas."""
     win = 1 if pnl_pct > 0 else 0
+    sizing_json = json.dumps(sizing, separators=(",", ":"), sort_keys=True) if sizing is not None else None
     async with connect(DB_PATH) as db:
         if source_id:
             existing = await (await db.execute(
@@ -644,15 +707,42 @@ async def record_trade_outcome(
                        SET source=?, is_demo=?, symbol=?, side=?, entry_price=?, exit_price=?,
                            pnl_pct=?, pnl_usdt=?, win=?, oi_at_entry=?, funding_at_entry=?,
                            volume_ratio=?, btc_regime=?, rsi_at_entry=?, ema_cross=?,
-                           slippage_bps=?, fee_paid_usdt=?, experiment_id=?, experiment_arm=?,
-                           policy_version=?, campaign_id=?, mfe_pct=?, mae_pct=?,
-                           exit_reason=?, latency_drag_usdt=?, regime=?, playbook=?,
-                           setup_type=?, regime_confidence=?, playbook_version=?,
-                           stacking_depth=?, execution_priority=?, coach_score=?,
-                           playbook_score=?, ml_probability=?, execution_quality=?,
-                           signal_id=?, entry_aggressive_score=?, risk_tier=?,
-                           size_multiplier=?, size_reason=?, recommended_margin=?,
-                           recommended_leverage=?, max_loss_if_stop=?, notional=?,
+                           slippage_bps=?, fee_paid_usdt=?,
+                           experiment_id=COALESCE(?, experiment_id),
+                           experiment_arm=COALESCE(?, experiment_arm),
+                           policy_version=COALESCE(?, policy_version),
+                           campaign_id=COALESCE(?, campaign_id),
+                           mfe_pct=COALESCE(?, mfe_pct),
+                           mae_pct=COALESCE(?, mae_pct),
+                           exit_reason=COALESCE(?, exit_reason),
+                           latency_drag_usdt=COALESCE(?, latency_drag_usdt),
+                           regime=COALESCE(?, regime),
+                           playbook=COALESCE(?, playbook),
+                           setup_type=COALESCE(?, setup_type),
+                           regime_confidence=COALESCE(?, regime_confidence),
+                           playbook_version=COALESCE(?, playbook_version),
+                           stacking_depth=COALESCE(?, stacking_depth),
+                           execution_priority=COALESCE(?, execution_priority),
+                           coach_score=COALESCE(?, coach_score),
+                           playbook_score=COALESCE(?, playbook_score),
+                           ml_probability=COALESCE(?, ml_probability),
+                           execution_quality=COALESCE(?, execution_quality),
+                           signal_id=COALESCE(?, signal_id),
+                           entry_aggressive_score=COALESCE(?, entry_aggressive_score),
+                           risk_tier=COALESCE(?, risk_tier),
+                           size_multiplier=COALESCE(?, size_multiplier),
+                           size_reason=COALESCE(?, size_reason),
+                           recommended_margin=COALESCE(?, recommended_margin),
+                           recommended_leverage=COALESCE(?, recommended_leverage),
+                           max_loss_if_stop=COALESCE(?, max_loss_if_stop),
+                           notional=COALESCE(?, notional),
+                           strategy_version=COALESCE(?, strategy_version),
+                           config_version=COALESCE(?, config_version),
+                           model_version=COALESCE(?, model_version),
+                           label_version=COALESCE(?, label_version),
+                           market_event_id=COALESCE(?, market_event_id),
+                           source_type=COALESCE(?, source_type),
+                           sizing_json=COALESCE(?, sizing_json),
                            timestamp=?
                        WHERE source_id=?""",
                     (source, 1 if is_demo else 0, symbol, side, entry_price, exit_price,
@@ -665,9 +755,13 @@ async def record_trade_outcome(
                      playbook_score, ml_probability, execution_quality,
                      signal_id, entry_aggressive_score, risk_tier, size_multiplier,
                      size_reason, recommended_margin, recommended_leverage,
-                     max_loss_if_stop, notional, time.time(), source_id)
+                     max_loss_if_stop, notional, strategy_version, config_version,
+                     model_version, label_version, market_event_id, source_type,
+                     sizing_json, time.time(), source_id)
                 )
                 await db.commit()
+                if signal_id:
+                    await reconcile_signal_outcome(signal_id, source_id or "", win == 1)
                 return True
 
         cursor = await db.execute(
@@ -682,8 +776,10 @@ async def record_trade_outcome(
                 ml_probability, execution_quality, signal_id, entry_aggressive_score,
                 risk_tier, size_multiplier, size_reason, recommended_margin,
                 recommended_leverage, max_loss_if_stop, notional,
+                strategy_version, config_version, model_version, label_version,
+                market_event_id, source_type, sizing_json,
                 timestamp)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(source_id) DO NOTHING""",
             (source_id, source, 1 if is_demo else 0, symbol, side, entry_price, exit_price, pnl_pct, pnl_usdt, win,
              oi_change, funding, volume_ratio, btc_regime,
@@ -695,6 +791,8 @@ async def record_trade_outcome(
              ml_probability, execution_quality, signal_id, entry_aggressive_score,
              risk_tier, size_multiplier, size_reason, recommended_margin,
              recommended_leverage, max_loss_if_stop, notional,
+             strategy_version, config_version, model_version, label_version,
+             market_event_id, source_type, sizing_json,
              time.time())
         )
         if source_id and int(getattr(cursor, "rowcount", 0) or 0) == 0:
@@ -702,6 +800,8 @@ async def record_trade_outcome(
         await _update_hourly_metrics(db, symbol, side, pnl_pct, win)
         await _update_daily_metrics(db, symbol, side, pnl_pct, win)
         await db.commit()
+        if signal_id:
+            await reconcile_signal_outcome(signal_id, source_id or "", win == 1)
         return True
 
 
@@ -799,6 +899,26 @@ async def record_signal_decision(
     entry_price: float,
     estimated_cost_pct: float,
     target_moves: dict[str, float],
+    market_event_id: str | None = None,
+    feature_timestamp: float | None = None,
+    decision_timestamp: float | None = None,
+    reference_price: float | None = None,
+    bid: float | None = None,
+    ask: float | None = None,
+    spread_bps: float | None = None,
+    position_side: str | None = None,
+    playbook: str | None = None,
+    regime: str | None = None,
+    setup_type: str | None = None,
+    raw_score: float | None = None,
+    calibrated_score: float | None = None,
+    policy_version: str | None = None,
+    config_version: str | None = None,
+    feature_version: str | None = None,
+    label_version: str | None = None,
+    allowed: bool | None = None,
+    reject_reasons: list | None = None,
+    expires_at: float | None = None,
 ) -> bool:
     if entry_price <= 0:
         return False
@@ -811,8 +931,13 @@ async def record_signal_decision(
                     entry_price, estimated_cost_pct,
                     target_configured_move_pct, target_050_move_pct,
                     target_100_move_pct, target_200_move_pct,
+                    market_event_id, feature_timestamp, decision_timestamp,
+                    reference_price, bid, ask, spread_bps, position_side,
+                    playbook, regime, setup_type, raw_score, calibrated_score,
+                    policy_version, config_version, feature_version, label_version,
+                    allowed, reject_reasons, expires_at,
                     created_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     signal_id,
                     symbol,
@@ -831,7 +956,27 @@ async def record_signal_decision(
                     float(target_moves.get("0.5", 0)),
                     float(target_moves.get("1.0", 0)),
                     float(target_moves.get("2.0", 0)),
-                    time.time(),
+                    market_event_id,
+                    feature_timestamp,
+                    decision_timestamp,
+                    reference_price,
+                    bid,
+                    ask,
+                    spread_bps,
+                    position_side,
+                    playbook,
+                    regime,
+                    setup_type,
+                    raw_score,
+                    calibrated_score,
+                    policy_version,
+                    config_version,
+                    feature_version,
+                    label_version,
+                    None if allowed is None else (1 if allowed else 0),
+                    json.dumps(reject_reasons or []),
+                    expires_at,
+                    decision_timestamp or time.time(),
                 ),
             )
             await db.commit()
@@ -858,6 +1003,67 @@ async def get_pending_signal_outcomes(min_age_seconds: int = 300, limit: int = 2
             d["reasons"] = json.loads(d["reasons"])
             result.append(d)
         return result
+
+
+async def update_signal_decision_audit(
+    signal_id: str,
+    *,
+    allowed: bool,
+    reject_reasons: list,
+    raw_score: float | None = None,
+    calibrated_score: float | None = None,
+    policy_version: str | None = None,
+    playbook: str | None = None,
+    regime: str | None = None,
+    setup_type: str | None = None,
+) -> None:
+    async with connect(DB_PATH) as db:
+        await db.execute(
+            """UPDATE signal_outcomes
+               SET allowed=?,
+                   reject_reasons=?,
+                   raw_score=COALESCE(?, raw_score),
+                   calibrated_score=COALESCE(?, calibrated_score),
+                   policy_version=COALESCE(?, policy_version),
+                   playbook=COALESCE(?, playbook),
+                   regime=COALESCE(?, regime),
+                   setup_type=COALESCE(?, setup_type)
+               WHERE signal_id=?""",
+            (
+                1 if allowed else 0,
+                json.dumps(reject_reasons or []),
+                raw_score,
+                calibrated_score,
+                policy_version,
+                playbook,
+                regime,
+                setup_type,
+                signal_id,
+            ),
+        )
+        await db.commit()
+
+
+async def reconcile_signal_outcome(signal_id: str, outcome_source_id: str, won: bool) -> bool:
+    if not signal_id:
+        return False
+    now = time.time()
+    async with connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """UPDATE signal_outcomes
+               SET hit_configured=?,
+                   finalized=1,
+                   finalized_at=?,
+                   label_source='realized_campaign',
+                   outcome_source_id=COALESCE(NULLIF(outcome_source_id, ''), ?),
+                   label_version=COALESCE(label_version, 'campaign-pnl-v1')
+               WHERE signal_id=?
+                 AND source_type='vst_campaign'
+                 AND (outcome_source_id IS NULL OR outcome_source_id='' OR outcome_source_id=?)""",
+            (1 if won else 0, now, outcome_source_id, signal_id, outcome_source_id),
+        )
+        await db.commit()
+        return int(getattr(cursor, "rowcount", 0) or 0) > 0
 
 
 async def finalize_signal_outcome(
@@ -971,11 +1177,16 @@ async def get_signal_training_rows(
             f"""SELECT signal_id, symbol, side, decision, decision_group,
                       context_key, features,
                       target_configured_move_pct, estimated_cost_pct, hit_configured,
-                      stopped, first_event, created_at
+                      stopped, first_event, created_at,
+                      COALESCE(label_source, 'hypothetical') AS label_source,
+                      outcome_source_id,
+                      feature_version,
+                      label_version
                FROM signal_outcomes
                WHERE finalized=1
                  {source_filter}
                  AND hit_configured IS NOT NULL
+                 AND (finalized_at IS NULL OR finalized_at >= created_at)
                  {decision_filter}
                ORDER BY created_at ASC
                LIMIT ?""",
@@ -987,6 +1198,65 @@ async def get_signal_training_rows(
         item["features"] = json.loads(item["features"])
         result.append(item)
     return result
+
+
+def signal_dataset_fingerprint(rows: list[dict]) -> str:
+    payload = [
+        {
+            "signal_id": row.get("signal_id"),
+            "hit_configured": row.get("hit_configured"),
+            "label_source": row.get("label_source"),
+            "created_at": row.get("created_at"),
+        }
+        for row in rows
+    ]
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+async def get_signal_readiness_diagnostics(
+    min_samples: int = 300,
+    source_type: str | None = "vst_campaign",
+) -> dict:
+    rows = await get_signal_training_rows(source_type=source_type)
+    source_filter = ""
+    params: list[Any] = []
+    if source_type:
+        source_filter = "AND source_type=?"
+        params.append(source_type)
+    stale_cutoff = time.time() - max(SIGNAL_OUTCOME_MIN_AGE_SECONDS if "SIGNAL_OUTCOME_MIN_AGE_SECONDS" in globals() else 300, 300)
+    async with connect(DB_PATH) as db:
+        pending = await (await db.execute(
+            f"""SELECT COUNT(*) FROM signal_outcomes
+                WHERE finalized=0 AND created_at <= ? {source_filter}""",
+            (stale_cutoff, *params),
+        )).fetchone()
+        invalid = await (await db.execute(
+            f"""SELECT COUNT(*) FROM signal_outcomes
+                WHERE finalized=1 AND finalized_at IS NOT NULL
+                  AND finalized_at < created_at {source_filter}""",
+            tuple(params),
+        )).fetchone()
+    samples = len(rows)
+    hits = sum(1 for row in rows if int(row.get("hit_configured") or 0) == 1)
+    misses = samples - hits
+    minority = min(hits, misses) / samples if samples else 0.0
+    if samples < min_samples:
+        state = "COLLECTING"
+    elif hits == 0 or misses == 0 or minority < 0.10:
+        state = "CLASS_IMBALANCED"
+    else:
+        state = "READY"
+    return {
+        "state": state,
+        "samples": samples,
+        "hits": hits,
+        "misses": misses,
+        "minorityClassRatio": round(minority, 6),
+        "stalePending": int((pending or (0,))[0] or 0),
+        "invalidOrLeakyLabels": int((invalid or (0,))[0] or 0),
+        "datasetFingerprint": signal_dataset_fingerprint(rows),
+    }
 
 
 async def get_signal_training_summary(
@@ -1100,6 +1370,238 @@ async def get_signal_source_summary() -> list[dict]:
         }
         for row in rows
     ]
+
+
+def _safe_json_loads(raw: Any, fallback: Any) -> Any:
+    if raw is None:
+        return fallback
+    if isinstance(raw, (dict, list)):
+        return raw
+    try:
+        return json.loads(raw)
+    except Exception:
+        return fallback
+
+
+def _score_bucket(score: float | None) -> str:
+    if score is None:
+        return "unknown"
+    if score < 0.40:
+        return "0.00-0.39"
+    if score < 0.55:
+        return "0.40-0.54"
+    if score < 0.70:
+        return "0.55-0.69"
+    if score < 0.85:
+        return "0.70-0.84"
+    return "0.85-1.00"
+
+
+def _pct(value: float, total: int) -> float:
+    return round(value / total, 6) if total else 0.0
+
+
+async def get_sniper_reconciliation_status(days: int = 30, limit: int = 10000) -> dict:
+    since = time.time() - max(1, int(days or 30)) * 86400
+    limit = max(1, min(int(limit or 10000), 50000))
+    async with connect(DB_PATH) as db:
+        db.row_factory = Row
+        signals = await (await db.execute(
+            """SELECT *
+               FROM signal_outcomes
+               WHERE created_at >= ? AND finalized=1
+               ORDER BY created_at ASC
+               LIMIT ?""",
+            (since, limit),
+        )).fetchall()
+        trades = await (await db.execute(
+            """SELECT *
+               FROM trade_outcomes
+               WHERE timestamp >= ?
+               ORDER BY timestamp ASC
+               LIMIT ?""",
+            (since, limit),
+        )).fetchall()
+
+    trades_by_signal: dict[str, dict] = {}
+    trades_by_event: dict[str, dict] = {}
+    for row in trades:
+        trade = dict(row)
+        sid = str(trade.get("signal_id") or "")
+        mid = str(trade.get("market_event_id") or "")
+        if sid and sid not in trades_by_signal:
+            trades_by_signal[sid] = trade
+        if mid and mid not in trades_by_event:
+            trades_by_event[mid] = trade
+
+    counts = {
+        "totalDecisions": 0,
+        "executedDecisions": 0,
+        "shadowOnlyDecisions": 0,
+        "missedWins": 0,
+        "avoidedLosses": 0,
+        "badBlocks": 0,
+        "goodBlocks": 0,
+        "executionLosses": 0,
+        "strategyLosses": 0,
+    }
+    classifications: dict[str, int] = {
+        "WOULD_HAVE_WON": 0,
+        "WOULD_HAVE_LOST": 0,
+        "EXECUTED_AND_WON": 0,
+        "EXECUTED_AND_LOST": 0,
+        "MISSED_WIN": 0,
+        "AVOIDED_LOSS": 0,
+        "BAD_BLOCK": 0,
+        "GOOD_BLOCK": 0,
+        "EXECUTION_LOSS": 0,
+        "STRATEGY_LOSS": 0,
+    }
+    reject_stats: dict[str, dict[str, int]] = {}
+    playbook_stats: dict[str, dict[str, int]] = {}
+    bucket_stats: dict[str, dict[str, float]] = {}
+    estimated_ev_sum = 0.0
+    realized_ev_sum = 0.0
+    net_ev_sum = 0.0
+    live_shadow_delta_sum = 0.0
+    recent: list[dict] = []
+    seen_market_events: set[str] = set()
+
+    for row in signals:
+        signal = dict(row)
+        signal_id = str(signal.get("signal_id") or "")
+        market_event_id = str(signal.get("market_event_id") or "")
+        if market_event_id:
+            dedupe_key = f"{market_event_id}|{signal.get('side')}|{signal.get('source_type')}"
+            if dedupe_key in seen_market_events:
+                continue
+            seen_market_events.add(dedupe_key)
+        counts["totalDecisions"] += 1
+        trade = trades_by_signal.get(signal_id) or trades_by_event.get(market_event_id)
+        executed = trade is not None
+        would_win = bool(signal.get("hit_configured"))
+        allowed_value = signal.get("allowed")
+        allowed = bool(allowed_value) if allowed_value is not None else str(signal.get("decision_group")) == "ALLOW"
+        features = _safe_json_loads(signal.get("features"), {})
+        stop_pct = float(features.get("stop_move_pct") or signal.get("target_configured_move_pct") or 0)
+        target_pct = float(signal.get("target_configured_move_pct") or 0)
+        estimated_cost_pct = float(signal.get("estimated_cost_pct") or 0)
+        hypothetical_ev = target_pct if would_win else -abs(stop_pct)
+        net_hypothetical_ev = hypothetical_ev - estimated_cost_pct
+        estimated_ev_sum += hypothetical_ev
+        net_ev_sum += net_hypothetical_ev
+
+        realized_pct = float(trade.get("pnl_pct") or 0) if trade else None
+        actual_win = realized_pct is not None and realized_pct > 0
+        if realized_pct is not None:
+            realized_ev_sum += realized_pct
+            live_shadow_delta_sum += realized_pct - net_hypothetical_ev
+
+        if executed:
+            counts["executedDecisions"] += 1
+            if actual_win:
+                classifications["EXECUTED_AND_WON"] += 1
+                primary = "EXECUTED_AND_WON"
+            else:
+                classifications["EXECUTED_AND_LOST"] += 1
+                primary = "EXECUTED_AND_LOST"
+                if would_win:
+                    classifications["EXECUTION_LOSS"] += 1
+                    counts["executionLosses"] += 1
+                    primary = "EXECUTION_LOSS"
+                else:
+                    classifications["STRATEGY_LOSS"] += 1
+                    counts["strategyLosses"] += 1
+                    primary = "STRATEGY_LOSS"
+        else:
+            counts["shadowOnlyDecisions"] += 1
+            if would_win:
+                classifications["WOULD_HAVE_WON"] += 1
+                primary = "WOULD_HAVE_WON"
+                if not allowed:
+                    classifications["MISSED_WIN"] += 1
+                    classifications["BAD_BLOCK"] += 1
+                    counts["missedWins"] += 1
+                    counts["badBlocks"] += 1
+                    primary = "MISSED_WIN"
+            else:
+                classifications["WOULD_HAVE_LOST"] += 1
+                primary = "WOULD_HAVE_LOST"
+                if not allowed:
+                    classifications["AVOIDED_LOSS"] += 1
+                    classifications["GOOD_BLOCK"] += 1
+                    counts["avoidedLosses"] += 1
+                    counts["goodBlocks"] += 1
+                    primary = "AVOIDED_LOSS"
+
+        if not allowed:
+            for reason in _safe_json_loads(signal.get("reject_reasons"), []):
+                key = str(reason).split(":", 1)[0]
+                stats = reject_stats.setdefault(key, {"total": 0, "correct": 0})
+                stats["total"] += 1
+                if not would_win:
+                    stats["correct"] += 1
+
+        playbook = str(signal.get("playbook") or "UNKNOWN")
+        pstats = playbook_stats.setdefault(playbook, {"total": 0, "wins": 0})
+        pstats["total"] += 1
+        if would_win:
+            pstats["wins"] += 1
+
+        bucket = _score_bucket(signal.get("calibrated_score") or signal.get("raw_score"))
+        bstats = bucket_stats.setdefault(bucket, {"total": 0, "wins": 0, "realizedPnlPct": 0.0})
+        bstats["total"] += 1
+        if would_win:
+            bstats["wins"] += 1
+        if realized_pct is not None:
+            bstats["realizedPnlPct"] += realized_pct
+
+        if len(recent) < 25:
+            recent.append({
+                "signalId": signal_id,
+                "marketEventId": market_event_id or None,
+                "symbol": signal.get("symbol"),
+                "side": signal.get("side"),
+                "sourceType": signal.get("source_type"),
+                "allowed": allowed,
+                "executed": executed,
+                "classification": primary,
+                "hypotheticalNetPct": round(net_hypothetical_ev, 6),
+                "realizedPnlPct": round(realized_pct, 6) if realized_pct is not None else None,
+            })
+
+    total = counts["totalDecisions"]
+    executed_total = max(1, counts["executedDecisions"])
+    blocked_total = sum(v["total"] for v in reject_stats.values())
+    return {
+        "days": days,
+        **counts,
+        "classifications": classifications,
+        "liveVsShadowDelta": round(live_shadow_delta_sum / executed_total, 6) if counts["executedDecisions"] else 0.0,
+        "rejectReasonAccuracy": {
+            "overall": _pct(sum(v["correct"] for v in reject_stats.values()), blocked_total),
+            "byReason": {
+                key: {**value, "accuracy": _pct(value["correct"], value["total"])}
+                for key, value in sorted(reject_stats.items())
+            },
+        },
+        "playbookAccuracy": {
+            key: {**value, "accuracy": _pct(value["wins"], value["total"])}
+            for key, value in sorted(playbook_stats.items())
+        },
+        "scoreBucketTruth": {
+            key: {
+                **value,
+                "hitRate": _pct(value["wins"], int(value["total"])),
+                "avgRealizedPnlPct": round(value["realizedPnlPct"] / max(1, int(value["total"])), 6),
+            }
+            for key, value in sorted(bucket_stats.items())
+        },
+        "estimatedEv": round(estimated_ev_sum / max(1, total), 6),
+        "realizedEv": round(realized_ev_sum / executed_total, 6) if counts["executedDecisions"] else 0.0,
+        "netEvAfterFeesSlippageFunding": round(net_ev_sum / max(1, total), 6),
+        "recent": recent,
+    }
 
 
 async def save_model_artifact(
