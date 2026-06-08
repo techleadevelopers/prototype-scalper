@@ -49,24 +49,31 @@ app.use(
     },
   }),
 );
-const allowedOrigins = process.env.CORS_ORIGIN
-  ? process.env.CORS_ORIGIN.split(",").map((s) => s.trim()).filter(Boolean)
-  : [];
+const corsOriginConfig = process.env.CORS_ORIGIN ?? process.env.FRONTEND_URLS ?? process.env.FRONTEND_URL ?? "";
+const allowedOrigins = corsOriginConfig.split(",").map((s) => s.trim()).filter(Boolean);
+
+if (isProduction && allowedOrigins.length === 0) {
+  logger.error("FATAL: CORS_ORIGIN or FRONTEND_URLS must be set in production.");
+  process.exit(1);
+}
 
 app.use(
   cors({
     credentials: true,
     origin: (origin, callback) => {
       if (!origin) return callback(null, true);
-      if (allowedOrigins.length === 0 || allowedOrigins.includes(origin)) {
+      if (!isProduction && allowedOrigins.length === 0) {
+        return callback(null, true);
+      }
+      if (allowedOrigins.includes(origin)) {
         return callback(null, true);
       }
       callback(new Error("CORS: origin not allowed"));
     },
   }),
 );
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: process.env.REQUEST_BODY_LIMIT ?? "256kb" }));
+app.use(express.urlencoded({ extended: true, limit: process.env.REQUEST_BODY_LIMIT ?? "256kb" }));
 app.use((_req, res, next) => {
   const finish = beginRequestMeasurement();
   res.once("finish", finish);
