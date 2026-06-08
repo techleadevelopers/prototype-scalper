@@ -52,6 +52,9 @@ export const BulkOrderItemSchema = z.object({
   currentEv: z.number().optional(),
   expectedEntryPrice: z.number().positive().optional(),
   btcChangePct: z.number().optional(),
+  marketEventId: z.string().optional(),
+  featureTimestampMs: z.number().int().positive().optional(),
+  candleIsComplete: z.boolean().optional(),
 });
 export type BulkOrderItem = z.infer<typeof BulkOrderItemSchema>;
 
@@ -251,9 +254,21 @@ export function isModeAvailable(id: BotModeId, context?: {
   const mode = BOT_MODES[id];
 
   if (id === "aggressive") {
-    // Aggressive mode is always available — the Quant Brain gate handles risk
-    // through score-based ranking rather than hard entry lockouts.
-    // Historical performance data improves ranking quality over time.
+    if (!context) {
+      return { available: false, reason: "Missing telemetry context" };
+    }
+
+    if ((context.totalTrades ?? 0) < 100) {
+      return { available: false, reason: `Need at least 100 trades (have ${context.totalTrades ?? 0})` };
+    }
+
+    if ((context.profitFactor ?? 0) < 1.5) {
+      return { available: false, reason: `Need profit factor ≥ 1.5 (have ${context.profitFactor?.toFixed(2) ?? 0})` };
+    }
+
+    if ((context.winRate ?? 0) < 0.55) {
+      return { available: false, reason: `Need win rate ≥ 55% (have ${((context.winRate ?? 0) * 100).toFixed(0)}%)` };
+    }
   }
 
   if (id === "standard" && context) {
