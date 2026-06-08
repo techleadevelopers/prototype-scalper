@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from "async_hooks";
 import { randomUUID } from "crypto";
 import pino from "pino";
+import { sanitizeForOutput } from "./executionSecurity";
 
 interface RequestContext {
   requestId: string;
@@ -35,8 +36,20 @@ export const logger = pino({
       "token",
       "apiKey",
       "secretKey",
+      "*.apiKey",
+      "*.secretKey",
+      "*.token",
+      "*.authorization",
+      "**.apiKey",
+      "**.secretKey",
+      "**.token",
+      "**.authorization",
+      "**.signature",
     ],
     censor: "[REDACTED]",
+  },
+  serializers: {
+    err: (err) => sanitizeForOutput(err),
   },
   mixin() {
     const requestId = getCurrentRequestId();
