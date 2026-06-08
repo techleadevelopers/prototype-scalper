@@ -1,0 +1,222 @@
+// Colors
+$neon-green: rgb(142, 215, 52);
+$neon-greenshadow: rgba(142, 215, 52, 1);
+$bitcoin-orange: #FF9500;
+$dark-grey-background: rgb(24, 26, 39);
+$light-purple: rgb(116, 125, 156);
+
+// Styles
+$border-radius: 15px;
+
+body, html{
+  width: 100%;
+  height: 100%;
+ }
+body{
+  display: flex;
+  justify-content: center;
+  align-items: center;
+}
+
+h1, h2, h3, h4, h5, h6, p, button{
+  margin: 0;
+  font-family: -apple-system,BlinkMacSystemFont,Roboto,Helvetica Neue,Helvetica,Arial,sans-serif;
+  line-height: 1.6;
+  letter-spacing: .25px;
+}
+
+.content{
+  position: relative;
+  width: 330px;
+  background-color: $dark-grey-background;
+  border-radius: $border-radius;
+  &.collapsed{
+    animation: collapse .3s linear forwards;
+    .bottom-bar{
+      animation: bottom-bar-collapse .3s linear forwards;
+      height: 15px;
+    }
+    button{
+      transition: .2s;
+      opacity: 0;
+      cursor: default;
+    }
+    .bottom-bar{
+      span{
+        opacity: 1;
+      }
+      svg{
+        opacity: 0;
+      }
+    }
+  }
+  &.expanded{
+    animation: expand .3s linear forwards;
+    .bottom-bar{
+      height: 30px;
+      animation: bottom-bar-expand .3s linear forwards;
+    }
+    button{
+      transition: 1s;
+      opacity: 1;
+    }
+    .bottom-bar{
+      span{
+        opacity: 0;
+      }
+      svg{
+        opacity: 1;
+      }
+    }
+  }
+  
+  
+
+}
+
+.top{
+  // position: absolute;
+  text-align: center;
+  flex-direction: column;
+  svg.graph{
+    // width: 330px;
+    height: 50px;
+    -webkit-filter: drop-shadow( 0px 0px 10px $neon-greenshadow);
+    filter: drop-shadow( 0px 0px 3px $neon-greenshadow);
+    pollyfill{
+      stroke: $neon-green;
+    }
+  }
+  .bitcoin-icon, .info{
+    float: left;
+    padding: 10px 10px 0px 10px;
+    margin-top: 10px;
+    vertical-align: middle;
+    text-align: left;
+  }
+  .bitcoin-icon{
+    background-color: rgba(255, 255, 255, .1);
+    border-radius: 50%;
+    margin: 20px 0px 0px 30px;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    padding: 12px;
+    svg{
+      width: 22px;
+    }
+  }
+  .info{
+    vertical-align: middle;
+    h3{
+    color: $bitcoin-orange;
+    font-size: 14px;
+    font-weight: 500;
+    }
+    p{
+      color: white;
+      font-size: 18px;
+      vertical-align: middle;
+    }
+    svg{
+      vertical-align: middle;
+      width: 24px;
+    }
+  }
+
+}
+
+.middle{
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  button{
+    // transition: .4s;
+    width: 140px;
+    height: 45px;
+    margin: 20px;
+    border: none;
+    border-radius: 8px;
+    background-color: rgba(0, 0, 0, .8);
+    font-size: 14px;
+    cursor: pointer;
+    &.buy{
+      color: $neon-green;
+    }
+    &.sell{
+      color: rgb(218, 74, 74);
+    }
+    &:focus{
+      outline: none;
+    }
+    &:active{
+      transform: scale(0.8);
+    }
+    
+  }
+}
+
+.bottom-bar{
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background-color: black;
+  position: absolute;
+  bottom: 0;
+  width: 100%;
+  border-bottom-left-radius: $border-radius;
+  border-bottom-right-radius: $border-radius;
+  cursor: pointer;
+  span{
+    border: 1px solid $light-purple;
+    width: 20px;
+    height: 0px;
+    display: block;
+    position: absolute;
+    transition: .3s;
+  }
+  svg{
+    transition: .3s;
+    width: 30px;
+  }
+  path{
+    fill: $light-purple;
+    position: absolute;
+  }
+}
+
+@keyframes expand{
+  0%{
+    height: 145px;
+  }
+  100%{
+    height: 240px;
+  }
+}
+
+@keyframes bottom-bar-expand{
+  0%{
+    height: 15px;
+  }
+  100%{
+    height: 30px;
+  }
+}
+
+@keyframes collapse{
+  0%{
+    height: 240px;
+  }
+  100%{
+    height: 145px;
+  }
+}
+
+@keyframes bottom-bar-collapse{
+  0%{
+    height: 30px;
+  }
+  100%{
+    height: 15px;
+  }
+}
