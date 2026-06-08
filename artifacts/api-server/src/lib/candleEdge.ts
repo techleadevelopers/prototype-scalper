@@ -26,8 +26,13 @@
  */
 
 import { EventEmitter } from "events";
-import { createHash } from "crypto";
 import { z } from "zod";
+import {
+  assessCandleBatch,
+  canonicalMarketEventId,
+  normalizeMarketSymbol,
+  timeframeToMs,
+} from "./marketDataQuality";
 
 // ========== CONSTANTS ==========
 
@@ -85,6 +90,11 @@ export const CandleEdgeSchema = z.object({
   candleCloseTimeMs: z.number().optional(),
   candleIsComplete: z.boolean().optional(),
   marketEventId: z.string().optional(),
+  freshnessMs: z.number().optional(),
+  missingCandleCount: z.number().int().optional(),
+  duplicateCandleCount: z.number().int().optional(),
+  outOfOrderCandleCount: z.number().int().optional(),
+  dataQualityIncidents: z.array(z.string()).optional(),
   // NOVOS CAMPOS
   macdLine: z.number().optional(),
   macdSignal: z.number().optional(),
@@ -440,34 +450,10 @@ function computeScores(
 
 // ========== INTERVAL UTILITIES ==========
 
-function intervalToMs(interval: CandleInterval): number {
-  const map: Record<CandleInterval, number> = {
-    "1m": 60_000,
-    "3m": 180_000,
-    "5m": 300_000,
-    "15m": 900_000,
-    "30m": 1_800_000,
-    "1h": 3_600_000,
-  };
-  return map[interval] ?? 300_000;
-}
-
-function makeMarketEventId(symbol: string, interval: CandleInterval, candleOpenTimeMs: number): string {
-  return createHash("sha256")
-    .update(`${symbol}|${interval}|${candleOpenTimeMs}`)
-    .digest("hex")
-    .slice(0, 16);
-}
-
 // ========== SYMBOL NORMALIZATION ==========
 
 function toKlineSymbol(symbol: string): string {
-  const s = symbol.toUpperCase();
-  if (s.includes("-")) return s;
-  if (s.endsWith("USDT")) return `${s.slice(0, -4)}-USDT`;
-  if (s.endsWith("USDC")) return `${s.slice(0, -4)}-USDC`;
-  if (s.endsWith("USD")) return `${s.slice(0, -3)}-USDT`;
-  return s;
+  return normalizeMarketSymbol(symbol);
 }
 
 // ========== BINGX CANDLE FETCH ==========
@@ -549,10 +535,15 @@ export async function computeCandleEdge(
       throw new Error(`Insufficient candles: ${candles.length}`);
     }
 
-    // Use all-but-last (completed) candles for indicator computation to avoid
-    // live-candle repainting. The last candle in the BingX response is still
-    // forming and its OHLCV values change every tick.
-    const indicatorCandles = candles.length >= 2 ? candles.slice(0, -1) : candles;
+    const fetchedAt = Date.now();
+    const quality = assessCandleBatch(symbol, interval, candles, fetchedAt);
+    const indicatorCandles = quality.completedCandles;
+    if (indicatorCandles.length < 35) {
+      throw new Error(`Insufficient completed candles for indicator warm-up: ${indicatorCandles.length}/35`);
+    }
+    if (quality.stale) {
+      throw new Error(`Stale candle data: freshness ${quality.freshnessMs}ms`);
+    }
 
     const closes = indicatorCandles.map((c) => c.close);
     const highs = indicatorCandles.map((c) => c.high);
@@ -615,9 +606,9 @@ export async function computeCandleEdge(
 
     // Candle completion provenance
     const candleOpenTimeMs = lastCandle.openTime;
-    const intMs = intervalToMs(interval);
+    const intMs = timeframeToMs(interval);
     const candleCloseTimeMs = candleOpenTimeMs + intMs;
-    const marketEventId = makeMarketEventId(symbol, interval, candleOpenTimeMs);
+    const marketEventId = canonicalMarketEventId(symbol, interval, candleOpenTimeMs);
 
     const edge: CandleEdge = {
       symbol,
@@ -638,12 +629,17 @@ export async function computeCandleEdge(
       longScore,
       shortScore,
       suggestedSide,
-      fetchedAt: Date.now(),
+      fetchedAt,
       // Candle completion provenance
       candleOpenTimeMs,
       candleCloseTimeMs,
       candleIsComplete: true,
       marketEventId,
+      freshnessMs: quality.freshnessMs,
+      missingCandleCount: quality.missingCount,
+      duplicateCandleCount: quality.duplicateCount,
+      outOfOrderCandleCount: quality.outOfOrderCount,
+      dataQualityIncidents: quality.incidents.map((incident) => incident.type),
       // NOVOS CAMPOS
       macdLine,
       macdSignal: signalLine,
