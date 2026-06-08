@@ -686,40 +686,12 @@ export default function BotPage() {
                   </CardTitle>
                 </CardHeader>
                 <CardContent className="px-4 pb-4">
-                  <div className="flex items-start justify-between py-2 border-b border-border/20">
-                    <span className="text-xs text-muted-foreground shrink-0 mr-3 mt-1">Allowed symbols</span>
-                    {config.allowedSymbols.length === 0 ? (
-                      <span className="text-xs font-mono text-muted-foreground">all</span>
-                    ) : (
-                      <div className="flex flex-wrap gap-1.5 justify-end">
-                        {config.allowedSymbols.map((sym) => {
-                          const base = sym.replace(/-USDT$/, "").toLowerCase();
-                          return (
-                            <div key={sym} className="flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-muted/15 border border-border/20" title={sym}>
-                              <img
-                                src={`https://cdn.jsdelivr.net/gh/spothq/cryptocurrency-icons@master/32/color/${base}.png`}
-                                alt={base}
-                                width={14}
-                                height={14}
-                                className="rounded-full"
-                                onError={(e) => {
-                                  (e.currentTarget as HTMLImageElement).style.display = "none";
-                                  const next = e.currentTarget.nextSibling as HTMLElement | null;
-                                  if (next) next.style.display = "flex";
-                                }}
-                              />
-                              <span
-                                className="hidden w-3.5 h-3.5 rounded-full bg-primary/20 text-primary items-center justify-center text-[7px] font-bold uppercase"
-                              >
-                                {base.charAt(0)}
-                              </span>
-                              <span className="text-[10px] font-mono font-semibold">{sym.replace(/-USDT$/, "")}</span>
-                            </div>
-                          );
-                        })}
-                      </div>
-                    )}
-                  </div>
+                  <Row
+                    label="Allowed symbols"
+                    value={config.allowedSymbols.length > 0 ? config.allowedSymbols.join(", ") : "all"}
+                    mono
+                    highlight={config.allowedSymbols.length === 0 ? "dim" : undefined}
+                  />
                   <Row
                     label="Hour blacklist (UTC)"
                     value={config.hourBlacklist.length > 0 ? config.hourBlacklist.join(", ") : "none"}
