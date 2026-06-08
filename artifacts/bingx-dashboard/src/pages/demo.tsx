@@ -1135,7 +1135,7 @@ export default function DemoPage() {
           </div>
 
        {/* ── CENTER PANEL — scanner ── */}
-<Card className="bg-card/30 border-border/40 flex flex-col max-h-[525px]">
+<Card className="bg-card/30 border-border/40 flex flex-col h-[525px] overflow-hidden">
   <CardHeader className="px-5 pt-5 pb-3 border-b border-border/15 shrink-0">
     <div className="flex items-center justify-between">
       <div className="flex items-center gap-2">
@@ -1195,7 +1195,7 @@ export default function DemoPage() {
       <p className="text-sm">Nenhum símbolo no scan</p>
     </div>
   ) : (
-    <div className="flex-1 overflow-y-auto custom-scrollbar">
+    <div className="flex-1 overflow-y-auto min-h-0 custom-scrollbar">
       <div className="divide-y divide-border/5">
         {scanSymbols.map((s, i) => {
           const key = `${s.symbol}-${s.positionSide}`;
@@ -1370,7 +1370,7 @@ export default function DemoPage() {
 </Card>
 
 {/* ── RIGHT PANEL — log ── */}
-<Card className="bg-card/30 border-border/40 flex flex-col max-h-[525px]">
+<Card className="bg-card/30 border-border/40 flex flex-col h-[525px] overflow-hidden">
   <CardHeader className="px-4 pt-4 pb-3 border-b border-border/20 shrink-0">
     <div className="flex items-center justify-between">
       <CardTitle className="text-sm font-semibold flex items-center gap-2">
