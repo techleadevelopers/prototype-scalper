@@ -274,8 +274,10 @@ async def record_signal_from_gate(
     fallback_side: str,
     sniper: dict[str, Any],
     config: dict[str, Any],
+    metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Registra decisão do gate para aprendizado posterior."""
+    metadata = metadata or {}
     alt = MovementFeatures(**sniper["altFeatures"])
     btc = MovementFeatures(**sniper["btcFeatures"])
     side = _side_from_decision(str(sniper.get("decision", "")), fallback_side)
@@ -312,9 +314,21 @@ async def record_signal_from_gate(
         ),
     )
     created_bucket = int(time.time() // dedupe_seconds)
-    signal_id = _signal_id(symbol, side, str(sniper.get("decision", "")), created_bucket, context_key)
+    signal_id = str(metadata.get("signalId") or "") or _signal_id(symbol, side, str(sniper.get("decision", "")), created_bucket, context_key)
     decision = str(sniper.get("decision", "WAIT"))
     source_type = str(config.get("signalSourceType", "hypothetical")).lower()
+    feature_timestamp = metadata.get("featureTimestamp")
+    if feature_timestamp is None and metadata.get("featureTimestampMs") is not None:
+        feature_timestamp = float(metadata["featureTimestampMs"]) / 1000
+    decision_timestamp = metadata.get("decisionTimestamp")
+    if decision_timestamp is None and metadata.get("requestTimestamp") is not None:
+        decision_timestamp = float(metadata["requestTimestamp"]) / 1000
+    decision_timestamp = float(decision_timestamp or time.time())
+    expires_at = metadata.get("expiresAt")
+    if expires_at is not None:
+        expires_at = float(expires_at)
+        if expires_at > 10_000_000_000:
+            expires_at = expires_at / 1000
 
     features = {
         "alt": sniper.get("altFeatures", {}),
@@ -329,6 +343,7 @@ async def record_signal_from_gate(
         "stop_move_pct": stop_move_pct,
         "optimal_target_usdt": optimal_target,
         "optimal_score": optimal_score,
+        "source_metadata": metadata,
     }
 
     recorded = await kb.record_signal_decision(
@@ -346,6 +361,24 @@ async def record_signal_from_gate(
         entry_price=entry_price,
         estimated_cost_pct=estimated_cost_pct,
         target_moves=target_moves,
+        market_event_id=metadata.get("marketEventId"),
+        feature_timestamp=float(feature_timestamp) if feature_timestamp is not None else None,
+        decision_timestamp=decision_timestamp,
+        reference_price=float(metadata.get("referencePrice") or entry_price),
+        bid=float(getattr(alt, "bid", 0) or 0) or None,
+        ask=float(getattr(alt, "ask", 0) or 0) or None,
+        spread_bps=float(getattr(alt, "spread_bps", 0) or 0) or None,
+        position_side=side,
+        playbook=metadata.get("playbook"),
+        regime=metadata.get("regime"),
+        setup_type=metadata.get("setup"),
+        raw_score=float(sniper.get("score", 0) or 0),
+        calibrated_score=metadata.get("calibratedScore"),
+        policy_version=metadata.get("policyVersion"),
+        config_version=metadata.get("configVersion") or str(config.get("configVersion") or ""),
+        feature_version=metadata.get("featureVersion"),
+        label_version=metadata.get("labelVersion"),
+        expires_at=expires_at,
     )
 
     return {
