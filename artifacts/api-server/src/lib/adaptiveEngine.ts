@@ -130,6 +130,8 @@ export const TradeOutcomeSchema = z.object({
   labelVersion: z.string().optional(),
   sourceType: z.enum(["demo", "live", "hypothetical", "shadow"]).optional(),
   playbook: z.string().optional(),
+  setup: z.string().optional(),
+  sizing: z.unknown().optional(),
   aggressiveScore: z.number().min(0).max(1).optional(),
   executionPriority: z.number().min(0).max(1).optional(),
   coachScore: z.number().min(0).max(1).optional(),
