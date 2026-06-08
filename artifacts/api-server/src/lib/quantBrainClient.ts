@@ -5,6 +5,7 @@ import path from "path";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { canonicalMarketEventId } from "./marketDataQuality";
+import { validateLearningEligibility } from "./pipelineAuditor";
 
 export const QUANT_BRAIN_CONTRACT_VERSION = "edge-v3";
 export const DEFAULT_FEATURE_VERSION = "sniper-v1";
@@ -188,6 +189,7 @@ export interface QuantBrainEdgeResult {
   modelVersion?: string | null;
   featureVersion?: string;
   calibratedProbability?: number | null;
+  calibratedScore?: number | null;
   probabilityDefinition?: string;
   uncertaintyType?: string;
   predictionTimestamp?: number;
@@ -255,6 +257,7 @@ const QuantBrainEdgeResponseSchema = z.object({
   modelVersion: z.string().min(1).nullable(),
   featureVersion: z.string().min(1),
   calibratedProbability: z.number().min(0).max(1).nullable(),
+  calibratedScore: z.number().min(0).max(1).nullable().optional(),
   probabilityDefinition: z.literal("probability_configured_target_hit_before_stop"),
   uncertaintyType: z.enum([
     "STRONG_EVIDENCE",
@@ -308,6 +311,26 @@ function outcomeToQuantPayload(outcome: TradeOutcome): Record<string, unknown> {
     exitTime: outcome.exitTime,
     exitReason: outcome.exitReason,
     expectedTpProfit: outcome.expectedTpProfit,
+    expectedEntryPrice: outcome.expectedEntryPrice,
+    markPriceBeforeOrder: outcome.markPriceBeforeOrder,
+    actualAvgEntryPrice: outcome.actualAvgEntryPrice ?? outcome.entryPrice,
+    expectedExitPrice: outcome.expectedExitPrice,
+    actualExitPrice: outcome.actualExitPrice ?? outcome.exitPrice,
+    signalCreatedAt: outcome.signalCreatedAt,
+    qbEvaluatedAt: outcome.qbEvaluatedAt,
+    orderRequestedAt: outcome.orderRequestedAt,
+    orderSentAt: outcome.orderSentAt,
+    orderAckAt: outcome.orderAckAt,
+    positionConfirmedAt: outcome.positionConfirmedAt,
+    positionClosedAt: outcome.positionClosedAt ?? outcome.exitTime,
+    protectionAttachedAt: outcome.protectionAttachedAt,
+    monitorDetectedCloseAt: outcome.monitorDetectedCloseAt,
+    spreadBps: outcome.spreadBps,
+    spreadAtSignal: outcome.spreadAtSignal,
+    spreadAtEntry: outcome.spreadAtEntry,
+    spreadAtExit: outcome.spreadAtExit,
+    orderType: outcome.orderType,
+    quantity: outcome.qty,
     entrySlippage: outcome.entrySlippage ?? 0,
     exitSlippage: outcome.exitSlippage ?? 0,
     totalSlippage: outcome.totalSlippage ?? 0,
@@ -319,7 +342,23 @@ function outcomeToQuantPayload(outcome: TradeOutcome): Record<string, unknown> {
     mae: outcome.mae,
     holdDurationMs: outcome.holdDurationMs,
     entryCount: outcome.entryCount,
+    riskTier: outcome.riskTier,
+    sizeMultiplier: outcome.sizeMultiplier,
+    sizeReason: outcome.sizeReason,
+    recommendedMargin: outcome.recommendedMargin,
+    recommendedLeverage: outcome.recommendedLeverage,
+    maxLossIfStop: outcome.maxLossIfStop,
+    notional: outcome.notional,
     modelVersion: outcome.modelVersion,
+    aggressiveScore: outcome.aggressiveScore,
+    executionPriority: outcome.executionPriority,
+    coachScore: outcome.coachScore,
+    playbookScore: outcome.playbookScore,
+    playbook: outcome.playbook,
+    mlProbability: outcome.mlProbability ?? outcome.calibratedProbability,
+    calibratedProbability: outcome.calibratedProbability ?? outcome.mlProbability,
+    executionQuality: outcome.executionQuality,
+    calibratedScore: outcome.calibratedScore,
     signalId: outcome.signalId,
     marketEventId: outcome.marketEventId,
     predictionId: outcome.predictionId,
@@ -327,8 +366,12 @@ function outcomeToQuantPayload(outcome: TradeOutcome): Record<string, unknown> {
     clientOrderId: outcome.clientOrderId,
     exchangeOrderId: outcome.exchangeOrderId ?? outcome.entryOrderId,
     featureVersion: outcome.featureVersion,
+    strategyVersion: outcome.strategyVersion,
+    configVersion: outcome.configVersion,
+    policyVersion: outcome.policyVersion,
+    sourceType: outcome.sourceType,
     contractVersion: QUANT_BRAIN_CONTRACT_VERSION,
-    labelVersion: outcome.id.startsWith("campaign:") ? "campaign-pnl-v1" : undefined,
+    labelVersion: outcome.labelVersion ?? (outcome.id.startsWith("campaign:") ? "campaign-pnl-v1" : undefined),
   };
 }
 
@@ -524,10 +567,27 @@ export async function getQuantBrainRecentTrades(
   }
 }
 
+export async function getQuantBrainExecutionAudit(hours = 24): Promise<unknown | null> {
+  if (!quantBrainEnabled()) return null;
+  const safeHours = Math.max(1, Math.min(Math.trunc(hours), 720));
+  try {
+    return await getJson<unknown>(`/execution/audit?hours=${safeHours}`, SUMMARY_TIMEOUT_MS);
+  } catch {
+    return null;
+  }
+}
+
 export async function syncQuantBrainOutcome(
   outcome: TradeOutcome,
 ): Promise<{ synced: boolean; error?: string }> {
   if (!quantBrainEnabled()) return { synced: false, error: "disabled" };
+  const eligibility = validateLearningEligibility(outcome);
+  if (!eligibility.learningEligible) {
+    return {
+      synced: false,
+      error: `pipeline_integrity_blocked:${eligibility.blockedReasons.join(",")}`,
+    };
+  }
   pendingOutcomes.set(outcome.id, outcome);
   evictOldestPending();
   persistOutcomeOutbox();
@@ -567,8 +627,12 @@ async function flushPendingQuantBrainOutcomes(): Promise<void> {
 }
 
 export function startQuantBrainOutcomeSync(initialOutcomes: TradeOutcome[] = []): void {
-  for (const outcome of loadOutcomeOutbox()) pendingOutcomes.set(outcome.id, outcome);
-  for (const outcome of initialOutcomes) pendingOutcomes.set(outcome.id, outcome);
+  for (const outcome of loadOutcomeOutbox()) {
+    if (validateLearningEligibility(outcome).learningEligible) pendingOutcomes.set(outcome.id, outcome);
+  }
+  for (const outcome of initialOutcomes) {
+    if (validateLearningEligibility(outcome).learningEligible) pendingOutcomes.set(outcome.id, outcome);
+  }
   persistOutcomeOutbox();
   if (outcomeSyncTimer) return;
   outcomeSyncTimer = setInterval(() => {
@@ -769,4 +833,41 @@ export async function getQuantBrainIntelligence(
     newsContext: newsContext.value,
     errors,
   };
+}
+
+export async function getQuantBrainScoreCalibrationStatus(
+  days = 30,
+  limit = 5000,
+): Promise<unknown> {
+  if (!quantBrainEnabled()) {
+    return {
+      connected: false,
+      enabled: false,
+      error: "disabled",
+      scoreTruth: {
+        isMonotonic: false,
+        calibrationQuality: "INSUFFICIENT_DATA",
+        overconfidence: false,
+        bestBucket: null,
+        toxicBucket: null,
+        recommendedMinScore: 0.58,
+        recommendedBoostScore: 0.76,
+      },
+      buckets: [],
+      recommendedThresholds: {
+        minAggressiveScore: 0.58,
+        minStackingScore: 0.68,
+        minBoostScore: 0.76,
+        maxSniperScore: 0.92,
+      },
+      overconfidenceWarnings: ["quant_brain_disabled"],
+      bestScoringModel: null,
+      scoreVsActualPnlChartData: [],
+    };
+  }
+  const params = new URLSearchParams({
+    days: String(Math.max(1, Math.floor(days))),
+    limit: String(Math.max(50, Math.floor(limit))),
+  });
+  return await getJson<unknown>(`/score-calibration/status?${params.toString()}`, SUMMARY_TIMEOUT_MS);
 }
