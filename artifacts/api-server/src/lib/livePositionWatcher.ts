@@ -91,6 +91,8 @@ let activeCreds: { apiKey: string; secretKey: string } | null = null;
 // watcher interval handle
 let watchHandle: NodeJS.Timeout | null = null;
 let isRunning = false;
+let pollInFlight = false;
+let statSkippedOverlaps = 0;
 
 // ── Stats ─────────────────────────────────────────────────────────────────────
 
@@ -189,6 +191,12 @@ function inferExitReason(
 // ── Core Poll Cycle ───────────────────────────────────────────────────────────
 
 async function pollCycle(): Promise<void> {
+  if (pollInFlight) {
+    statSkippedOverlaps++;
+    return;
+  }
+  pollInFlight = true;
+  try {
   if (!activeCreds) return;
 
   statPollCount++;
@@ -416,6 +424,9 @@ async function pollCycle(): Promise<void> {
       }
     }
   }
+  } finally {
+    pollInFlight = false;
+  }
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -505,6 +516,8 @@ export function getLiveWatcherStats(): {
   lastPollAt: number | null;
   lastClosedAt: number | null;
   lastError: string | null;
+  pollInFlight: boolean;
+  skippedOverlaps: number;
   entries: Array<{
     entryOrderId: string;
     symbol: string;
@@ -527,6 +540,8 @@ export function getLiveWatcherStats(): {
     lastPollAt: statLastPollAt || null,
     lastClosedAt: statLastClosedAt,
     lastError: statLastError,
+    pollInFlight,
+    skippedOverlaps: statSkippedOverlaps,
     entries: Array.from(tracked.values()).map((e) => ({
       entryOrderId: e.entryOrderId,
       symbol: e.symbol,
