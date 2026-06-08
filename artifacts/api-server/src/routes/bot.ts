@@ -1,19 +1,20 @@
 import { Router } from "express";
-import { createHmac, randomUUID } from "crypto";
+import { createHash, createHmac, randomUUID } from "crypto";
 import type { Request, Response } from "express";
 import { getBotConfig, getOverrideHistory, setConfigOverrides, resetConfigOverrides } from "../lib/botConfig";
 import {
   BOT_MODES, type BotModeId, type BulkOrderItem, type BulkOrderResult, type BulkExecutionSummary,
   TokenBucket, setActiveModeId, getActiveModeId, getActiveModePreset, clearActiveMode,
 } from "../lib/botModes";
-import { exportAllOutcomes, getEngine } from "../lib/telemetryStore";
+import { exportAllOutcomes, getEngine, getTelemetryStats } from "../lib/telemetryStore";
 import { AdaptiveEngine, type BtcRegime, type ClusterKey, type PositionSide, type TradeOutcome } from "../lib/adaptiveEngine";
 import { computeAllCandleEdges, computeCandleEdge, type CandleEdge, type CandleInterval } from "../lib/candleEdge";
-import { feeDragRejectReason, maxCorrelatedBulkOrders } from "../lib/executionRisk";
+import { estimateExecutionCosts, feeDragRejectReason, maxCorrelatedBulkOrders } from "../lib/executionRisk";
 import {
   getQuantBrainIntelligence,
   evaluateQuantBrainEdge,
   getCurrentQuantBrainDriftPolicy,
+  getQuantBrainQueueStats,
   quantBrainGateMode,
   type QuantBrainEdgeInput,
 } from "../lib/quantBrainClient";
@@ -48,6 +49,7 @@ import {
 } from "../lib/symbolRotation";
 import {
   calculatePositionSizing,
+  getPositionSizingConfig,
   recentSizingStats,
   summarizeSizingStatus,
   type PositionSizingDecision,
@@ -71,13 +73,51 @@ import {
 import {
   buildLiveReadinessStatus,
   evaluateLiveReadinessForOrder,
+  type LiveReadinessStatus,
   type PromotionState,
 } from "../lib/live_readiness";
 import { loadClosedTrades } from "../lib/demoTradeStore";
+import { getPolicyStatus } from "../lib/policyManifest";
 
 const router = Router();
 
 const BINGX_BASE = "https://open-api.bingx.com";
+
+type ProtectionBuildResult = {
+  orderParams: Record<string, string | number>;
+  protectionAttached: boolean;
+  riskMode: "TP_SL_PROTECTED" | "UNPROTECTED_HIGH_RISK";
+  protectionStopPrice?: number;
+  protectionTakeProfitPrice?: number;
+};
+
+function withEntryProtection(
+  orderParams: Record<string, string | number>,
+  referencePrice: number,
+  positionSide: "LONG" | "SHORT",
+  config: ReturnType<typeof getBotConfig>,
+): ProtectionBuildResult {
+  const protection = buildAttachedProtection(referencePrice, positionSide, config);
+  if (!protection) {
+    return {
+      orderParams,
+      protectionAttached: false,
+      riskMode: "UNPROTECTED_HIGH_RISK",
+    };
+  }
+
+  return {
+    orderParams: {
+      ...orderParams,
+      stopLoss: protection.stopLoss,
+      takeProfit: protection.takeProfit,
+    },
+    protectionAttached: true,
+    riskMode: "TP_SL_PROTECTED",
+    protectionStopPrice: protection.stopPrice,
+    protectionTakeProfitPrice: protection.takeProfitPrice,
+  };
+}
 
 function driftAdjustedStackLimit(config: ReturnType<typeof getBotConfig>): number {
   const base = config.positionStackingEnabled ? config.maxPositionsPerSymbol : 1;
@@ -94,6 +134,21 @@ function openCountsBySymbolFromCapital(capitalCtx: CapitalContext | null | undef
     counts.set(symbol.toUpperCase(), { LONG: bySide.LONG, SHORT: bySide.SHORT });
   }
   return counts;
+}
+
+function liveEntryPolicyProvenance() {
+  const policy = getPolicyStatus();
+  return {
+    configVersion: policy.currentConfigHash,
+    policyVersion: policy.activePolicyVersion,
+    strategyVersion: policy.effectiveSnapshot.strategyVersion,
+    scoreCalibrationVersion: policy.effectiveSnapshot.scoreCalibrationVersion,
+    sizingPolicyVersion: policy.effectiveSnapshot.sizingPolicyVersion,
+    rotationPolicyVersion: policy.effectiveSnapshot.rotationPolicyVersion,
+    playbookVersion: policy.effectiveSnapshot.playbookVersion,
+    modelVersion: policy.quantBrain.modelVersion ?? undefined,
+    labelVersion: policy.quantBrain.labelVersion ?? "live-outcome-v1",
+  };
 }
 
 function evaluateLiveKillSwitch(input: {
@@ -160,6 +215,77 @@ function killSwitchReject(
 
 router.get("/bot/market-data-quality", (_req: Request, res: Response) => {
   res.json(getMarketDataQualityStatus());
+});
+
+router.get("/market-data/integrity", (_req: Request, res: Response) => {
+  const quality = getMarketDataQualityStatus();
+  const incidents = quality.incidents.slice(-100);
+  res.json({
+    staleSymbols: incidents.filter((incident) => incident.type === "STALE").map((incident) => incident.symbol),
+    invalidCandles: incidents.filter((incident) => incident.type === "INVALID_VALUE" || incident.type === "TIMESTAMP_VIOLATION"),
+    incompleteCandlesRejected: quality.metrics.incomplete,
+    dataAgeMsBySource: {
+      backendCandleQuality: null,
+      quantBrainSnapshot: null,
+    },
+    spreadAnomalies: incidents.filter((incident) => /spread/i.test(incident.detail ?? "")),
+    duplicateMarketEvents: {
+      duplicateCandles: quality.metrics.duplicates,
+      duplicateExecutions: quality.metrics.duplicateExecutions,
+      activeExecutionClaims: quality.activeExecutionClaims,
+      activeExecutionClaimKeys: quality.activeExecutionClaimKeys,
+    },
+    canonicalSnapshotAvailable: false,
+    recommendedActions: [
+      ...(quality.metrics.stale > 0 ? ["Investigate stale candle sources before enabling live entries."] : []),
+      ...(quality.metrics.incomplete > 0 ? ["Keep INCOMPLETE_CANDLE_REJECT enforced for live candidates."] : []),
+      ...(quality.activeExecutionClaims > 0 ? ["Run exchange reconciliation before clearing active execution claims."] : []),
+      "Use Quant Brain /market/snapshots as the canonical bid/ask/spread source until backend snapshots are implemented.",
+    ],
+  });
+});
+
+router.get("/sniper/signal-freshness/status", async (req: Request, res: Response) => {
+  const config = getBotConfig();
+  const creds = getCredentials(req);
+  const [capitalCtx, sentiment, closedDemoTrades] = await Promise.all([
+    creds ? fetchCapitalContext(creds).catch(() => null) : Promise.resolve(null),
+    config.allowedSymbols[0] ? getMarketSentiment(config.allowedSymbols[0]).catch(() => null) : Promise.resolve(null),
+    loadClosedTrades(5_000).catch(() => []),
+  ]);
+  const readiness = buildLiveReadinessStatus({
+    outcomes: exportAllOutcomes(),
+    closedDemoTrades,
+    config,
+  });
+  const watcher = getLiveWatcherStats();
+  const policy = getPolicyStatus();
+  const now = Date.now();
+  res.json({
+    blockedLiveCandidates: getMarketDataQualityStatus().metrics.duplicateExecutions,
+    btcRegimeAgeMs: null,
+    sentimentAgeMs: sentiment ? 0 : null,
+    scoreCalibrationAgeMs: null,
+    playbookAgeMs: null,
+    rotationReportAgeMs: null,
+    capitalContextAgeMs: capitalCtx ? 0 : null,
+    backendQuantSnapshotDelta: null,
+    priceDriftScanToOrder: null,
+    watcherLagMs: watcher.lastPollAt ? now - watcher.lastPollAt : null,
+    activeExecutionClaims: getMarketDataQualityStatus().activeExecutionClaims,
+    readinessGeneratedAt: readiness.generatedAt,
+    currentConfigHash: policy.currentConfigHash,
+    freshnessGaps: [
+      "btcRegimeTimestamp is not persisted on live candidates yet.",
+      "backend canonical market snapshot is not implemented; use Quant Brain /market/snapshots for canonical freshness.",
+      "score/playbook/rotation age is inferred from current status, not persisted per candidate.",
+    ],
+    recommendedActions: [
+      "Persist btcRegimeTimestamp, scoreCalibrationTimestamp, playbookTimestamp and scanPrice on every candidate snapshot.",
+      "Block live entries when watcherLagMs exceeds three poll intervals.",
+      "Compare scan referencePrice against order-time mark price before POSTing a live order.",
+    ],
+  });
 });
 
 router.get("/position-sizing/status", async (req: Request, res: Response) => {
@@ -248,6 +374,19 @@ function sign(params: Record<string, string | number | undefined>, secretKey: st
   return createHmac("sha256", secretKey).update(query).digest("hex");
 }
 
+function deterministicClientOrderId(input: {
+  symbol: string;
+  positionSide: "LONG" | "SHORT";
+  side: "BUY" | "SELL";
+  marketEventId: string;
+}): string {
+  const digest = createHash("sha256")
+    .update(`${input.symbol.toUpperCase()}|${input.positionSide}|${input.side}|${input.marketEventId}`)
+    .digest("hex")
+    .slice(0, 24);
+  return `sniper_${digest}`;
+}
+
 const BINGX_REQUEST_TIMEOUT_MS = Number(process.env["BINGX_REQUEST_TIMEOUT_MS"] ?? 8_000);
 
 async function bingxPost(
@@ -308,6 +447,7 @@ interface CapitalContext {
   openPositionsCount: number;
   marginUtilization: number;
   equity: number;
+  usedMargin: number;
   availableMargin: number;
   // counts[symbol][side] = number of open positions on that side
   countsBySide: Map<string, { LONG: number; SHORT: number }>;
@@ -353,6 +493,7 @@ async function fetchCapitalContext(
     openPositionsCount: openPositions.length,
     marginUtilization: equity > 0 ? usedMargin / equity : 0,
     equity,
+    usedMargin,
     availableMargin,
     countsBySide,
     fetchedAt: Date.now(),
@@ -378,6 +519,86 @@ function capitalPositionsForSizing(capitalCtx: CapitalContext | null | undefined
       leverage,
     };
   }).filter((position) => position.symbol && position.marginUsed > 0);
+}
+
+function riskEnvNum(key: string, fallback: number): number {
+  const parsed = Number(process.env[key]);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function portfolioRiskRejectsForOrder(input: {
+  ctx: CapitalContext;
+  config: ReturnType<typeof getBotConfig>;
+  symbol: string;
+  positionSide: PositionSide;
+  margin: number;
+  leverage: number;
+  playbook?: string;
+  btcChangePct?: number;
+  sizing?: PositionSizingDecision;
+}): string[] {
+  const { ctx, config, symbol, positionSide, margin, leverage, sizing } = input;
+  const equity = Math.max(0, ctx.equity);
+  const stopLossPct = Math.max(0.01, config.stopLossPct);
+  const newRisk = sizing?.maxLossIfStop ?? margin * leverage * (stopLossPct / 100);
+  const newNotional = sizing?.notional ?? margin * leverage;
+  const positions = capitalPositionsForSizing(ctx);
+  const openRisk = positions.reduce((sum, pos) => sum + pos.marginUsed * pos.leverage * (stopLossPct / 100), 0);
+  const openNotional = positions.reduce((sum, pos) => sum + pos.marginUsed * pos.leverage, 0);
+  const symbolRisk = positions
+    .filter((pos) => pos.symbol.toUpperCase() === symbol.toUpperCase())
+    .reduce((sum, pos) => sum + pos.marginUsed * pos.leverage * (stopLossPct / 100), 0) + newRisk;
+  const sideRisk = positions
+    .filter((pos) => pos.positionSide === positionSide)
+    .reduce((sum, pos) => sum + pos.marginUsed * pos.leverage * (stopLossPct / 100), 0) + newRisk;
+  const sizingCfg = getPositionSizingConfig(config);
+  const maxTotalRiskPct = riskEnvNum("MAX_TOTAL_RISK_PCT", sizingCfg.maxTotalRiskPct);
+  const maxSymbolRiskPct = riskEnvNum("MAX_SYMBOL_RISK_PCT", sizingCfg.maxSymbolRiskPct);
+  const maxSideRiskPct = riskEnvNum("MAX_SIDE_RISK_PCT", maxTotalRiskPct * 0.75);
+  const maxTotalNotionalPct = riskEnvNum("MAX_TOTAL_NOTIONAL_PCT", config.maxMarginUtilization * config.leverage);
+  const minFreeMarginAfterOrder = riskEnvNum("MIN_FREE_MARGIN_AFTER_ORDER", Math.max(config.marginPerTrade, equity * 0.02));
+  const rejects: string[] = [];
+
+  if (equity <= 0) rejects.push("PORTFOLIO_RISK_REJECT: equity unavailable");
+  if (equity > 0 && (openRisk + newRisk) / equity > maxTotalRiskPct) {
+    rejects.push(`PORTFOLIO_TOTAL_RISK_REJECT: riskIfStop ${(((openRisk + newRisk) / equity) * 100).toFixed(2)}% > ${(maxTotalRiskPct * 100).toFixed(2)}%`);
+  }
+  if (equity > 0 && symbolRisk / equity > maxSymbolRiskPct) {
+    rejects.push(`PORTFOLIO_SYMBOL_RISK_REJECT: ${symbol} risk ${(symbolRisk / equity * 100).toFixed(2)}% > ${(maxSymbolRiskPct * 100).toFixed(2)}%`);
+  }
+  if (equity > 0 && sideRisk / equity > maxSideRiskPct) {
+    rejects.push(`PORTFOLIO_SIDE_RISK_REJECT: ${positionSide} risk ${(sideRisk / equity * 100).toFixed(2)}% > ${(maxSideRiskPct * 100).toFixed(2)}%`);
+  }
+  if (equity > 0 && (openNotional + newNotional) / equity > maxTotalNotionalPct) {
+    rejects.push(`PORTFOLIO_NOTIONAL_REJECT: notional/equity ${(((openNotional + newNotional) / equity) * 100).toFixed(1)}% > ${(maxTotalNotionalPct * 100).toFixed(1)}%`);
+  }
+  if (ctx.availableMargin - margin < minFreeMarginAfterOrder) {
+    rejects.push(`PORTFOLIO_FREE_MARGIN_REJECT: freeMarginAfter ${(ctx.availableMargin - margin).toFixed(4)} < ${minFreeMarginAfterOrder.toFixed(4)}`);
+  }
+  return rejects;
+}
+
+function projectOrderIntoCapitalContext(
+  ctx: CapitalContext | null | undefined,
+  input: { symbol: string; positionSide: PositionSide; margin: number; leverage: number },
+): void {
+  if (!ctx) return;
+  const symbol = input.symbol.toUpperCase();
+  ctx.openPositions.push({
+    symbol,
+    positionSide: input.positionSide,
+    positionAmt: "1",
+    avgPrice: String(input.margin * input.leverage),
+    leverage: String(input.leverage),
+    initialMargin: String(input.margin),
+  });
+  ctx.openPositionsCount += 1;
+  ctx.usedMargin += input.margin;
+  ctx.availableMargin = Math.max(0, ctx.availableMargin - input.margin);
+  ctx.marginUtilization = ctx.equity > 0 ? ctx.usedMargin / ctx.equity : 1;
+  const counts = ctx.countsBySide.get(symbol) ?? { LONG: 0, SHORT: 0 };
+  counts[input.positionSide] += 1;
+  ctx.countsBySide.set(symbol, counts);
 }
 
 // ── Sniper Autopilot — server-side autonomous execution loop ──────────────────
@@ -765,8 +986,10 @@ router.post("/bot/order", async (req: Request, res: Response) => {
 
   let config = getBotConfig();
   let orderMargin = config.marginPerTrade;
+  let orderLeverage = config.leverage;
   let readinessScopeId: string | undefined;
   let promotionState: PromotionState | undefined;
+  let marketEventClaimed = false;
   const {
     symbol,
     side,
@@ -884,29 +1107,23 @@ router.post("/bot/order", async (req: Request, res: Response) => {
   let openPositionsCount = 0;
   let marginUtilization = 0;
   let openPositions: Record<string, unknown>[] = [];
+  let capitalCtx: CapitalContext | null = null;
   let qbShadowRejects: string[] = [];
+  let sizingDecision: PositionSizingDecision | null = null;
+  let sizingWarning: string | undefined;
 
   const [capitalData, sentimentForQb] = await Promise.all([
-    Promise.all([
-      bingxGet("/openApi/swap/v2/user/positions", {}, creds.apiKey, creds.secretKey),
-      bingxGet("/openApi/swap/v2/user/balance", {}, creds.apiKey, creds.secretKey),
-    ]).catch(() => null),
+    fetchCapitalContext(creds).catch(() => null),
     getMarketSentiment(symbol).catch(() => null),
   ]);
 
   if (capitalData) {
-    const [posData, balData] = capitalData;
-    if (posData.code === 0) {
-      openPositions = ((posData.data as unknown[]) ?? []) as Record<string, unknown>[];
-      openPositions = openPositions.filter((p) => parseFloat(String(p.positionAmt ?? "0")) !== 0);
-      openPositionsCount = openPositions.length;
-    }
-    if (balData.code === 0) {
-      const bal = ((balData.data as Record<string, unknown>)?.balance ?? {}) as Record<string, string>;
-      const usedMargin = parseFloat(bal.usedMargin ?? "0");
-      const equity = parseFloat(bal.equity ?? "1");
-      marginUtilization = equity > 0 ? usedMargin / equity : 0;
-    }
+    capitalCtx = capitalData;
+    openPositions = capitalData.openPositions;
+    openPositionsCount = capitalData.openPositionsCount;
+    marginUtilization = capitalData.marginUtilization;
+  } else if (config.allowExecution) {
+    gateRejects.push("CAPITAL_CONTEXT_REJECT: live capital snapshot unavailable");
   }
 
   // QB edge gate — called after capital gate (sentiment already fetched in parallel above)
@@ -919,6 +1136,22 @@ router.post("/bot/order", async (req: Request, res: Response) => {
       currentWinRate,
       currentProfitFactor,
       config,
+      costModel: estimateExecutionCosts(
+        orderMargin,
+        orderLeverage,
+        config.takerFeeBps / 10_000,
+        undefined,
+        undefined,
+        {
+          takeProfitPct: config.takeProfitPct,
+          stopLossPct: config.stopLossPct,
+          grossEv: currentEv,
+          expectedWinRate: currentWinRate,
+          slippageBpsPerSide: config.slippageBpsPerSide,
+          fundingCostPct: config.estimatedFundingCostPct,
+          minEdgeOverCostPct: config.minEdgeOverCostPct,
+        },
+      ),
       sentimentContext: sentimentForQb ? {
         direction: sentimentForQb.direction,
         confidence: sentimentForQb.confidence,
@@ -935,8 +1168,13 @@ router.post("/bot/order", async (req: Request, res: Response) => {
       marketDataSource: "bingx",
       referencePrice: candle.lastClose,
     };
-    const qbResult = await evaluateQuantBrainEdge(qbInput);
     const qbMode = quantBrainGateMode();
+    const qbResult = await Promise.race([
+      evaluateQuantBrainEdge(qbInput),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("QB_ORDER_TIMEOUT")), QB_ORDER_TIMEOUT_MS),
+      ),
+    ]);
     if (qbMode === "enforce" && !qbResult.allow) {
       // Enforce mode: QB rejects block the trade
       gateRejects.push(...qbResult.gateRejects.map((r) => `QB_${r}`));
@@ -946,7 +1184,11 @@ router.post("/bot/order", async (req: Request, res: Response) => {
       req.log.info({ symbol, positionSide, qbShadowRejects }, "QB shadow rejects (not blocking)");
     }
   } catch (err) {
-    req.log.debug({ err }, "QB edge evaluation skipped — not blocking");
+    if (quantBrainGateMode() === "enforce") {
+      gateRejects.push(`QB_TIMEOUT_REJECT: ${err instanceof Error ? err.message : "Quant Brain timed out"}`);
+    } else {
+      req.log.debug({ err }, "QB edge evaluation skipped - not blocking");
+    }
   }
 
   if (openPositionsCount >= config.maxConcurrentPositions) {
@@ -994,6 +1236,47 @@ router.post("/bot/order", async (req: Request, res: Response) => {
     );
   }
 
+  if (getPositionSizingConfig(config).enabled) {
+    try {
+      const sameSideOpen = openPositions.filter(
+        (p) => String(p.symbol ?? "").toUpperCase() === symbol.toUpperCase()
+          && String(p.positionSide ?? "").toUpperCase() === positionSide,
+      );
+      const sizingStats = recentSizingStats(exportAllOutcomes(), symbol, positionSide);
+      sizingDecision = calculatePositionSizing({
+        symbol,
+        positionSide,
+        accountEquity: capitalCtx?.equity ?? config.marginPerTrade / 0.005,
+        availableMargin: capitalCtx?.availableMargin ?? Number.POSITIVE_INFINITY,
+        aggressiveScore: Math.max(0, Math.min(1, currentEv ?? 0.62)),
+        recentPnl: sizingStats.recentPnl,
+        recentWinRate: sizingStats.recentWinRate,
+        profitFactor: sizingStats.profitFactor,
+        drawdown: sizingStats.drawdown,
+        executionSlippageBps: sizingStats.executionSlippageBps,
+        campaignDepth: sameSideOpen.length + 1,
+        previousEntryMargin: sameSideOpen.length > 0 ? orderMargin : undefined,
+        currentOpenPositions: capitalPositionsForSizing(capitalCtx),
+        sideContextWinRate: sizingStats.sideContextWinRate,
+        sideContextProfitFactor: sizingStats.sideContextProfitFactor,
+        baseMarginFallback: config.marginPerTrade,
+        leverageFallback: config.leverage,
+        stopLossPct: config.stopLossPct,
+      });
+      if (sizingDecision.approved) {
+        orderMargin = sizingDecision.recommendedMargin;
+        orderLeverage = sizingDecision.recommendedLeverage;
+      } else if (config.allowExecution) {
+        gateRejects.push(...sizingDecision.gateRejects);
+      } else {
+        sizingWarning = sizingDecision.gateRejects[0] ?? sizingDecision.reason;
+      }
+    } catch (err) {
+      sizingWarning = err instanceof Error ? err.message : "position sizing failed";
+      req.log.warn({ err, symbol, positionSide }, "position sizing failed; using configured margin");
+    }
+  }
+
   // ── Observation mode ────────────────────────────────────────────────────────
   if (!config.allowExecution) {
     req.log.info({ symbol, side, positionSide, gateRejects, observationMode: true }, "bot order observation");
@@ -1006,6 +1289,12 @@ router.post("/bot/order", async (req: Request, res: Response) => {
       gateRejects,
       qbShadowRejects,
       observationMode: true,
+      riskTier: sizingDecision?.riskTier,
+      recommendedMargin: sizingDecision?.recommendedMargin,
+      recommendedLeverage: sizingDecision?.recommendedLeverage,
+      maxMarginApplied: orderMargin,
+      sizingReason: sizingDecision?.reason,
+      sizingWarning,
       message: gateRejects.length > 0
         ? `BLOCKED by ${gateRejects.length} gate(s). Also observation mode (SCALP_ALLOW_EXECUTION=false).`
         : "All gates pass. Observation mode active — set SCALP_ALLOW_EXECUTION=true to execute.",
@@ -1025,6 +1314,12 @@ router.post("/bot/order", async (req: Request, res: Response) => {
       quantity: quantity ?? null,
       gateRejects: ["LIVE_ENVIRONMENT_REJECT"],
       observationMode: false,
+      riskTier: sizingDecision?.riskTier,
+      recommendedMargin: sizingDecision?.recommendedMargin,
+      recommendedLeverage: sizingDecision?.recommendedLeverage,
+      maxMarginApplied: orderMargin,
+      sizingReason: sizingDecision?.reason,
+      sizingWarning,
       message: err instanceof Error ? err.message : "Real-money execution refused.",
     });
     return;
@@ -1069,6 +1364,19 @@ router.post("/bot/order", async (req: Request, res: Response) => {
     }
   }
 
+  if (capitalCtx) {
+    gateRejects.push(...portfolioRiskRejectsForOrder({
+      ctx: capitalCtx,
+      config,
+      symbol,
+      positionSide,
+      margin: orderMargin,
+      leverage: orderLeverage,
+      btcChangePct,
+      sizing: sizingDecision ?? undefined,
+    }));
+  }
+
   if (gateRejects.length > 0) {
     req.log.info({ symbol, side, positionSide, gateRejects }, "bot order gate reject");
     res.status(403).json({
@@ -1080,6 +1388,12 @@ router.post("/bot/order", async (req: Request, res: Response) => {
       gateRejects,
       qbShadowRejects,
       observationMode: false,
+      riskTier: sizingDecision?.riskTier,
+      recommendedMargin: sizingDecision?.recommendedMargin,
+      recommendedLeverage: sizingDecision?.recommendedLeverage,
+      maxMarginApplied: orderMargin,
+      sizingReason: sizingDecision?.reason,
+      sizingWarning,
       message: `REJECTED by ${gateRejects.length} gate(s): ${gateRejects[0]}`,
     });
     return;
@@ -1087,23 +1401,39 @@ router.post("/bot/order", async (req: Request, res: Response) => {
 
   // ── Compute quantity if not provided ────────────────────────────────────────
   let qty = quantity;
+  let referencePrice = 0;
   if (!qty) {
     // Fetch mark price to compute qty = (marginPerTrade × leverage) / markPrice
     try {
       const timestamp = Date.now();
       const url = `${BINGX_BASE}/openApi/swap/v2/quote/ticker?symbol=${encodeURIComponent(symbol)}&timestamp=${timestamp}`;
-      const tickerData = (await (await fetch(url)).json()) as Record<string, unknown>;
+      const tickerData = (await (await fetch(url, { signal: AbortSignal.timeout(3000) })).json()) as Record<string, unknown>;
       if (tickerData.code === 0) {
         const t = (tickerData.data as Record<string, string>) ?? {};
         const markPrice = parseFloat(t.lastPrice ?? "0");
         if (markPrice > 0) {
-          qty = (orderMargin * config.leverage) / markPrice;
+          referencePrice = markPrice;
+          qty = (orderMargin * orderLeverage) / markPrice;
           // Round to reasonable precision
           qty = Math.floor(qty * 1000) / 1000;
         }
       }
     } catch {
       // use fallback
+    }
+  }
+
+  if (referencePrice <= 0) {
+    try {
+      const timestamp = Date.now();
+      const url = `${BINGX_BASE}/openApi/swap/v2/quote/ticker?symbol=${encodeURIComponent(symbol)}&timestamp=${timestamp}`;
+      const tickerData = (await (await fetch(url, { signal: AbortSignal.timeout(3000) })).json()) as Record<string, unknown>;
+      if (tickerData.code === 0) {
+        const t = (tickerData.data as Record<string, string>) ?? {};
+        referencePrice = parseFloat(t.lastPrice ?? "0");
+      }
+    } catch {
+      // Protection will be marked high risk if no usable reference price is available.
     }
   }
 
@@ -1116,30 +1446,89 @@ router.post("/bot/order", async (req: Request, res: Response) => {
       quantity: null,
       gateRejects: ["QTY_REJECT: could not compute valid quantity"],
       observationMode: false,
+      riskTier: sizingDecision?.riskTier,
+      recommendedMargin: sizingDecision?.recommendedMargin,
+      recommendedLeverage: sizingDecision?.recommendedLeverage,
+      maxMarginApplied: orderMargin,
+      sizingReason: sizingDecision?.reason,
+      sizingWarning,
       message: "Could not determine order quantity. Provide quantity explicitly.",
     });
     return;
   }
 
+  const manualMarketEventId = candle.marketEventId;
+  if (!manualMarketEventId) {
+    res.status(409).json({
+      placed: false,
+      orderId: null,
+      symbol,
+      side,
+      quantity: qty,
+      gateRejects: ["MARKET_EVENT_REJECT: canonical completed candle event is unavailable"],
+      observationMode: false,
+      riskTier: sizingDecision?.riskTier,
+      recommendedMargin: sizingDecision?.recommendedMargin,
+      recommendedLeverage: sizingDecision?.recommendedLeverage,
+      maxMarginApplied: orderMargin,
+      sizingReason: sizingDecision?.reason,
+      sizingWarning,
+      message: "Canonical market event is required for live manual execution.",
+    });
+    return;
+  }
+  const clientOrderId = deterministicClientOrderId({
+    symbol,
+    side,
+    positionSide,
+    marketEventId: manualMarketEventId,
+  });
+  if (!claimMarketEventExecution(manualMarketEventId, positionSide)) {
+    res.status(409).json({
+      placed: false,
+      orderId: null,
+      symbol,
+      side,
+      quantity: qty,
+      gateRejects: ["DUPLICATE_EXECUTION_REJECT: candle event already executed"],
+      observationMode: false,
+      riskTier: sizingDecision?.riskTier,
+      recommendedMargin: sizingDecision?.recommendedMargin,
+      recommendedLeverage: sizingDecision?.recommendedLeverage,
+      maxMarginApplied: orderMargin,
+      sizingReason: sizingDecision?.reason,
+      sizingWarning,
+      message: "Duplicate candle execution rejected.",
+    });
+    return;
+  }
+  marketEventClaimed = true;
+
   // ── Execute order ────────────────────────────────────────────────────────────
   try {
-    const orderParams: Record<string, string | number> = {
+    const orderRequestedAt = Date.now();
+    const orderSentAt = orderRequestedAt;
+    const baseOrderParams: Record<string, string | number> = {
       symbol,
       side,
       positionSide,
       type: config.orderType,
       quantity: qty,
-      leverage: config.leverage,
+      leverage: orderLeverage,
+      clientOrderID: clientOrderId,
     };
+    const protection = withEntryProtection(baseOrderParams, referencePrice, positionSide, config);
 
     const data = await bingxPost(
       "/openApi/swap/v2/trade/order",
-      orderParams,
+      protection.orderParams,
       creds.apiKey,
       creds.secretKey,
     );
 
     if (data.code !== 0) {
+      releaseMarketEventExecution(manualMarketEventId, positionSide);
+      marketEventClaimed = false;
       req.log.error({ data }, "BingX order error");
       res.status(500).json({
         placed: false,
@@ -1149,17 +1538,98 @@ router.post("/bot/order", async (req: Request, res: Response) => {
         quantity: qty,
         gateRejects: [],
         observationMode: false,
+        riskTier: sizingDecision?.riskTier,
+        recommendedMargin: sizingDecision?.recommendedMargin,
+        recommendedLeverage: sizingDecision?.recommendedLeverage,
+        maxMarginApplied: orderMargin,
+        sizingReason: sizingDecision?.reason,
+        sizingWarning,
         message: `BingX error: ${(data.msg as string) ?? "unknown"}`,
       });
       return;
     }
 
+    const orderAckAt = Date.now();
     const order = (data.data as Record<string, unknown>)?.order as Record<string, unknown>;
+    const placedOrderId = String(order?.orderId ?? "");
+    const executedPrice = Number(order?.avgPrice ?? order?.price ?? 0);
     req.log.info({ symbol, side, positionSide, qty, orderId: order?.orderId }, "bot order placed");
+
+    if (!placedOrderId) {
+      req.log.error({ data, symbol, side, positionSide, qty }, "BingX order ACK missing orderId");
+      res.status(502).json({
+        placed: false,
+        orderId: null,
+        symbol,
+        side,
+        quantity: qty,
+        gateRejects: ["ORDER_ACK_AMBIGUOUS: BingX accepted request but did not return orderId"],
+        observationMode: false,
+        riskTier: sizingDecision?.riskTier,
+        recommendedMargin: sizingDecision?.recommendedMargin,
+        recommendedLeverage: sizingDecision?.recommendedLeverage,
+        maxMarginApplied: orderMargin,
+        sizingReason: sizingDecision?.reason,
+        sizingWarning,
+        message: "BingX order acknowledgement was ambiguous; do not retry until exchange state is reconciled.",
+      });
+      return;
+    }
+
+    if (placedOrderId) {
+      updateWatcherCreds(creds);
+      const btcRegimeForEntry: BtcRegime =
+        btcChangePct === undefined
+          ? "NEUTRAL"
+          : btcChangePct >= config.btcRegimeThresholdPct
+            ? "BULL"
+            : btcChangePct <= -config.btcRegimeThresholdPct
+              ? "BEAR"
+              : "NEUTRAL";
+      registerLiveEntry({
+        entryOrderId: placedOrderId,
+        symbol,
+        positionSide,
+        side,
+        expectedEntryPrice: executedPrice > 0 ? executedPrice : candle.lastClose,
+        qty,
+        leverage: orderLeverage,
+        marginUsed: orderMargin,
+        btcRegime: btcRegimeForEntry,
+        hourUtc: currentHour,
+        entryTime: orderAckAt,
+        expectedTpProfit: orderMargin * orderLeverage * (config.takeProfitPct / 100),
+        takeProfitPct: config.takeProfitPct,
+        stopLossPct: config.stopLossPct,
+        signalId: randomUUID(),
+        marketEventId: manualMarketEventId,
+        clientOrderId,
+        featureVersion: "candle-edge-v1",
+        ...liveEntryPolicyProvenance(),
+        signalCreatedAt: orderRequestedAt,
+        orderRequestedAt,
+        orderSentAt,
+        orderAckAt,
+        positionConfirmedAt: orderAckAt,
+        protectionAttachedAt: protection.protectionAttached ? orderAckAt : undefined,
+        orderType: config.orderType,
+        playbook: "MOMENTUM_BREAKOUT_SCALP",
+        readinessScopeId,
+        promotionState,
+        riskTier: sizingDecision?.riskTier === "NO_TRADE" ? undefined : sizingDecision?.riskTier,
+        sizeMultiplier: sizingDecision?.sizeMultiplier,
+        sizeReason: sizingDecision?.reason,
+        recommendedMargin: sizingDecision?.recommendedMargin,
+        recommendedLeverage: sizingDecision?.recommendedLeverage,
+        maxLossIfStop: sizingDecision?.maxLossIfStop,
+        notional: sizingDecision?.notional,
+        exitPolicy: protection.riskMode,
+      });
+    }
 
     res.json({
       placed: true,
-      orderId: String(order?.orderId ?? ""),
+      orderId: placedOrderId,
       symbol,
       side,
       quantity: qty,
@@ -1168,11 +1638,27 @@ router.post("/bot/order", async (req: Request, res: Response) => {
       message: `Order placed: ${side} ${qty} ${symbol} @ MARKET`,
       readinessScopeId,
       promotionState,
+      riskTier: sizingDecision?.riskTier,
+      recommendedMargin: sizingDecision?.recommendedMargin,
+      recommendedLeverage: sizingDecision?.recommendedLeverage,
       maxMarginApplied: orderMargin,
+      sizingReason: sizingDecision?.reason,
+      sizingWarning,
+      protectionAttached: protection.protectionAttached,
+      riskMode: protection.riskMode,
+      protectionStopPrice: protection.protectionStopPrice,
+      protectionTakeProfitPrice: protection.protectionTakeProfitPrice,
     });
   } catch (err) {
     req.log.error({ err }, "bot order execution error");
-    res.status(500).json({ error: "Order execution failed" });
+    res.status(500).json({
+      error: "Order execution failed",
+      clientOrderID: clientOrderId,
+      marketEventId: manualMarketEventId,
+      message: marketEventClaimed
+        ? "Execution failed after the exchange call may have been sent; the market event remains claimed until reconciliation."
+        : "Order execution failed before exchange acknowledgement.",
+    });
   }
 });
 
@@ -1198,20 +1684,6 @@ router.post("/bot/close", async (req: Request, res: Response) => {
 
   // Closing a LONG = SELL; closing a SHORT = BUY
   const closeSide = positionSide === "LONG" ? "SELL" : "BUY";
-
-  if (!config.allowExecution) {
-    res.json({
-      placed: false,
-      orderId: null,
-      symbol,
-      side: closeSide,
-      quantity: parseFloat(quantity),
-      gateRejects: [],
-      observationMode: true,
-      message: "Observation mode — set SCALP_ALLOW_EXECUTION=true to execute close.",
-    });
-    return;
-  }
 
   try {
     assertLiveExecutionAllowed(creds);
@@ -1289,6 +1761,66 @@ function buildBulkCorrelationRejects(orders: BulkOrderItem[], maxPerCluster: num
   });
 
   return rejects;
+}
+
+function capitalContextFromRequest(raw: unknown): CapitalContext | null {
+  if (!raw || typeof raw !== "object") return null;
+  const data = raw as Record<string, unknown>;
+  const equity = Number(data.equity ?? 0);
+  const usedMargin = Number(data.usedMargin ?? 0);
+  const availableMargin = Number(data.availableMargin ?? Math.max(0, equity - usedMargin));
+  const openPositions = Array.isArray(data.openPositions)
+    ? data.openPositions as Record<string, unknown>[]
+    : [];
+  if (!Number.isFinite(equity) || equity <= 0 || !Number.isFinite(availableMargin)) return null;
+  const countsBySide = new Map<string, { LONG: number; SHORT: number }>();
+  for (const p of openPositions) {
+    const sym = String(p.symbol ?? "").toUpperCase();
+    const side = String(p.positionSide ?? "").toUpperCase() as "LONG" | "SHORT";
+    if (!sym) continue;
+    const counts = countsBySide.get(sym) ?? { LONG: 0, SHORT: 0 };
+    if (side === "LONG" || side === "SHORT") counts[side] += 1;
+    countsBySide.set(sym, counts);
+  }
+  return {
+    openPositions,
+    openPositionsCount: openPositions.length,
+    marginUtilization: equity > 0 ? usedMargin / equity : 1,
+    equity,
+    usedMargin,
+    availableMargin,
+    countsBySide,
+    fetchedAt: Date.now(),
+  };
+}
+
+function summarizeCapitalRisk(ctx: CapitalContext, config: ReturnType<typeof getBotConfig>): Record<string, unknown> {
+  const positions = capitalPositionsForSizing(ctx);
+  const stopLossPct = Math.max(0.01, config.stopLossPct);
+  const bySymbol = new Map<string, number>();
+  const bySide = new Map<string, number>();
+  let totalRiskIfStop = 0;
+  let totalNotional = 0;
+  for (const pos of positions) {
+    const notional = pos.marginUsed * pos.leverage;
+    const risk = notional * (stopLossPct / 100);
+    totalNotional += notional;
+    totalRiskIfStop += risk;
+    bySymbol.set(pos.symbol, (bySymbol.get(pos.symbol) ?? 0) + risk);
+    bySide.set(pos.positionSide ?? "UNKNOWN", (bySide.get(pos.positionSide ?? "UNKNOWN") ?? 0) + risk);
+  }
+  return {
+    equity: ctx.equity,
+    availableMargin: ctx.availableMargin,
+    usedMargin: ctx.usedMargin,
+    marginUtilization: ctx.marginUtilization,
+    openPositions: ctx.openPositionsCount,
+    totalNotional,
+    effectiveLeverage: ctx.equity > 0 ? totalNotional / ctx.equity : null,
+    totalRiskIfStop,
+    riskBySymbol: Object.fromEntries(bySymbol),
+    riskBySide: Object.fromEntries(bySide),
+  };
 }
 
 /**
@@ -1841,6 +2373,10 @@ const QB_SNIPER_TIMEOUT_MS = Math.max(
   400,
   Number(process.env["QB_SNIPER_TIMEOUT_MS"] ?? 600),
 );
+const QB_ORDER_TIMEOUT_MS = Math.max(
+  400,
+  Number(process.env["QB_ORDER_TIMEOUT_MS"] ?? process.env["QB_SNIPER_TIMEOUT_MS"] ?? 600),
+);
 
 async function executeSingleOrder(
   item: BulkOrderItem,
@@ -1849,11 +2385,12 @@ async function executeSingleOrder(
   config: ReturnType<typeof getBotConfig>,
   preGateRejects: string[] = [],
   capitalCtx?: CapitalContext,
+  executionCtx: { readinessStatus?: LiveReadinessStatus } = {},
 ): Promise<BulkOrderResult> {
   const t0 = Date.now();
   const { symbol, side, positionSide, btcChangePct } = item;
   let orderMargin = item.marginOverride ?? config.marginPerTrade;
-  const orderLeverage = Math.max(1, Math.round(item.leverageOverride ?? config.leverage));
+  let orderLeverage = Math.max(1, Math.round(item.leverageOverride ?? config.leverage));
   const gateRejects: string[] = [...preGateRejects];
   const currentHour = new Date().getUTCHours();
   const killSwitch = evaluateLiveKillSwitch({
@@ -1878,6 +2415,14 @@ async function executeSingleOrder(
   if (candle) gateRejects.push(...candleConfirmationRejects(candle, positionSide, config));
   if (!marketEventId) {
     gateRejects.push("MARKET_EVENT_REJECT: canonical completed candle event is unavailable");
+  }
+  if (candleIsComplete !== true) {
+    gateRejects.push("INCOMPLETE_CANDLE_REJECT: live execution requires a completed candle");
+  }
+  if (!Number.isSafeInteger(featureTimestampMs) || (featureTimestampMs ?? 0) <= 0) {
+    gateRejects.push("FEATURE_TIMESTAMP_REJECT: feature timestamp is unavailable");
+  } else if ((featureTimestampMs ?? 0) > Date.now()) {
+    gateRejects.push("FEATURE_TIMESTAMP_REJECT: feature timestamp is in the future");
   }
 
   // Gate: symbol allowlist
@@ -1908,6 +2453,10 @@ async function executeSingleOrder(
   // ── Capital gate (use pre-fetched context if available) ───────────────────
   const ctx = capitalCtx ?? await fetchCapitalContext(creds).catch(() => null);
 
+  if (!ctx && config.allowExecution) {
+    gateRejects.push("CAPITAL_CONTEXT_REJECT: live capital snapshot unavailable");
+  }
+
   if (ctx) {
     if (ctx.openPositionsCount >= config.maxConcurrentPositions) {
       gateRejects.push(`CAPITAL_REJECT: ${ctx.openPositionsCount} positions >= max ${config.maxConcurrentPositions}`);
@@ -1930,12 +2479,23 @@ async function executeSingleOrder(
     if (sameSide >= stackLimit) {
       gateRejects.push(`STACK_REJECT: ${symbol} ${positionSide} at limit ${sameSide}/${stackLimit}`);
     }
+    gateRejects.push(...portfolioRiskRejectsForOrder({
+      ctx,
+      config,
+      symbol,
+      positionSide,
+      margin: orderMargin,
+      leverage: orderLeverage,
+      playbook,
+      btcChangePct,
+      sizing: item.sizing as PositionSizingDecision | undefined,
+    }));
   }
 
   // ── QB gate — hard 600ms cap so sniper is never held hostage ──────────────
   if (config.allowExecution) {
     const sameSideOpen = ctx?.countsBySide.get(symbol.toUpperCase())?.[positionSide] ?? 0;
-    const readinessStatus = buildLiveReadinessStatus({
+    const readinessStatus = executionCtx.readinessStatus ?? buildLiveReadinessStatus({
       outcomes: exportAllOutcomes(),
       closedDemoTrades: await loadClosedTrades(5_000),
       config,
@@ -1988,6 +2548,21 @@ async function executeSingleOrder(
           evaluateQuantBrainEdge({
             symbol, side, positionSide, hourUtc: currentHour,
             btcChangePct, currentEv: item.currentEv, config,
+            costModel: estimateExecutionCosts(
+              orderMargin,
+              orderLeverage,
+              config.takerFeeBps / 10_000,
+              undefined,
+              undefined,
+              {
+                takeProfitPct: config.takeProfitPct,
+                stopLossPct: config.stopLossPct,
+                grossEv: item.currentEv,
+                slippageBpsPerSide: config.slippageBpsPerSide,
+                fundingCostPct: config.estimatedFundingCostPct,
+                minEdgeOverCostPct: config.minEdgeOverCostPct,
+              },
+            ),
             signalId, marketEventId, expiresAt, featureVersion: "sniper-v1",
             featureTimestampMs, candleIsComplete, marketDataSource: "bingx",
             referencePrice: candle?.lastClose,
@@ -2004,8 +2579,8 @@ async function executeSingleOrder(
       if (!qbResult.allow) {
         gateRejects.push(...qbResult.gateRejects.map((r) => `QB_${r}`));
       }
-    } catch {
-      // QB timeout or error: NEVER block — sniper fires on local edge
+    } catch (err) {
+      gateRejects.push(`QB_ENFORCE_REJECT: ${err instanceof Error ? err.message : "Quant Brain unavailable"}`);
     }
   } else {
     // Shadow: fire-and-forget — never waits
@@ -2014,6 +2589,21 @@ async function executeSingleOrder(
         evaluateQuantBrainEdge({
           symbol, side, positionSide, hourUtc: currentHour,
           btcChangePct, currentEv: item.currentEv, config,
+          costModel: estimateExecutionCosts(
+            orderMargin,
+            orderLeverage,
+            config.takerFeeBps / 10_000,
+            undefined,
+            undefined,
+            {
+              takeProfitPct: config.takeProfitPct,
+              stopLossPct: config.stopLossPct,
+              grossEv: item.currentEv,
+              slippageBpsPerSide: config.slippageBpsPerSide,
+              fundingCostPct: config.estimatedFundingCostPct,
+              minEdgeOverCostPct: config.minEdgeOverCostPct,
+            },
+          ),
           signalId, marketEventId, expiresAt, featureVersion: "sniper-v1",
           featureTimestampMs, candleIsComplete, marketDataSource: "bingx",
           referencePrice: candle?.lastClose,
@@ -2065,9 +2655,9 @@ async function executeSingleOrder(
   }
 
   // Compute qty from mark price (use pre-fetched price hint if available via item)
-  let expectedEntryPrice = 0;
+  let expectedEntryPrice = item.expectedEntryPrice ?? 0;
   let qty = item.quantity;
-  if (!qty) {
+  if (!qty || expectedEntryPrice <= 0) {
     try {
       const url = `${BINGX_BASE}/openApi/swap/v2/quote/ticker?symbol=${encodeURIComponent(symbol)}&timestamp=${Date.now()}`;
       const json = (await (await fetch(url, { signal: AbortSignal.timeout(3000) })).json()) as Record<string, unknown>;
@@ -2076,7 +2666,7 @@ async function executeSingleOrder(
         const markPrice = parseFloat(d.lastPrice ?? "0");
         if (markPrice > 0) {
           expectedEntryPrice = markPrice;
-          qty = Math.floor((orderMargin * orderLeverage) / markPrice * 1000) / 1000;
+          if (!qty) qty = Math.floor((orderMargin * orderLeverage) / markPrice * 1000) / 1000;
         }
       }
     } catch { /* fallthrough */ }
@@ -2101,13 +2691,24 @@ async function executeSingleOrder(
   }
 
   // Place order
+  const clientOrderId = deterministicClientOrderId({ symbol, side, positionSide, marketEventId });
   try {
     recordPredictionExecutionAge(predictionTimestamp);
     const orderRequestedAt = Date.now();
     const orderSentAt = orderRequestedAt;
+    const baseOrderParams: Record<string, string | number> = {
+      symbol,
+      side,
+      positionSide,
+      type: config.orderType,
+      quantity: qty,
+      leverage: orderLeverage,
+      clientOrderID: clientOrderId,
+    };
+    const protection = withEntryProtection(baseOrderParams, expectedEntryPrice, positionSide, config);
     const data = await bingxPost(
       "/openApi/swap/v2/trade/order",
-      { symbol, side, positionSide, type: config.orderType, quantity: qty, leverage: orderLeverage },
+      protection.orderParams,
       creds.apiKey, creds.secretKey,
     );
     const orderAckAt = Date.now();
@@ -2144,6 +2745,17 @@ async function executeSingleOrder(
       message: placedOrderId ? "order placed" : "order ack missing id",
     });
 
+    if (!placedOrderId) {
+      return {
+        index, symbol, side, placed: false, orderId: null,
+        quantity: qty,
+        gateRejects: ["ORDER_ACK_AMBIGUOUS: BingX accepted request but did not return orderId"],
+        observationMode: false,
+        message: "Ambiguous BingX ACK; market event remains claimed until reconciliation confirms the exchange state.",
+        durationMs: Date.now() - t0,
+      };
+    }
+
     // Register entry for autonomous outcome recording — watcher polls BingX
     // every LIVE_WATCHER_POLL_MS and records the outcome when the position closes.
     if (placedOrderId) {
@@ -2178,20 +2790,23 @@ async function executeSingleOrder(
         notional: sizingDecision?.notional,
         signalId,
         marketEventId,
+        clientOrderId,
         predictionId,
         featureVersion: "sniper-v1",
+        ...liveEntryPolicyProvenance(),
         signalCreatedAt,
         qbEvaluatedAt,
         orderRequestedAt,
         orderSentAt,
         orderAckAt,
         positionConfirmedAt: orderAckAt,
+        protectionAttachedAt: protection.protectionAttached ? orderAckAt : undefined,
         orderType: config.orderType,
         playbook,
         readinessScopeId,
         promotionState,
         stackingDepth: item.stackingDepth,
-        exitPolicy: item.exitPolicy ?? "TP_SL_PROTECTED",
+        exitPolicy: item.exitPolicy ?? protection.riskMode,
       });
     }
 
@@ -2200,10 +2815,13 @@ async function executeSingleOrder(
       quantity: qty, gateRejects: [], observationMode: false,
       message: `Placed: ${side} ${qty} ${symbol}`,
       sizing: item.sizing,
+      protectionAttached: protection.protectionAttached,
+      riskMode: protection.riskMode,
+      protectionStopPrice: protection.protectionStopPrice,
+      protectionTakeProfitPrice: protection.protectionTakeProfitPrice,
       durationMs: Date.now() - t0,
     };
   } catch (err) {
-    releaseMarketEventExecution(marketEventId, positionSide);
     recordKillSwitchExecutionAttempt({
       placed: false,
       latencyMs: Date.now() - t0,
@@ -2215,7 +2833,7 @@ async function executeSingleOrder(
     return {
       index, symbol, side, placed: false, orderId: null,
       quantity: qty, gateRejects: [], observationMode: false,
-      message: `Execution error: ${err instanceof Error ? err.message : String(err)}`,
+      message: `Execution error after clientOrderID ${clientOrderId}: ${err instanceof Error ? err.message : String(err)}`,
       durationMs: Date.now() - t0,
     };
   }
@@ -2232,7 +2850,103 @@ async function executeSingleOrder(
  *
  * Body: { candidates: Array<{ symbol, positionSide, combinedScore?, currentEv?, btcChangePct? }>, ordersPerSecond? }
  */
-router.post("/bot/sniper/mass", async (req: Request, res: Response) => {
+router.post("/sniper/risk/simulate-cycle", async (req: Request, res: Response) => {
+  const creds = getCredentials(req);
+  let config = getBotConfig();
+  if (req.body?.config && typeof req.body.config === "object") {
+    config = { ...config, ...(req.body.config as Partial<ReturnType<typeof getBotConfig>>) };
+  }
+  const candidates = Array.isArray(req.body?.candidates) ? req.body.candidates as BulkOrderItem[] : [];
+  if (candidates.length === 0) {
+    res.status(400).json({ error: "candidates must be a non-empty array" });
+    return;
+  }
+  if (candidates.length > 50) {
+    res.status(400).json({ error: "Max 50 candidates per simulation" });
+    return;
+  }
+
+  const capitalCtx = capitalContextFromRequest(req.body?.capital)
+    ?? (creds ? await fetchCapitalContext(creds).catch(() => null) : null);
+  if (!capitalCtx) {
+    res.status(200).json({
+      approved: [],
+      rejected: candidates.map((candidate, index) => ({
+        index,
+        symbol: candidate.symbol,
+        positionSide: candidate.positionSide,
+        reasons: ["CAPITAL_CONTEXT_REJECT: capital snapshot unavailable"],
+      })),
+      recommendedSafeBatch: [],
+      capitalSnapshot: null,
+      riskTotals: null,
+    });
+    return;
+  }
+
+  const correlationRejects = buildBulkCorrelationRejects(candidates, maxCorrelatedBulkOrders());
+  const approved: Array<Record<string, unknown>> = [];
+  const rejected: Array<Record<string, unknown>> = [];
+  for (let index = 0; index < candidates.length; index++) {
+    const candidate = candidates[index];
+    const margin = candidate.marginOverride ?? config.marginPerTrade;
+    const leverage = Math.max(1, Math.round(candidate.leverageOverride ?? config.leverage));
+    const reasons = [
+      ...(correlationRejects.get(index) ?? []),
+      ...portfolioRiskRejectsForOrder({
+        ctx: capitalCtx,
+        config,
+        symbol: candidate.symbol,
+        positionSide: candidate.positionSide,
+        margin,
+        leverage,
+        playbook: candidate.playbook,
+        btcChangePct: candidate.btcChangePct,
+        sizing: candidate.sizing as PositionSizingDecision | undefined,
+      }),
+    ];
+    const riskIncrement = margin * leverage * (Math.max(0.01, config.stopLossPct) / 100);
+    const row = {
+      index,
+      symbol: candidate.symbol,
+      side: candidate.side,
+      positionSide: candidate.positionSide,
+      playbook: candidate.playbook ?? "MOMENTUM_BREAKOUT_SCALP",
+      btcChangePct: candidate.btcChangePct,
+      margin,
+      leverage,
+      notional: margin * leverage,
+      riskIncrement,
+      reasons,
+    };
+    if (reasons.length > 0) {
+      rejected.push(row);
+      continue;
+    }
+    approved.push(row);
+    projectOrderIntoCapitalContext(capitalCtx, {
+      symbol: candidate.symbol,
+      positionSide: candidate.positionSide,
+      margin,
+      leverage,
+    });
+  }
+
+  res.json({
+    approved,
+    rejected,
+    recommendedSafeBatch: approved,
+    capitalSnapshot: {
+      openPositions: capitalCtx.openPositionsCount,
+      marginUtilization: capitalCtx.marginUtilization,
+      equity: capitalCtx.equity,
+      availableMargin: capitalCtx.availableMargin,
+    },
+    riskTotals: summarizeCapitalRisk(capitalCtx, config),
+  });
+});
+
+router.post("/bot/sniper/mass", requireAdminAuthorization, async (req: Request, res: Response) => {
   const creds = getCredentials(req);
   if (!creds) { res.status(401).json({ error: "Not connected." }); return; }
 
@@ -2378,6 +3092,13 @@ router.post("/bot/sniper/mass", async (req: Request, res: Response) => {
   const projectedPositions = capitalPositionsForSizing(capitalCtx);
   const dataQualityStatus = getMarketDataQualityStatus();
   const dataQualityDegraded = dataQualityStatus.incidents.some((incident) => Date.now() - incident.occurredAt < 10 * 60_000);
+  const readinessStatus = aggressiveConfig.allowExecution
+    ? buildLiveReadinessStatus({
+        outcomes: recentOutcomes,
+        closedDemoTrades: await loadClosedTrades(5_000),
+        config: aggressiveConfig,
+      })
+    : undefined;
 
   for (let i = 0; i < toFire.length; i++) {
     await bucket.consume();
@@ -2455,6 +3176,7 @@ router.post("/bot/sniper/mass", async (req: Request, res: Response) => {
       orderConfig,
       correlationRejects.get(i) ?? [],
       capitalCtx ?? undefined,
+      { readinessStatus },
     );
     results.push(result);
     if (result.placed) {
@@ -2462,6 +3184,12 @@ router.post("/bot/sniper/mass", async (req: Request, res: Response) => {
         symbol: c.symbol,
         positionSide: c.positionSide,
         marginUsed: sizing.recommendedMargin,
+        leverage: sizing.recommendedLeverage,
+      });
+      projectOrderIntoCapitalContext(capitalCtx, {
+        symbol: c.symbol,
+        positionSide: c.positionSide,
+        margin: sizing.recommendedMargin,
         leverage: sizing.recommendedLeverage,
       });
     }
@@ -2517,7 +3245,7 @@ router.post("/bot/sniper/mass", async (req: Request, res: Response) => {
 // ── Sniper: Autopilot endpoints ───────────────────────────────────────────────
 
 /** POST /api/bot/sniper/autopilot/start — begin server-side autonomous scalp loop */
-router.post("/bot/sniper/autopilot/start", (req: Request, res: Response) => {
+router.post("/bot/sniper/autopilot/start", requireAdminAuthorization, (req: Request, res: Response) => {
   const creds = getCredentials(req);
   if (!creds) { res.status(401).json({ error: "Not connected." }); return; }
 
@@ -2527,6 +3255,19 @@ router.post("/bot/sniper/autopilot/start", (req: Request, res: Response) => {
   }
 
   const config = getBotConfig();
+  if (!config.allowExecution) {
+    res.status(403).json({ started: false, reason: "SCALP_ALLOW_EXECUTION=false blocks live autopilot." });
+    return;
+  }
+  try {
+    assertLiveExecutionAllowed(creds);
+  } catch (err) {
+    res.status(403).json({
+      started: false,
+      reason: err instanceof Error ? err.message : "Real-money execution refused.",
+    });
+    return;
+  }
   const intervalMs = config.sniperAutopilotIntervalSec * 1000;
 
   autopilot.running = true;
@@ -2557,7 +3298,7 @@ router.post("/bot/sniper/autopilot/start", (req: Request, res: Response) => {
 });
 
 /** POST /api/bot/sniper/autopilot/stop — halt the autonomous loop */
-router.post("/bot/sniper/autopilot/stop", (req: Request, res: Response) => {
+router.post("/bot/sniper/autopilot/stop", requireAdminAuthorization, (req: Request, res: Response) => {
   if (!autopilot.running) {
     res.json({ stopped: false, reason: "Autopilot was not running" });
     return;
@@ -2599,7 +3340,43 @@ router.get("/bot/sniper/autopilot/status", (_req: Request, res: Response) => {
  *  a token-bucket rate limiter so BingX's 10 orders/second cap is respected.
  *  Each order runs through the full gate pipeline before hitting the exchange.
  */
-router.post("/bot/order/bulk", async (req: Request, res: Response) => {
+/** GET /api/sniper/concurrency/status - live lock/idempotency health snapshot */
+router.get("/sniper/concurrency/status", (_req: Request, res: Response) => {
+  const dataQuality = getMarketDataQualityStatus();
+  const watcher = getLiveWatcherStats();
+  const quantQueue = getQuantBrainQueueStats();
+  const telemetry = getTelemetryStats();
+  const recentRaceWarnings = dataQuality.incidents
+    .filter((incident) => ["DUPLICATE_EXECUTION", "DUPLICATE", "OUT_OF_ORDER", "STALE"].includes(incident.type))
+    .slice(-20);
+
+  res.json({
+    activeExecutionClaims: {
+      count: dataQuality.activeExecutionClaims,
+      keys: dataQuality.activeExecutionClaimKeys,
+    },
+    autopilotCycleInFlight,
+    skippedOverlaps: {
+      autopilot: autopilotSkippedOverlaps,
+      watcher: watcher.skippedOverlaps,
+    },
+    pendingOutcomes: quantQueue.pendingOutcomes,
+    outboxFlushInFlight: quantQueue.flushInFlight,
+    telemetryWriteQueueDepth: telemetry.bufferSize,
+    watcherTrackedPositions: watcher.trackedEntries,
+    duplicateClaimsRejected: dataQuality.metrics.duplicateExecutions,
+    recentRaceWarnings,
+    lockHealth: {
+      marketEventClaims: "ok",
+      autopilotCycle: autopilotCycleInFlight ? "in_flight" : "idle",
+      quantBrainOutbox: quantQueue.flushInFlight ? "flushing" : "idle",
+      liveWatcher: watcher.pollInFlight ? "polling" : "idle",
+      telemetryWriter: telemetry.bufferSize > 0 ? "buffered" : "idle",
+    },
+  });
+});
+
+router.post("/bot/order/bulk", requireAdminAuthorization, async (req: Request, res: Response) => {
   const creds = getCredentials(req);
   if (!creds) {
     res.status(401).json({ error: "Not connected." });
@@ -2658,11 +3435,34 @@ router.post("/bot/order/bulk", async (req: Request, res: Response) => {
     correlationRejected: correlationRejects.size,
     openPositions: capitalCtx?.openPositionsCount ?? "unknown",
   }, "bulk execution started");
+  const readinessStatus = config.allowExecution
+    ? buildLiveReadinessStatus({
+        outcomes: exportAllOutcomes(),
+        closedDemoTrades: await loadClosedTrades(5_000),
+        config,
+      })
+    : undefined;
 
   for (let i = 0; i < orders.length; i++) {
     await bucket.consume(); // respect rate limit
-    const result = await executeSingleOrder(orders[i], i, creds, config, correlationRejects.get(i) ?? [], capitalCtx);
+    const result = await executeSingleOrder(
+      orders[i],
+      i,
+      creds,
+      config,
+      correlationRejects.get(i) ?? [],
+      capitalCtx,
+      { readinessStatus },
+    );
     results.push(result);
+    if (result.placed) {
+      projectOrderIntoCapitalContext(capitalCtx, {
+        symbol: orders[i].symbol,
+        positionSide: orders[i].positionSide,
+        margin: orders[i].marginOverride ?? config.marginPerTrade,
+        leverage: Math.max(1, Math.round(orders[i].leverageOverride ?? config.leverage)),
+      });
+    }
   }
 
   const placed = results.filter((r) => r.placed).length;
@@ -2683,6 +3483,121 @@ router.post("/bot/order/bulk", async (req: Request, res: Response) => {
 /** GET /api/bot/watcher — live position watcher health and registry snapshot */
 router.get("/bot/watcher", (_req: Request, res: Response) => {
   res.json(getLiveWatcherStats());
+});
+
+/** GET /api/sniper/protection/status — local protection and exit reliability snapshot */
+router.get("/sniper/protection/status", (_req: Request, res: Response) => {
+  const now = Date.now();
+  const watcher = getLiveWatcherStats();
+  const outcomes = exportAllOutcomes().filter((outcome) => !isDemoOutcome(outcome));
+  const recentOutcomes = outcomes.filter((outcome) => now - outcome.exitTime <= 7 * 24 * 60 * 60 * 1000);
+  const openUnprotected = watcher.entries.filter((entry) => !entry.protectionAttachedAt);
+  const unprotectedRiskUsdt = openUnprotected.reduce(
+    (sum, entry) => sum + entry.marginUsed * entry.leverage * (getBotConfig().stopLossPct / 100),
+    0,
+  );
+  const watcherLagMs = watcher.lastPollAt ? now - watcher.lastPollAt : null;
+  const stalePositions = watcher.entries
+    .filter((entry) => entry.ageMs > Math.max(watcher.pollIntervalMs * 4, 60_000))
+    .map((entry) => ({
+      entryOrderId: entry.entryOrderId,
+      symbol: entry.symbol,
+      positionSide: entry.positionSide,
+      ageMs: entry.ageMs,
+      protected: Boolean(entry.protectionAttachedAt),
+    }));
+
+  const byPlaybook = new Map<string, { trades: number; wins: number; pnl: number; gaveBack: number; sl: number }>();
+  const bySymbol = new Map<string, { trades: number; pnl: number; gaveBack: number; sl: number }>();
+  for (const outcome of recentOutcomes) {
+    const playbook = outcome.playbook ?? "UNKNOWN";
+    const symbol = outcome.symbol.toUpperCase();
+    const mfe = outcome.mfe ?? 0;
+    const gaveBack = Math.max(0, mfe - outcome.realizedPnl);
+    const playbookRow = byPlaybook.get(playbook) ?? { trades: 0, wins: 0, pnl: 0, gaveBack: 0, sl: 0 };
+    playbookRow.trades += 1;
+    playbookRow.wins += outcome.realizedPnl > 0 ? 1 : 0;
+    playbookRow.pnl += outcome.realizedPnl;
+    playbookRow.gaveBack += gaveBack;
+    playbookRow.sl += outcome.exitReason === "SL" ? 1 : 0;
+    byPlaybook.set(playbook, playbookRow);
+
+    const symbolRow = bySymbol.get(symbol) ?? { trades: 0, pnl: 0, gaveBack: 0, sl: 0 };
+    symbolRow.trades += 1;
+    symbolRow.pnl += outcome.realizedPnl;
+    symbolRow.gaveBack += gaveBack;
+    symbolRow.sl += outcome.exitReason === "SL" ? 1 : 0;
+    bySymbol.set(symbol, symbolRow);
+  }
+
+  const exitQuality = Array.from(byPlaybook.entries()).map(([playbook, row]) => ({
+    playbook,
+    trades: row.trades,
+    winRate: row.trades > 0 ? row.wins / row.trades : 0,
+    netPnl: row.pnl,
+    avgGaveBack: row.trades > 0 ? row.gaveBack / row.trades : 0,
+    slRate: row.trades > 0 ? row.sl / row.trades : 0,
+  })).sort((a, b) => a.netPnl - b.netPnl);
+
+  const topSymbolsWithBadExit = Array.from(bySymbol.entries())
+    .map(([symbol, row]) => ({
+      symbol,
+      trades: row.trades,
+      netPnl: row.pnl,
+      avgGaveBack: row.trades > 0 ? row.gaveBack / row.trades : 0,
+      slRate: row.trades > 0 ? row.sl / row.trades : 0,
+    }))
+    .filter((row) => row.trades >= 2 && (row.netPnl < 0 || row.slRate >= 0.5))
+    .sort((a, b) => a.netPnl - b.netPnl)
+    .slice(0, 10);
+
+  const recentProtected = outcomes.slice(-100).filter((outcome) => outcome.protectionAttachedAt).length;
+  const protectionAttachFailureRate = outcomes.length > 0
+    ? 1 - recentProtected / Math.min(100, outcomes.length)
+    : openUnprotected.length > 0 ? 1 : 0;
+  const pendingCloseRecon = watcher.closesDetected - watcher.outcomesRecorded;
+  const latestCriticalFailures = [
+    ...openUnprotected.slice(0, 5).map((entry) => ({
+      severity: "CRITICAL",
+      type: "UNPROTECTED_OPEN_POSITION",
+      symbol: entry.symbol,
+      positionSide: entry.positionSide,
+      ageMs: entry.ageMs,
+    })),
+    ...(watcher.lastError ? [{ severity: "HIGH", type: "WATCHER_ERROR", message: watcher.lastError }] : []),
+  ];
+  const recommendedActions: string[] = [];
+  if (openUnprotected.length > 0) recommendedActions.push("Reconcile unprotected live entries and close or attach exchange protection manually.");
+  if (watcherLagMs === null || watcherLagMs > watcher.pollIntervalMs * 3) recommendedActions.push("Restart or investigate livePositionWatcher; polling is stale.");
+  if (pendingCloseRecon > 0) recommendedActions.push("Review order history reconciliation before increasing sniper size.");
+  if (topSymbolsWithBadExit.length > 0) recommendedActions.push("Reduce or pause symbols with negative exit quality until recent outcomes recover.");
+
+  res.json({
+    generatedAt: now,
+    openPositions: {
+      protected: watcher.entries.filter((entry) => entry.protectionAttachedAt).length,
+      unprotected: openUnprotected.length,
+      entries: watcher.entries.map((entry) => ({
+        entryOrderId: entry.entryOrderId,
+        symbol: entry.symbol,
+        positionSide: entry.positionSide,
+        protected: Boolean(entry.protectionAttachedAt),
+        riskMode: entry.exitPolicy ?? (entry.protectionAttachedAt ? "TP_SL_PROTECTED" : "UNPROTECTED_HIGH_RISK"),
+        ageMs: entry.ageMs,
+        marginUsed: entry.marginUsed,
+        leverage: entry.leverage,
+      })),
+    },
+    protectionAttachFailureRate,
+    watcherLagMs,
+    stalePositions,
+    pendingCloseRecon,
+    unprotectedRiskUsdt,
+    exitQuality,
+    topSymbolsWithBadExit,
+    latestCriticalFailures,
+    recommendedActions,
+  });
 });
 
 export default router;
