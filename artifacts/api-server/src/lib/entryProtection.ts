@@ -128,13 +128,13 @@ export function buildAttachedProtection(
       type: "STOP_MARKET",
       stopPrice,
       workingType: "MARK_PRICE",
-      stopGuaranteed: false,
+      stopGuaranteed: "false",
     }),
     takeProfit: JSON.stringify({
       type: "TAKE_PROFIT_MARKET",
       stopPrice: takeProfitPrice,
       workingType: "MARK_PRICE",
-      stopGuaranteed: false,
+      stopGuaranteed: "false",
     }),
   };
 }

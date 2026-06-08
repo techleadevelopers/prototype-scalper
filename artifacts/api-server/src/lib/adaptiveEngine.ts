@@ -32,7 +32,10 @@ import crypto from "crypto";
 
 // ========== SCHEMAS ==========
 
-export const BtcRegimeSchema = z.enum(["BULL", "BEAR", "NEUTRAL"]);
+export const BtcRegimeSchema = z.preprocess(
+  (v) => v === "BULLISH" ? "BULL" : v === "BEARISH" ? "BEAR" : v,
+  z.enum(["BULL", "BEAR", "NEUTRAL"]),
+);
 export type BtcRegime = z.infer<typeof BtcRegimeSchema>;
 
 export const PositionSideSchema = z.enum(["LONG", "SHORT"]);
