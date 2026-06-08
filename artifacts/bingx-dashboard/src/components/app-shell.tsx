@@ -26,6 +26,7 @@ import {
   Radio,
   FlaskConical,
   BrainCircuit,
+  ShieldCheck,
 } from "lucide-react";
 import {
   Line,
@@ -43,6 +44,7 @@ const NAV = [
   { href: "/intelligence", label: "IA Sniper", icon: BrainCircuit },
   { href: "/bot", label: "Bot", icon: Bot },
   { href: "/demo", label: "Demo Lab", icon: FlaskConical, highlight: true },
+  { href: "/pipeline", label: "Pipeline", icon: ShieldCheck },
   { href: "/settings", label: "Settings", icon: Settings },
 ];
 
@@ -223,7 +225,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   return (
     <div className="flex h-screen bg-background text-foreground overflow-hidden">
       {/* Sidebar */}
-      <aside className="w-56 shrink-0 flex flex-col border-r border-border/50 bg-card/30 backdrop-blur-sm overflow-y-auto custom-scrollbar">
+      <aside className="w-56 shrink-0 flex flex-col border-r border-border/50 bg-card/30 backdrop-blur-sm overflow-y-auto">
         {/* Brand */}
         <div className="flex items-center gap-2.5 px-4 py-4 border-b border-border/40 shrink-0">
           <div className="p-1.5 bg-primary/15 rounded-md">
