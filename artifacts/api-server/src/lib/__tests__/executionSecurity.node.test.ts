@@ -35,7 +35,7 @@ test("real execution requires explicit live configuration and matching account i
     REAL_EXECUTION_ENABLED: "true",
     REAL_EXECUTION_CONFIRMATION: "I_ACKNOWLEDGE_REAL_MONEY",
     LIVE_ACCOUNT_ID: "approved-live-account",
-    ADMIN_API_TOKEN: "admin-token",
+    ADMIN_API_TOKEN: "admin-token-with-at-least-32-characters",
   };
   assert.doesNotThrow(() => assertLiveExecutionAllowed(liveCredentials, env));
   assert.throws(
@@ -52,6 +52,16 @@ test("startup refuses environment and credential disagreement", () => {
   assert.throws(
     () => validateExecutionStartup({ EXECUTION_ENV: "live", REAL_EXECUTION_ENABLED: "false" }),
     /requires REAL_EXECUTION_ENABLED=true/,
+  );
+  assert.throws(
+    () => validateExecutionStartup({
+      EXECUTION_ENV: "live",
+      REAL_EXECUTION_ENABLED: "true",
+      REAL_EXECUTION_CONFIRMATION: "I_ACKNOWLEDGE_REAL_MONEY",
+      LIVE_ACCOUNT_ID: "approved-live-account",
+      ADMIN_API_TOKEN: "short",
+    }),
+    /ADMIN_API_TOKEN must be at least 32 characters/,
   );
 });
 
