@@ -7,10 +7,17 @@ import { logger } from "./lib/logger";
 import { initTelemetryStore, exportAllOutcomes } from "./lib/telemetryStore";
 import { startQuantBrainOutcomeSync } from "./lib/quantBrainClient";
 import { startLivePositionWatcher } from "./lib/livePositionWatcher";
+import { beginRequestMeasurement } from "./lib/runtimeMetrics";
+import { validateExecutionStartup } from "./lib/executionSecurity";
 
+const execution = validateExecutionStartup();
 initTelemetryStore();
-startQuantBrainOutcomeSync(exportAllOutcomes());
-startLivePositionWatcher();
+startQuantBrainOutcomeSync(
+  exportAllOutcomes().filter(
+    (outcome) => outcome.source !== "bingx-vst" || outcome.id.startsWith("campaign:"),
+  ),
+);
+if (execution.environment === "live") startLivePositionWatcher();
 logger.info("Adaptive telemetry engine initialized");
 
 const app: Express = express();
@@ -60,6 +67,11 @@ app.use(
 );
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+app.use((_req, res, next) => {
+  const finish = beginRequestMeasurement();
+  res.once("finish", finish);
+  next();
+});
 
 const SESSION_SECRET_DEFAULT = "bingx-dashboard-secret-change-me";
 const sessionSecret = process.env.SESSION_SECRET ?? SESSION_SECRET_DEFAULT;
