@@ -2,17 +2,22 @@
  * Demo Trade Store — persistent JSONL ledger for open demo positions and closed outcomes.
  *
  * Survives API server restarts (unlike the in-memory sniperOpenTrades Map).
- * Adds campaign_id, signal_id, mfe, mae, holdDurationMs, fallbackMode,
- * edgeFeatures, modelVersion to the canonical trade record.
+ * Provides idempotent writes, crash-safe atomic renames, deduplication,
+ * campaign-level outcome aggregation, and bounded file growth.
  *
  * Two files:
- *   demo-open.jsonl   — one entry per open position (upserted on placement, deleted on close)
- *   demo-closed.jsonl — append-only closed trade ledger with full accounting
+ *   demo-open.jsonl   — current open entries (atomic rewrite via .tmp)
+ *   demo-closed.jsonl — append-only closed trade ledger (archived at MAX_CLOSED_LINES)
  *
  * Campaign semantics:
  *   Entries for the same symbol+positionSide placed within CAMPAIGN_WINDOW_MS
  *   of the first entry share the same campaign_id. A new campaign starts when
  *   the symbol+side has been flat for longer than the window.
+ *
+ * Idempotency:
+ *   persistOpenTrade  — skips if orderId already exists in _openTrades
+ *   closeOpenTrade    — skips if tradeId already in _closedTradeIds
+ *   Both operations are serialized through _writeLock.
  */
 
 import fs from "fs";
@@ -23,10 +28,29 @@ import { logger } from "./logger";
 
 // ========== CONSTANTS ==========
 
-const DATA_DIR = path.join(process.cwd(), "data");
-const OPEN_FILE = path.join(DATA_DIR, "demo-open.jsonl");
-const CLOSED_FILE = path.join(DATA_DIR, "demo-closed.jsonl");
+// DATA_DIR can be overridden for testing via setDataDir(); all path accessors
+// use the getter so test isolation works without module re-import.
+let _dataDir = path.join(process.cwd(), "data");
+function DATA_DIR()   { return _dataDir; }
+function OPEN_FILE()  { return path.join(_dataDir, "demo-open.jsonl"); }
+function CLOSED_FILE(){ return path.join(_dataDir, "demo-closed.jsonl"); }
+function ARCHIVE_DIR(){ return path.join(_dataDir, "archive"); }
+
+/** Override data directory — for tests only. Must be called before initDemoTradeStore(). */
+export function setDataDir(dir: string): void { _dataDir = dir; }
+
+/** Reset all in-memory state — for tests only. Does NOT touch files. */
+export function _resetStoreForTesting(): void {
+  _openTrades    = new Map();
+  _openByOrderId = new Map();
+  _campaigns     = new Map();
+  _closedTradeIds = new Set();
+  _closedCache   = new Map();
+  _writeLock     = Promise.resolve();
+}
 const CAMPAIGN_WINDOW_MS = parseInt(process.env["DEMO_CAMPAIGN_WINDOW_MS"] ?? "3600000", 10); // 1h
+const MAX_CLOSED_LINES = parseInt(process.env["DEMO_MAX_CLOSED_LINES"] ?? "10000", 10);
+const MAX_CLOSED_CACHE = parseInt(process.env["DEMO_MAX_CLOSED_CACHE"] ?? "2000", 10);
 
 // ========== TYPES ==========
 
@@ -35,6 +59,7 @@ export interface DemoTradeEntry {
   campaignId: string;
   signalId: string;
   orderId: string;
+  clientOrderId: string | null;
   symbol: string;
   side: "BUY" | "SELL";
   positionSide: "LONG" | "SHORT";
@@ -74,25 +99,58 @@ export interface DemoClosedTrade extends DemoTradeEntry {
   slippagePctNotional: number;
   funding: number;
   realizedPnl: number;
-  pnlSource: "balance_delta" | "price_estimate";
+  pnlSource: "exchange_reported" | "balance_delta" | "price_estimate";
   estimated: boolean;
   exitReason: "TP" | "SL" | "MANUAL";
   exitOrderId: string | null;
 }
 
+/**
+ * Aggregated campaign outcome — one ML sample per campaign (not per entry).
+ * Contains only information available at the first entry time.
+ */
+export interface DemoCampaignOutcome {
+  campaignId: string;
+  symbol: string;
+  positionSide: "LONG" | "SHORT";
+  side: "BUY" | "SELL";
+  entryCount: number;
+  openedAt: number;             // first entry time
+  closedAt: number;             // last exit time
+  holdDurationMs: number;
+  totalQty: number;
+  totalNotional: number;
+  totalMarginUsed: number;
+  avgEntryPrice: number;        // notional-weighted
+  avgExitPrice: number;         // notional-weighted
+  grossPnl: number;
+  totalFee: number;
+  realizedPnl: number;
+  mfe: number;                  // max MFE across entries
+  mae: number;                  // min MAE across entries (most negative)
+  exitReasons: Record<string, number>;
+  btcRegime: string;            // from first entry
+  hourUtc: number;              // from first entry
+  fallbackMode: boolean;        // true if any entry was fallback
+  modelVersion: string | null;  // from first entry
+  pnlSource: "exchange_reported" | "balance_delta" | "price_estimate";
+  estimated: boolean;
+}
+
 // ========== IN-MEMORY STATE ==========
 
-// open entries keyed by tradeId
-let _openTrades = new Map<string, DemoTradeEntry>();
-// campaign tracking: symbol:positionSide → { campaignId, lastEntryAt }
-let _campaigns = new Map<string, { campaignId: string; lastEntryAt: number }>();
-// write lock
+let _openTrades = new Map<string, DemoTradeEntry>();            // keyed by tradeId
+let _openByOrderId = new Map<string, string>();                  // orderId → tradeId (fast lookup)
+let _campaigns = new Map<string, { campaignId: string; lastEntryAt: number }>(); // symbol:positionSide → campaign
+let _closedTradeIds = new Set<string>();                         // dedup set (tradeId)
+let _closedCache = new Map<string, DemoClosedTrade>();           // tradeId → closed (last MAX_CLOSED_CACHE)
 let _writeLock: Promise<void> = Promise.resolve();
 
 // ========== HELPERS ==========
 
 function ensureDir(): void {
-  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+  if (!fs.existsSync(DATA_DIR())) fs.mkdirSync(DATA_DIR(), { recursive: true });
+  if (!fs.existsSync(ARCHIVE_DIR())) fs.mkdirSync(ARCHIVE_DIR(), { recursive: true });
 }
 
 function acquireLock(): Promise<() => void> {
@@ -111,9 +169,19 @@ async function rewriteOpenFile(): Promise<void> {
   const lines = Array.from(_openTrades.values())
     .map((e) => JSON.stringify(e))
     .join("\n");
-  const tmp = `${OPEN_FILE}.tmp`;
+  const tmp = `${OPEN_FILE()}.tmp`;
   await fs.promises.writeFile(tmp, lines ? lines + "\n" : "", "utf-8");
-  await fs.promises.rename(tmp, OPEN_FILE);
+  await fs.promises.rename(tmp, OPEN_FILE());
+}
+
+function evictClosedCache(): void {
+  if (_closedCache.size <= MAX_CLOSED_CACHE) return;
+  // Evict oldest by exitTime
+  const sorted = Array.from(_closedCache.entries()).sort(
+    (a, b) => (a[1].exitTime ?? 0) - (b[1].exitTime ?? 0),
+  );
+  const toDelete = Math.ceil(sorted.length / 4);
+  for (let i = 0; i < toDelete; i++) _closedCache.delete(sorted[i][0]);
 }
 
 // ========== STARTUP LOAD ==========
@@ -121,13 +189,33 @@ async function rewriteOpenFile(): Promise<void> {
 export async function initDemoTradeStore(): Promise<void> {
   ensureDir();
 
+  // Recover a stranded .tmp file (crash during rewrite)
+  const tmpFile = `${OPEN_FILE()}.tmp`;
+  if (fs.existsSync(tmpFile)) {
+    try {
+      const tmpStat = fs.statSync(tmpFile);
+      const mainStat = fs.existsSync(OPEN_FILE()) ? fs.statSync(OPEN_FILE()) : null;
+      if (!mainStat || tmpStat.mtimeMs > mainStat.mtimeMs) {
+        // .tmp is newer — it was the intended final state; complete the rename
+        await fs.promises.rename(tmpFile, OPEN_FILE());
+        logger.warn("[demoTradeStore] recovered stranded .tmp file");
+      } else {
+        await fs.promises.unlink(tmpFile);
+      }
+    } catch { /* non-fatal */ }
+  }
+
   // Load open trades
-  if (fs.existsSync(OPEN_FILE)) {
-    const rl = readline.createInterface({ input: fs.createReadStream(OPEN_FILE), crlfDelay: Infinity });
+  if (fs.existsSync(OPEN_FILE())) {
+    const rl = readline.createInterface({ input: fs.createReadStream(OPEN_FILE()), crlfDelay: Infinity });
     for await (const line of rl) {
+      if (!line.trim()) continue;
       try {
         const entry = JSON.parse(line) as DemoTradeEntry;
-        if (entry.tradeId) _openTrades.set(entry.tradeId, entry);
+        if (entry.tradeId && entry.orderId) {
+          _openTrades.set(entry.tradeId, entry);
+          _openByOrderId.set(entry.orderId, entry.tradeId);
+        }
       } catch { /* skip corrupt */ }
     }
     logger.info({ count: _openTrades.size }, "[demoTradeStore] loaded open trades from disk");
@@ -142,8 +230,26 @@ export async function initDemoTradeStore(): Promise<void> {
     }
   }
 
-  if (!fs.existsSync(CLOSED_FILE)) {
-    await fs.promises.writeFile(CLOSED_FILE, "", "utf-8");
+  // Load closed trade IDs + last MAX_CLOSED_CACHE for campaign lookups
+  if (!fs.existsSync(CLOSED_FILE())) {
+    await fs.promises.writeFile(CLOSED_FILE(), "", "utf-8");
+  } else {
+    const allClosed: DemoClosedTrade[] = [];
+    const rl = readline.createInterface({ input: fs.createReadStream(CLOSED_FILE()), crlfDelay: Infinity });
+    for await (const line of rl) {
+      if (!line.trim()) continue;
+      try {
+        const t = JSON.parse(line) as DemoClosedTrade;
+        if (t.tradeId) {
+          _closedTradeIds.add(t.tradeId);
+          allClosed.push(t);
+        }
+      } catch { /* skip */ }
+    }
+    // Keep last MAX_CLOSED_CACHE in memory
+    const recent = allClosed.slice(-MAX_CLOSED_CACHE);
+    for (const t of recent) _closedCache.set(t.tradeId, t);
+    logger.info({ total: _closedTradeIds.size, cached: _closedCache.size }, "[demoTradeStore] loaded closed trade IDs");
   }
 }
 
@@ -168,11 +274,19 @@ export async function persistOpenTrade(entry: Omit<DemoTradeEntry, "tradeId" | "
   campaignId?: string;
   signalId?: string;
 }): Promise<DemoTradeEntry> {
+  // Idempotency: skip if orderId already persisted
+  const existingTradeId = _openByOrderId.get(entry.orderId);
+  if (existingTradeId) {
+    const existing = _openTrades.get(existingTradeId);
+    if (existing) return existing;
+  }
+
   const release = await acquireLock();
   try {
     const now = entry.entryTime || Date.now();
     const full: DemoTradeEntry = {
       ...entry,
+      clientOrderId: entry.clientOrderId ?? null,
       tradeId: entry.tradeId ?? crypto.randomUUID(),
       campaignId: entry.campaignId ?? resolveCampaignId(entry.symbol, entry.positionSide, now),
       signalId: entry.signalId ?? crypto.randomUUID(),
@@ -184,7 +298,15 @@ export async function persistOpenTrade(entry: Omit<DemoTradeEntry, "tradeId" | "
       lastCheckedAt: entry.lastCheckedAt ?? null,
       closedAt: entry.closedAt ?? null,
     } as DemoTradeEntry;
+
+    // Double-check idempotency inside lock
+    if (_openByOrderId.has(entry.orderId)) {
+      const tid = _openByOrderId.get(entry.orderId)!;
+      return _openTrades.get(tid) ?? full;
+    }
+
     _openTrades.set(full.tradeId, full);
+    _openByOrderId.set(full.orderId, full.tradeId);
     await rewriteOpenFile();
     return full;
   } finally {
@@ -228,17 +350,27 @@ export async function closeOpenTrade(
     exitSlippage: number;
     funding?: number;
     realizedPnl: number;
-    pnlSource: "balance_delta" | "price_estimate";
+    pnlSource: "exchange_reported" | "balance_delta" | "price_estimate";
     estimated: boolean;
     exitReason: "TP" | "SL" | "MANUAL";
     exitOrderId: string | null;
   },
 ): Promise<DemoClosedTrade | null> {
+  // Idempotency: skip if already closed
+  if (_closedTradeIds.has(tradeId)) {
+    return _closedCache.get(tradeId) ?? null;
+  }
+
   const entry = _openTrades.get(tradeId);
   if (!entry) return null;
 
   const release = await acquireLock();
   try {
+    // Double-check inside lock
+    if (_closedTradeIds.has(tradeId)) {
+      return _closedCache.get(tradeId) ?? null;
+    }
+
     const totalSlippage = closeData.entrySlippage + closeData.exitSlippage;
     const notional = entry.entryPrice * entry.qty;
     const closed: DemoClosedTrade = {
@@ -263,8 +395,14 @@ export async function closeOpenTrade(
     };
 
     _openTrades.delete(tradeId);
+    _openByOrderId.delete(entry.orderId);
+    _closedTradeIds.add(tradeId);
+    _closedCache.set(tradeId, closed);
+    evictClosedCache();
+
     await rewriteOpenFile();
-    await appendLine(CLOSED_FILE, closed);
+    await appendLine(CLOSED_FILE(), closed);
+
     return closed;
   } finally {
     release();
@@ -278,10 +416,12 @@ export function getOpenTrades(): DemoTradeEntry[] {
 }
 
 export function getOpenTradeByOrderId(orderId: string): DemoTradeEntry | null {
-  for (const entry of _openTrades.values()) {
-    if (entry.orderId === orderId) return entry;
-  }
-  return null;
+  const tradeId = _openByOrderId.get(orderId);
+  return tradeId ? (_openTrades.get(tradeId) ?? null) : null;
+}
+
+export function getOpenTradeByTradeId(tradeId: string): DemoTradeEntry | null {
+  return _openTrades.get(tradeId) ?? null;
 }
 
 export function getOpenTradesBySymbolSide(symbol: string, positionSide: "LONG" | "SHORT"): DemoTradeEntry[] {
@@ -290,15 +430,127 @@ export function getOpenTradesBySymbolSide(symbol: string, positionSide: "LONG" |
   );
 }
 
+/**
+ * Returns open trades keyed by orderId — used to restore sniperOpenTrades after restart.
+ */
+export function getOpenTradesAsMap(): Map<string, DemoTradeEntry> {
+  const m = new Map<string, DemoTradeEntry>();
+  for (const e of _openTrades.values()) m.set(e.orderId, e);
+  return m;
+}
+
+/**
+ * Returns the set of closed tradeIds — used to restore sniperRecordedIds after restart.
+ */
+export function getClosedTradeIds(): Set<string> {
+  return new Set(_closedTradeIds);
+}
+
+/** Count open entries currently in a campaign. */
+export function getCampaignOpenCount(campaignId: string): number {
+  let count = 0;
+  for (const e of _openTrades.values()) {
+    if (e.campaignId === campaignId) count++;
+  }
+  return count;
+}
+
+/** Returns closed trades for a campaign from in-memory cache (last MAX_CLOSED_CACHE). */
+export function getClosedTradesForCampaign(campaignId: string): DemoClosedTrade[] {
+  const result: DemoClosedTrade[] = [];
+  for (const t of _closedCache.values()) {
+    if (t.campaignId === campaignId) result.push(t);
+  }
+  return result.sort((a, b) => a.entryTime - b.entryTime);
+}
+
 export async function loadClosedTrades(limit = 500): Promise<DemoClosedTrade[]> {
-  if (!fs.existsSync(CLOSED_FILE)) return [];
+  if (!fs.existsSync(CLOSED_FILE())) return [];
   const results: DemoClosedTrade[] = [];
-  const rl = readline.createInterface({ input: fs.createReadStream(CLOSED_FILE), crlfDelay: Infinity });
+  const rl = readline.createInterface({ input: fs.createReadStream(CLOSED_FILE()), crlfDelay: Infinity });
   for await (const line of rl) {
+    if (!line.trim()) continue;
     try { results.push(JSON.parse(line) as DemoClosedTrade); } catch { /* skip */ }
   }
   return results.slice(-limit);
 }
+
+// ========== CAMPAIGN OUTCOME BUILDER ==========
+
+/**
+ * Aggregates individual closed trade entries for a campaign into a single ML-safe outcome.
+ * Uses only information available at entry time — no future-data leakage.
+ */
+export function buildCampaignOutcome(trades: DemoClosedTrade[]): DemoCampaignOutcome | null {
+  if (trades.length === 0) return null;
+
+  const sorted = [...trades].sort((a, b) => a.entryTime - b.entryTime);
+  const first = sorted[0];
+  const last = sorted[sorted.length - 1];
+
+  let totalQty = 0;
+  let totalNotional = 0;
+  let totalExitNotional = 0;
+  let grossPnl = 0;
+  let totalFee = 0;
+  let realizedPnl = 0;
+  let mfe = 0;
+  let mae = 0;
+  let fallbackMode = false;
+  const exitReasons: Record<string, number> = {};
+  let anyEstimated = false;
+  let anyExchangeReported = false;
+
+  for (const t of sorted) {
+    totalQty += t.qty;
+    totalNotional += t.entryPrice * t.qty;
+    totalExitNotional += t.exitPrice * t.qty;
+    grossPnl += t.grossPnl;
+    totalFee += t.fee;
+    realizedPnl += t.realizedPnl;
+    if (t.mfe > mfe) mfe = t.mfe;
+    if (t.mae < mae) mae = t.mae;
+    if (t.fallbackMode) fallbackMode = true;
+    exitReasons[t.exitReason] = (exitReasons[t.exitReason] ?? 0) + 1;
+    if (t.estimated) anyEstimated = true;
+    if (t.pnlSource === "exchange_reported") anyExchangeReported = true;
+  }
+
+  const avgEntryPrice = totalQty > 0 ? totalNotional / totalQty : first.entryPrice;
+  const avgExitPrice = totalQty > 0 ? totalExitNotional / totalQty : last.exitPrice;
+  const pnlSource = anyExchangeReported ? "exchange_reported"
+    : anyEstimated ? "price_estimate" : "balance_delta";
+
+  return {
+    campaignId: first.campaignId,
+    symbol: first.symbol,
+    positionSide: first.positionSide,
+    side: first.side,
+    entryCount: sorted.length,
+    openedAt: first.entryTime,
+    closedAt: last.exitTime,
+    holdDurationMs: last.exitTime - first.entryTime,
+    totalQty,
+    totalNotional,
+    totalMarginUsed: sorted.reduce((s, t) => s + t.marginUsed, 0),
+    avgEntryPrice,
+    avgExitPrice,
+    grossPnl,
+    totalFee,
+    realizedPnl,
+    mfe,
+    mae,
+    exitReasons,
+    btcRegime: first.btcRegime,
+    hourUtc: first.hourUtc,
+    fallbackMode,
+    modelVersion: first.modelVersion,
+    pnlSource,
+    estimated: anyEstimated,
+  };
+}
+
+// ========== CAMPAIGN SUMMARY ==========
 
 interface CampaignSummaryEntry {
   campaignId: string;
@@ -337,4 +589,28 @@ export async function getCampaignSummary(): Promise<Record<string, CampaignSumma
     if (entry.entryTime < c.oldestEntryAt) c.oldestEntryAt = entry.entryTime;
   }
   return campaigns;
+}
+
+// ========== BOUNDED GROWTH ==========
+
+/**
+ * Archives demo-closed.jsonl when it exceeds MAX_CLOSED_LINES.
+ * Rotates to archive/demo-closed-TIMESTAMP.jsonl.
+ * Safe to call at start of each sniper cycle.
+ */
+export async function archiveClosedIfNeeded(): Promise<void> {
+  if (!fs.existsSync(CLOSED_FILE())) return;
+  try {
+    const content = await fs.promises.readFile(CLOSED_FILE(), "utf-8");
+    const lines = content.split("\n").filter((l) => l.trim().length > 0);
+    if (lines.length < MAX_CLOSED_LINES) return;
+
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const archivePath = path.join(ARCHIVE_DIR(), `demo-closed-${timestamp}.jsonl`);
+    await fs.promises.rename(CLOSED_FILE(), archivePath);
+    await fs.promises.writeFile(CLOSED_FILE(), "", "utf-8");
+    logger.info({ lines: lines.length, archivePath }, "[demoTradeStore] archived closed JSONL");
+  } catch (err) {
+    logger.error({ err }, "[demoTradeStore] archiveClosedIfNeeded failed");
+  }
 }

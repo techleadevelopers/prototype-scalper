@@ -2,13 +2,20 @@
  * Service State Machine — tracks system health and controls execution behaviour.
  *
  * States (ordered by severity):
- *   HEALTHY      — all gates nominal, full execution allowed
- *   DEGRADED     — elevated failures; execution continues with tighter limits
- *   SHADOW_ONLY  — critical failure (stale data / DB / QB outage); no new entries
- *   PAUSED       — manual pause or circuit-breaker trip; no new entries
+ *   HEALTHY      — model + baseline available; full validated demo stacking
+ *   DEGRADED     — elevated failures; reduced stacking and cycle concurrency
+ *   SHADOW_ONLY  — ML unavailable/untrained; conservative deterministic baseline may continue
+ *                  in VST demo; max ONE entry per campaign; every fallback trade is tagged
+ *   PAUSED       — no new entries; continue monitoring, closing, and reconciliation
  *
- * Transitions are one-way toward more restrictive states automatically;
- * recovery requires explicit resetServiceState() after the root cause clears.
+ * Key semantic distinction from previous version:
+ *   - SHADOW_ONLY allows a single exploratory entry per campaign (was: blocked entirely)
+ *   - PAUSED never stops position monitoring or PnL reconciliation
+ *   - isEntryAllowed(campaignHasEntry) encodes the per-state policy in one place
+ *
+ * Equity-relative risk:
+ *   Rolling loss is tracked both in absolute USD (secondary) and as % of VST equity (primary).
+ *   VST equity is updated each sniper cycle from the account balance endpoint.
  */
 
 import { EventEmitter } from "events";
@@ -25,6 +32,7 @@ export type ServiceStateReason =
   | "API_ERROR"
   | "CONSECUTIVE_LOSSES"
   | "ROLLING_NEGATIVE_EV"
+  | "EQUITY_LOSS_LIMIT"
   | "DB_UNAVAILABLE"
   | "MANUAL_PAUSE"
   | "MANUAL_RESET";
@@ -37,6 +45,8 @@ export interface ServiceStateSnapshot {
   apiErrors: number;
   consecutiveLosses: number;
   rollingLossPnl: number;
+  rollingLossPct: number | null;
+  vstEquity: number | null;
   lastBtcPriceAt: number | null;
   staleDataThresholdMs: number;
   history: Array<{ state: ServiceStateName; reason: ServiceStateReason | null; at: number }>;
@@ -50,7 +60,11 @@ const API_ERROR_DEGRADED_THRESHOLD = parseInt(process.env["API_ERROR_DEGRADED"] 
 const API_ERROR_SHADOW_THRESHOLD = parseInt(process.env["API_ERROR_SHADOW"] ?? "15", 10);
 const CONSECUTIVE_LOSS_PAUSE_THRESHOLD = parseInt(process.env["CONSECUTIVE_LOSS_PAUSE"] ?? "8", 10);
 const CONSECUTIVE_LOSS_DEGRADED_THRESHOLD = parseInt(process.env["CONSECUTIVE_LOSS_DEGRADED"] ?? "4", 10);
+// Absolute USD fallback (secondary safeguard)
 const ROLLING_LOSS_PAUSE_USD = parseFloat(process.env["ROLLING_LOSS_PAUSE_USD"] ?? "-50");
+// Equity-relative primary circuit breaker (% of VST equity, negative value)
+const ROLLING_LOSS_PCT_PAUSE = parseFloat(process.env["ROLLING_LOSS_PCT_PAUSE"] ?? "-5");  // −5% of equity
+const ROLLING_LOSS_PCT_DEGRADED = parseFloat(process.env["ROLLING_LOSS_PCT_DEGRADED"] ?? "-2"); // −2%
 const STALE_DATA_SHADOW_MS = parseInt(process.env["STALE_DATA_SHADOW_MS"] ?? "90000", 10); // 90s
 const FAILURE_WINDOW_MS = 5 * 60 * 1000; // 5-min rolling window for failure counts
 
@@ -65,6 +79,8 @@ let _apiErrors = 0;
 let _apiErrorTimes: number[] = [];
 let _consecutiveLosses = 0;
 let _rollingLossPnl = 0;
+let _vstEquity: number | null = null;           // latest VST account balance
+let _rollingLossPct: number | null = null;      // rolling loss as % of equity
 let _lastBtcPriceAt: number | null = null;
 let _history: Array<{ state: ServiceStateName; reason: ServiceStateReason | null; at: number }> = [];
 
@@ -106,18 +122,53 @@ export function getServiceState(): ServiceStateSnapshot {
     apiErrors: _apiErrors,
     consecutiveLosses: _consecutiveLosses,
     rollingLossPnl: _rollingLossPnl,
+    rollingLossPct: _rollingLossPct,
+    vstEquity: _vstEquity,
     lastBtcPriceAt: _lastBtcPriceAt,
     staleDataThresholdMs: STALE_DATA_SHADOW_MS,
     history: _history.slice(-20),
   };
 }
 
+/**
+ * Determines whether a new entry can be placed for a given campaign.
+ *
+ * HEALTHY / DEGRADED  → always allowed
+ * SHADOW_ONLY         → allowed only if the campaign has NO existing entries
+ *                       (one exploratory entry per campaign, tagged as fallbackMode)
+ * PAUSED              → never allowed (monitoring continues separately)
+ */
+export function isEntryAllowed(campaignHasExistingEntry: boolean): boolean {
+  switch (_state) {
+    case "HEALTHY":
+    case "DEGRADED":
+      return true;
+    case "SHADOW_ONLY":
+      return !campaignHasExistingEntry; // first entry only
+    case "PAUSED":
+      return false;
+  }
+}
+
+/** @deprecated Use isEntryAllowed(). Kept for backward compatibility. */
 export function isExecutionAllowed(): boolean {
   return _state === "HEALTHY" || _state === "DEGRADED";
 }
 
 export function isShadowOnly(): boolean {
   return _state === "SHADOW_ONLY" || _state === "PAUSED";
+}
+
+export function isFallbackMode(): boolean {
+  return _state === "SHADOW_ONLY";
+}
+
+/**
+ * Monitoring must never stop because entry execution is paused.
+ * This always returns true — it exists to make the intent explicit in call sites.
+ */
+export function isMonitoringAllowed(): boolean {
+  return true;
 }
 
 export function recordQbFailure(type: "timeout" | "unavailable"): void {
@@ -154,10 +205,42 @@ export function recordApiSuccess(): void {
   _apiErrors = _apiErrorTimes.length;
 }
 
+/**
+ * Update VST account equity. Called at the start of each sniper cycle from the balance endpoint.
+ * Triggers equity-relative circuit breakers when rolling loss exceeds configured thresholds.
+ */
+export function updateVstEquity(equity: number): void {
+  if (equity <= 0) return;
+  _vstEquity = equity;
+
+  // Recompute rolling loss as % of current equity
+  if (_rollingLossPnl < 0 && equity > 0) {
+    _rollingLossPct = (_rollingLossPnl / equity) * 100;
+
+    if (_rollingLossPct <= ROLLING_LOSS_PCT_PAUSE) {
+      transition("PAUSED", "EQUITY_LOSS_LIMIT");
+    } else if (_rollingLossPct <= ROLLING_LOSS_PCT_DEGRADED) {
+      transition("DEGRADED", "ROLLING_NEGATIVE_EV");
+    }
+  } else {
+    _rollingLossPct = 0;
+  }
+}
+
 export function recordTradeLoss(pnl: number): void {
   _consecutiveLosses++;
   _rollingLossPnl += pnl;
 
+  // Recompute equity-relative loss if equity is known
+  if (_vstEquity && _vstEquity > 0) {
+    _rollingLossPct = (_rollingLossPnl / _vstEquity) * 100;
+    if (_rollingLossPct <= ROLLING_LOSS_PCT_PAUSE) {
+      transition("PAUSED", "EQUITY_LOSS_LIMIT");
+      return;
+    }
+  }
+
+  // Absolute USD fallback (secondary safeguard)
   if (_consecutiveLosses >= CONSECUTIVE_LOSS_PAUSE_THRESHOLD || _rollingLossPnl <= ROLLING_LOSS_PAUSE_USD) {
     transition("PAUSED", _rollingLossPnl <= ROLLING_LOSS_PAUSE_USD ? "ROLLING_NEGATIVE_EV" : "CONSECUTIVE_LOSSES");
   } else if (_consecutiveLosses >= CONSECUTIVE_LOSS_DEGRADED_THRESHOLD) {
@@ -167,6 +250,8 @@ export function recordTradeLoss(pnl: number): void {
 
 export function recordTradeWin(): void {
   _consecutiveLosses = 0;
+  _rollingLossPnl = 0;
+  _rollingLossPct = 0;
   if (_state === "DEGRADED" && _reason === "CONSECUTIVE_LOSSES") {
     resetServiceState("MANUAL_RESET");
   }
@@ -205,6 +290,7 @@ export function resetServiceState(reason: ServiceStateReason = "MANUAL_RESET"): 
   _since = Date.now();
   _consecutiveLosses = 0;
   _rollingLossPnl = 0;
+  _rollingLossPct = 0;
   _qbFailureTimes = [];
   _qbFailures = 0;
   _apiErrorTimes = [];

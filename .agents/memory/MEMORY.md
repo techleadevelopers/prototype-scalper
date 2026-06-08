@@ -2,3 +2,4 @@
 - [Shadow ML profitability tests](shadow-ml-profitability.md) — breakeven for default scalp config is ~89.6%; model must be validated via EV simulation before saving, not just brier improvement
 - [Live Position Watcher](live-position-watcher.md) — autonomous outcome recording pipeline; hooks into executeSingleOrder; polls BingX every 15s; deduplicates by recordedIds Set
 - [Demo Sniper Autopilot](demo-sniper-autopilot.md) — score-tiered multi-asset VST placement; sniperOpenTrades (module Map keyed by orderId) is separate from session demoOpenTrades; campaign endpoint aggregates isDemo outcomes by symbol
+- [Demo Sniper Validation Loop](demo-sniper-validation.md) — G1–G19 gap fixes; demoTradeStore owns JSONL source-of-truth; campaign-level (not per-entry) QB outcomes; setDataDir enables test isolation

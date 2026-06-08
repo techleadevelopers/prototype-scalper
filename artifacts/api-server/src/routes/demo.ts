@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { createHmac } from "crypto";
+import { createHmac, randomUUID } from "crypto";
 import type { Request, Response } from "express";
 import { getBotConfig } from "../lib/botConfig";
 import { getEngine, recordTradeOutcome, updateTradeOutcome } from "../lib/telemetryStore";
@@ -22,13 +22,21 @@ import {
   closeOpenTrade,
   getOpenTrades,
   getOpenTradeByOrderId,
+  getOpenTradesAsMap,
+  getClosedTradeIds,
+  getCampaignOpenCount,
+  getClosedTradesForCampaign,
+  buildCampaignOutcome,
   resolveCampaignId,
   loadClosedTrades,
   getCampaignSummary,
+  archiveClosedIfNeeded,
 } from "../lib/demoTradeStore";
 import {
   getServiceState,
+  isEntryAllowed,
   isExecutionAllowed,
+  isFallbackMode,
   recordQbFailure,
   recordQbSuccess,
   recordApiError,
@@ -36,12 +44,39 @@ import {
   recordTradeLoss,
   recordTradeWin,
   recordBtcPriceUpdate,
+  updateVstEquity,
   checkDataFreshness,
   resetServiceState,
 } from "../lib/serviceState";
 
-// Initialise persistent demo trade store on module load
-void initDemoTradeStore().catch((err) => {
+// Initialise persistent demo trade store on module load, then restore runtime state
+void initDemoTradeStore().then(() => {
+  // Restore sniperOpenTrades from JSONL after restart — ensures monitor works immediately
+  let restored = 0;
+  for (const [orderId, storeEntry] of getOpenTradesAsMap()) {
+    if (!sniperOpenTrades.has(orderId)) {
+      sniperOpenTrades.set(orderId, {
+        orderId: storeEntry.orderId,
+        symbol: storeEntry.symbol,
+        side: storeEntry.side,
+        positionSide: storeEntry.positionSide,
+        quantity: storeEntry.qty,
+        entryPrice: storeEntry.entryPrice,
+        expectedEntryPrice: storeEntry.expectedEntryPrice,
+        entryTime: storeEntry.entryTime,
+        hourUtc: storeEntry.hourUtc,
+        btcRegime: storeEntry.btcRegime as BtcRegime,
+        leverage: storeEntry.leverage,
+        marginUsed: storeEntry.marginUsed,
+        expectedTpProfit: storeEntry.marginUsed * storeEntry.leverage * (storeEntry.tpPct / 100),
+      });
+      restored++;
+    }
+  }
+  if (restored > 0) {
+    console.info(`[demo-sniper] restored ${restored} open trade(s) from demoTradeStore after restart`);
+  }
+}).catch((err) => {
   console.error("[demoTradeStore] init failed", err);
 });
 
@@ -315,6 +350,42 @@ async function fetchSettledDemoBalance(
 
 function demoTradeKey(symbol: string, positionSide: string): string {
   return `${symbol.toUpperCase()}:${positionSide.toUpperCase()}`;
+}
+
+/**
+ * Query BingX income history for canonical realized PnL after a position closes.
+ * Falls back gracefully — caller always falls back to price estimate on null return.
+ */
+async function fetchBingXRealizedPnl(
+  symbol: string,
+  startTime: number,
+  endTime: number,
+  apiKey: string,
+  secretKey: string,
+): Promise<{ realizedPnl: number; fee: number } | null> {
+  try {
+    const data = await bingxGet(
+      "/openApi/swap/v2/user/income",
+      { symbol, incomeType: "REALIZED_PNL", startTime, endTime, limit: 50 },
+      apiKey,
+      secretKey,
+    );
+    if (!isBingXSuccess(data)) return null;
+    const items = data.data as Record<string, unknown>[];
+    if (!Array.isArray(items) || items.length === 0) return null;
+
+    let realizedPnl = 0;
+    let fee = 0;
+    for (const item of items) {
+      const income = parseFloat(String(item.income ?? "0"));
+      const type = String(item.incomeType ?? "");
+      if (type === "REALIZED_PNL") realizedPnl += income;
+      else if (type === "COMMISSION") fee += Math.abs(income);
+    }
+    return realizedPnl !== 0 ? { realizedPnl, fee } : null;
+  } catch {
+    return null;
+  }
 }
 
 function parseNumberField(
@@ -1550,9 +1621,11 @@ async function runDemoSniperCycle(): Promise<void> {
   if (!demoSniper.running || !demoSniper.creds) return;
 
   // ── Service state gate ───────────────────────────────────────────────────
+  // PAUSED: no new entries; monitoring continues via the separate monitor interval.
+  // SHADOW_ONLY: cycle continues; isEntryAllowed() enforces per-campaign cap below.
   const svcState = getServiceState();
-  if (!isExecutionAllowed()) {
-    console.info(`[demo-sniper] skipping cycle — service state ${svcState.state} (${svcState.reason ?? "n/a"})`);
+  if (svcState.state === "PAUSED") {
+    console.info(`[demo-sniper] skipping placement cycle — PAUSED (${svcState.reason ?? "n/a"})`);
     return;
   }
 
@@ -1597,6 +1670,15 @@ async function runDemoSniperCycle(): Promise<void> {
   const btcRegime = inferBtcRegime(btcChangePct, config.btcRegimeThresholdPct);
   const hourUtc = new Date().getUTCHours();
   const globalOpen = currentPositions.length;
+
+  // ── VST equity for equity-relative circuit breakers ─────────────────────
+  void fetchDemoBalance(apiKey, secretKey).then((bal) => {
+    const eq = numericBalance(bal);
+    if (eq !== null && eq > 0) updateVstEquity(eq);
+  }).catch(() => {});
+
+  // ── Archive closed JSONL if it has grown too large ───────────────────────
+  void archiveClosedIfNeeded().catch(() => {});
 
   // ── Stale data gate — block entries when BTC price is too old ────────────
   const freshness = checkDataFreshness();
@@ -1705,6 +1787,16 @@ async function runDemoSniperCycle(): Promise<void> {
     for (let n = 0; n < entriesToAdd; n++) {
       if (globalHeadroom <= 0) break;
 
+      // ── Per-entry entry-allowed check ──────────────────────────────────────
+      // SHADOW_ONLY: only first entry per campaign allowed.
+      // Resolve campaign BEFORE fetching price (no network call yet).
+      const entryNow = Date.now();
+      const campaignIdPreview = resolveCampaignId(c.symbol, c.positionSide, entryNow);
+      const campaignAlreadyHasEntry = getCampaignOpenCount(campaignIdPreview) > 0 || c.currentOpen > 0;
+      if (!isEntryAllowed(campaignAlreadyHasEntry)) { skipped++; break; }
+
+      const fallback = isFallbackMode();
+
       const price = await fetchDemoLastPrice(c.symbol).catch(() => null);
       if (!price || price <= 0) { skipped++; break; }
 
@@ -1712,6 +1804,7 @@ async function runDemoSniperCycle(): Promise<void> {
       if (!qty || qty <= 0) { skipped++; break; }
 
       const protection = buildAttachedProtection(price, c.positionSide, config);
+      const clientOrderId = randomUUID();
 
       try {
         const data = await bingxPost(
@@ -1725,6 +1818,7 @@ async function runDemoSniperCycle(): Promise<void> {
             leverage: config.leverage,
             stopLoss: protection?.stopLoss,
             takeProfit: protection?.takeProfit,
+            clientOrderId,
           },
           apiKey,
           secretKey,
@@ -1753,9 +1847,10 @@ async function runDemoSniperCycle(): Promise<void> {
           expectedTpProfit: config.marginPerTrade * config.leverage * (config.takeProfitPct / 100),
         });
 
-        // Persist to durable trade store (survives server restarts)
+        // Persist to durable trade store — idempotent, survives server restarts
         void persistOpenTrade({
           orderId,
+          clientOrderId,
           symbol: c.symbol,
           side: c.side,
           positionSide: c.positionSide,
@@ -1771,8 +1866,8 @@ async function runDemoSniperCycle(): Promise<void> {
           btcRegime,
           hourUtc,
           edgeScore: c.score,
-          modelVersion: "sniper-v1",
-          fallbackMode: false,
+          modelVersion: fallback ? "shadow-baseline" : "sniper-v1",
+          fallbackMode: fallback,
           mfe: 0,
           mae: 0,
           mfeAt: null,
@@ -1810,51 +1905,119 @@ async function runDemoSniperCycle(): Promise<void> {
 }
 
 async function runDemoSniperMonitor(): Promise<void> {
-  if (!demoSniper.creds || sniperOpenTrades.size === 0) return;
+  // Monitoring always runs — even in PAUSED / SHADOW_ONLY state.
+  // isMonitoringAllowed() always returns true; it exists to make the intent explicit.
+  if (!demoSniper.creds) return;
   const { apiKey, secretKey } = demoSniper.creds;
   const config = getBotConfig();
 
+  // ── Sync any demoTradeStore entries missing from sniperOpenTrades ─────────
+  // This handles two cases:
+  //   1. Server restart (sniperOpenTrades restored from JSONL on init — should already be done)
+  //   2. Crash between persistOpenTrade and sniperOpenTrades.set (race recovery)
+  for (const storeEntry of getOpenTrades()) {
+    if (!sniperOpenTrades.has(storeEntry.orderId)) {
+      sniperOpenTrades.set(storeEntry.orderId, {
+        orderId: storeEntry.orderId,
+        symbol: storeEntry.symbol,
+        side: storeEntry.side,
+        positionSide: storeEntry.positionSide,
+        quantity: storeEntry.qty,
+        entryPrice: storeEntry.entryPrice,
+        expectedEntryPrice: storeEntry.expectedEntryPrice,
+        entryTime: storeEntry.entryTime,
+        hourUtc: storeEntry.hourUtc,
+        btcRegime: storeEntry.btcRegime as BtcRegime,
+        leverage: storeEntry.leverage,
+        marginUsed: storeEntry.marginUsed,
+        expectedTpProfit: storeEntry.marginUsed * storeEntry.leverage * (storeEntry.tpPct / 100),
+      });
+    }
+  }
+
+  if (sniperOpenTrades.size === 0) return;
+
   let livePositions: Array<{ symbol: string; positionSide: string }>;
-  // key = "SYMBOL:POSITIONSIDE" → latest mark price from position response
   const openMarkPrices = new Map<string, number>();
   try {
     const posData = await bingxGet("/openApi/swap/v2/user/positions", {}, apiKey, secretKey);
     if (!isBingXSuccess(posData)) return;
     const rawPositions = (getRawPositions(posData) as Array<Record<string, unknown>>)
       .filter((p) => parseFloat(String(p.positionAmt ?? "0")) !== 0);
-    livePositions = rawPositions.map((p) => ({ symbol: String(p.symbol ?? ""), positionSide: String(p.positionSide ?? "") }));
+    livePositions = rawPositions.map((p) => ({
+      symbol: String(p.symbol ?? ""),
+      positionSide: String(p.positionSide ?? ""),
+    }));
     for (const p of rawPositions) {
       const markPrice = parseFloat(String(p.markPrice ?? p.currentPrice ?? "0"));
       if (markPrice > 0) {
-        openMarkPrices.set(`${String(p.symbol ?? "").toUpperCase()}:${String(p.positionSide ?? "").toUpperCase()}`, markPrice);
+        openMarkPrices.set(
+          `${String(p.symbol ?? "").toUpperCase()}:${String(p.positionSide ?? "").toUpperCase()}`,
+          markPrice,
+        );
       }
     }
   } catch { return; }
 
-  const openSet = new Set(livePositions.map((p) => `${p.symbol.toUpperCase()}:${p.positionSide.toUpperCase()}`));
+  const openSet = new Set(
+    livePositions.map((p) => `${p.symbol.toUpperCase()}:${p.positionSide.toUpperCase()}`),
+  );
+
+  // Campaigns whose last entry closed in this monitor pass — build campaign ML outcome
+  const campaignsToClose = new Set<string>();
 
   for (const [orderId, entry] of sniperOpenTrades.entries()) {
     if (sniperRecordedIds.has(orderId)) { sniperOpenTrades.delete(orderId); continue; }
     const key = `${entry.symbol.toUpperCase()}:${entry.positionSide.toUpperCase()}`;
+
     if (openSet.has(key)) {
-      // Update MFE/MAE for the open position using the last known mark price
+      // Still open — update MFE/MAE in durable store
       const storeEntry = getOpenTradeByOrderId(orderId);
       if (storeEntry) {
-        const markInfo = openMarkPrices.get(key);
-        if (markInfo && markInfo > 0) {
-          void updateOpenTradeMfe(storeEntry.tradeId, markInfo).catch(() => {});
+        const markPrice = openMarkPrices.get(key);
+        if (markPrice && markPrice > 0) {
+          void updateOpenTradeMfe(storeEntry.tradeId, markPrice).catch(() => {});
         }
       }
       continue;
     }
 
-    // Position closed — estimate exit price and record outcome
-    const exitPrice = await fetchDemoLastPrice(entry.symbol).catch(() => null);
-    if (!exitPrice) continue;
+    // ── Position closed on exchange ─────────────────────────────────────────
+    const exitTime = Date.now();
+    const estimatedExitPrice = await fetchDemoLastPrice(entry.symbol).catch(() => null);
+    if (!estimatedExitPrice) continue;
 
-    const grossPnl = estimateGrossPnl(entry.positionSide, entry.entryPrice, exitPrice, entry.quantity);
-    const fee = Math.max(0, Math.abs(entry.marginUsed * entry.leverage) * 0.001);
-    const realizedPnl = grossPnl - fee;
+    // Attempt canonical PnL from BingX income API (covers entire position hold window)
+    const windowStart = entry.entryTime - 10_000; // 10s before entry
+    const windowEnd = exitTime + 60_000;           // 60s after detected close
+    const incomeData = await fetchBingXRealizedPnl(
+      entry.symbol, windowStart, windowEnd, apiKey, secretKey,
+    );
+
+    let exitPrice: number;
+    let grossPnl: number;
+    let fee: number;
+    let realizedPnl: number;
+    let pnlSource: "exchange_reported" | "balance_delta" | "price_estimate";
+    let estimated: boolean;
+
+    if (incomeData && incomeData.realizedPnl !== 0) {
+      // Canonical exchange-reported values
+      realizedPnl = incomeData.realizedPnl;
+      fee = incomeData.fee;
+      grossPnl = realizedPnl + fee;
+      exitPrice = estimatedExitPrice; // use last price for exit price (income API doesn't give it)
+      pnlSource = "exchange_reported";
+      estimated = false;
+    } else {
+      // Fallback: price-based estimate
+      exitPrice = estimatedExitPrice;
+      grossPnl = estimateGrossPnl(entry.positionSide, entry.entryPrice, exitPrice, entry.quantity);
+      fee = Math.max(0, Math.abs(entry.marginUsed * entry.leverage) * 0.001);
+      realizedPnl = grossPnl - fee;
+      pnlSource = "price_estimate";
+      estimated = true;
+    }
 
     const favorableMovePct = entry.positionSide === "LONG"
       ? ((exitPrice - entry.entryPrice) / entry.entryPrice) * 100
@@ -1866,7 +2029,9 @@ async function runDemoSniperMonitor(): Promise<void> {
       : "MANUAL";
 
     try {
-      const outcome = recordTradeOutcome({
+      // Record per-entry outcome in adaptive engine for EWMA/cluster learning (execution analysis).
+      // This is NOT sent to QB — campaign-level outcome below is the ML training sample.
+      recordTradeOutcome({
         isDemo: true,
         source: "bingx-vst",
         entryOrderId: entry.orderId,
@@ -1874,7 +2039,7 @@ async function runDemoSniperMonitor(): Promise<void> {
         positionSide: entry.positionSide,
         side: entry.side,
         entryTime: entry.entryTime,
-        exitTime: Date.now(),
+        exitTime,
         hourUtc: entry.hourUtc,
         btcRegime: entry.btcRegime,
         entryPrice: entry.entryPrice,
@@ -1885,38 +2050,89 @@ async function runDemoSniperMonitor(): Promise<void> {
         grossPnl,
         fee,
         realizedPnl,
-        pnlSource: "price_estimate",
-        estimated: true,
+        pnlSource,
+        estimated,
         expectedEntryPrice: entry.expectedEntryPrice,
         exitReason,
         expectedTpProfit: entry.expectedTpProfit,
       });
+
       sniperRecordedIds.add(orderId);
       sniperOpenTrades.delete(orderId);
-      void syncQuantBrainOutcome(outcome).catch(() => {});
 
-      // Update service state circuit breaker
-      if (realizedPnl > 0) recordTradeWin();
-      else recordTradeLoss(realizedPnl);
-
-      // Close the persistent demoTradeStore entry
+      // Close in durable store — idempotent
       const storeEntry = getOpenTradeByOrderId(orderId);
       if (storeEntry) {
-        void closeOpenTrade(storeEntry.tradeId, {
-          exitTime: outcome.exitTime ?? Date.now(),
+        const closed = await closeOpenTrade(storeEntry.tradeId, {
+          exitTime,
           exitPrice,
           expectedExitPrice: null,
           grossPnl,
           fee,
-          entrySlippage: entry.expectedEntryPrice != null ? Math.abs(entry.entryPrice - entry.expectedEntryPrice) : 0,
+          entrySlippage: entry.expectedEntryPrice != null
+            ? Math.abs(entry.entryPrice - entry.expectedEntryPrice) : 0,
           exitSlippage: 0,
           realizedPnl,
-          pnlSource: "price_estimate",
-          estimated: true,
+          pnlSource,
+          estimated,
           exitReason,
           exitOrderId: null,
-        }).catch(() => {});
+        }).catch(() => null);
+
+        if (closed) {
+          // Track which campaigns may now be fully closed
+          if (getCampaignOpenCount(storeEntry.campaignId) === 0) {
+            campaignsToClose.add(storeEntry.campaignId);
+          }
+        }
       }
+    } catch { /* non-fatal */ }
+  }
+
+  // ── Campaign-level ML outcomes ─────────────────────────────────────────────
+  // For each fully-closed campaign: aggregate all entries → ONE ML sample → QB.
+  // This prevents N correlated stacked entries from becoming N independent training labels.
+  for (const campaignId of campaignsToClose) {
+    try {
+      const closedTrades = getClosedTradesForCampaign(campaignId);
+      const co = buildCampaignOutcome(closedTrades);
+      if (!co) continue;
+
+      const dominantReason = (
+        Object.entries(co.exitReasons).sort((a, b) => b[1] - a[1])[0]?.[0] ?? "MANUAL"
+      ) as "TP" | "SL" | "MANUAL";
+
+      const mlOutcome: TradeOutcome = {
+        id: `campaign:${campaignId}`,          // stable dedup key across restarts
+        isDemo: true,
+        source: "bingx-vst",
+        symbol: co.symbol,
+        positionSide: co.positionSide,
+        side: co.side,
+        entryTime: co.openedAt,
+        exitTime: co.closedAt,
+        hourUtc: co.hourUtc,
+        btcRegime: co.btcRegime as BtcRegime,
+        entryPrice: co.avgEntryPrice,
+        exitPrice: co.avgExitPrice,
+        qty: co.totalQty,
+        leverage: closedTrades[0]?.leverage ?? 1,
+        marginUsed: co.totalMarginUsed,
+        grossPnl: co.grossPnl,
+        fee: co.totalFee,
+        realizedPnl: co.realizedPnl,
+        pnlSource: co.pnlSource,
+        estimated: co.estimated,
+        exitReason: dominantReason,
+        expectedTpProfit: 0,
+      };
+
+      // Single QB sync per campaign — the ML training boundary
+      void syncQuantBrainOutcome(mlOutcome).catch(() => {});
+
+      // Circuit breaker at campaign level
+      if (co.realizedPnl > 0) recordTradeWin();
+      else recordTradeLoss(co.realizedPnl);
     } catch { /* non-fatal */ }
   }
 }
@@ -2133,6 +2349,133 @@ router.get("/demo/campaign", (_req: Request, res: Response) => {
     },
     symbols,
   });
+});
+
+/**
+ * GET /api/demo/campaign/summary
+ * Campaign-level aggregated PnL backed by demoTradeStore closed JSONL.
+ * Deduplicated by campaignId — each campaign appears exactly once regardless of how
+ * many stacked entries it contained. This is the ground-truth view for ML validation.
+ */
+router.get("/demo/campaign/summary", async (_req: Request, res: Response) => {
+  try {
+    const recent = await loadClosedTrades(2000);
+
+    // Group by campaignId — dedup at campaign level
+    const campaignMap = new Map<string, typeof recent>();
+    for (const t of recent) {
+      const grp = campaignMap.get(t.campaignId) ?? [];
+      grp.push(t);
+      campaignMap.set(t.campaignId, grp);
+    }
+
+    const campaigns = Array.from(campaignMap.entries())
+      .map(([, trades]) => buildCampaignOutcome(trades))
+      .filter((co): co is NonNullable<typeof co> => co !== null)
+      .sort((a, b) => b.closedAt - a.closedAt);
+
+    const totalRealizedPnl = campaigns.reduce((s, c) => s + c.realizedPnl, 0);
+    const totalFees = campaigns.reduce((s, c) => s + c.totalFee, 0);
+    const wins = campaigns.filter((c) => c.realizedPnl > 0).length;
+    const estimatedCount = campaigns.filter((c) => c.estimated).length;
+    const exchangeReportedCount = campaigns.filter((c) => c.pnlSource === "exchange_reported").length;
+
+    res.json({
+      campaignCount: campaigns.length,
+      wins,
+      losses: campaigns.length - wins,
+      winRate: campaigns.length > 0 ? parseFloat((wins / campaigns.length).toFixed(4)) : 0,
+      totalRealizedPnl: parseFloat(totalRealizedPnl.toFixed(4)),
+      totalFees: parseFloat(totalFees.toFixed(4)),
+      estimatedCount,
+      exchangeReportedCount,
+      campaigns: campaigns.slice(0, 200).map((co) => ({
+        campaignId: co.campaignId,
+        symbol: co.symbol,
+        positionSide: co.positionSide,
+        entryCount: co.entryCount,
+        openedAt: co.openedAt,
+        closedAt: co.closedAt,
+        holdDurationMs: co.holdDurationMs,
+        avgEntryPrice: co.avgEntryPrice,
+        avgExitPrice: co.avgExitPrice,
+        realizedPnl: parseFloat(co.realizedPnl.toFixed(4)),
+        grossPnl: parseFloat(co.grossPnl.toFixed(4)),
+        totalFee: parseFloat(co.totalFee.toFixed(4)),
+        pnlSource: co.pnlSource,
+        estimated: co.estimated,
+        exitReasons: co.exitReasons,
+        btcRegime: co.btcRegime,
+        hourUtc: co.hourUtc,
+        fallbackMode: co.fallbackMode,
+        mfe: co.mfe,
+        mae: co.mae,
+      })),
+    });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to load campaign summary", detail: String(err) });
+  }
+});
+
+/**
+ * GET /api/demo/model-readiness
+ * Proxies QB's /model/readiness endpoint with a bounded timeout.
+ * Returns a structured degraded response when QB is unavailable — never throws.
+ */
+router.get("/demo/model-readiness", async (_req: Request, res: Response) => {
+  const qbBase = process.env["QUANT_BRAIN_URL"]?.trim().replace(/\/+$/, "") ?? null;
+  if (!qbBase) {
+    res.json({
+      available: false,
+      reason: "QUANT_BRAIN_URL not configured",
+      model: null,
+      sampleCount: null,
+      calibrationBrier: null,
+      walkthroughAuc: null,
+      minSamplesRequired: null,
+      ready: false,
+    });
+    return;
+  }
+
+  try {
+    const token = process.env["QUANT_BRAIN_API_TOKEN"]?.trim();
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (token) headers["X-Quant-Brain-Token"] = token;
+
+    const resp = await fetch(`${qbBase}/model/readiness`, {
+      headers,
+      signal: AbortSignal.timeout(5000),
+    });
+
+    if (!resp.ok) {
+      res.json({
+        available: false,
+        reason: `QB returned ${resp.status}`,
+        model: null,
+        sampleCount: null,
+        calibrationBrier: null,
+        walkthroughAuc: null,
+        minSamplesRequired: null,
+        ready: false,
+      });
+      return;
+    }
+
+    const data = await resp.json() as Record<string, unknown>;
+    res.json({ available: true, ...data });
+  } catch (err) {
+    res.json({
+      available: false,
+      reason: String(err),
+      model: null,
+      sampleCount: null,
+      calibrationBrier: null,
+      walkthroughAuc: null,
+      minSamplesRequired: null,
+      ready: false,
+    });
+  }
 });
 
 export { router as demoRouter };
