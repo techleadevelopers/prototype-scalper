@@ -49,12 +49,20 @@ export const BulkOrderItemSchema = z.object({
   side: z.enum(["BUY", "SELL"]),
   positionSide: z.enum(["LONG", "SHORT"]),
   quantity: z.number().positive().optional(),
+  marginOverride: z.number().positive().optional(),
+  leverageOverride: z.number().positive().optional(),
+  sizing: z.unknown().optional(),
   currentEv: z.number().optional(),
   expectedEntryPrice: z.number().positive().optional(),
   btcChangePct: z.number().optional(),
   marketEventId: z.string().optional(),
   featureTimestampMs: z.number().int().positive().optional(),
   candleIsComplete: z.boolean().optional(),
+  playbook: z.string().optional(),
+  context: z.string().optional(),
+  stackingDepth: z.number().int().positive().optional(),
+  exitPolicy: z.string().optional(),
+  positionSizingTier: z.string().optional(),
 });
 export type BulkOrderItem = z.infer<typeof BulkOrderItemSchema>;
 
@@ -69,6 +77,7 @@ export const BulkOrderResultSchema = z.object({
   observationMode: z.boolean(),
   message: z.string(),
   durationMs: z.number(),
+  sizing: z.unknown().optional(),
 });
 export type BulkOrderResult = z.infer<typeof BulkOrderResultSchema>;
 
