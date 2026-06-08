@@ -442,25 +442,8 @@ export default function DemoPage() {
         stopReason: string | null;
         lastCycleAt: number | null;
         openTrades: number;
-        aggression?: {
-          aggressionState: "PAUSED" | "DEFENSIVE" | "NORMAL" | "BOOST" | "MAX_SNIPER";
-          reason: string;
-          maxCandidatesThisCycle: number;
-          maxPositionsThisCycle: number;
-          marginMultiplier: number;
-          stackingAllowed: boolean;
-          minAggressiveScore: number;
-          allowBurstMode: boolean;
-          metrics?: {
-            recentWinRate: number;
-            recentProfitFactor: number;
-            recentPnlUsdt: number;
-            hotSymbols: number;
-          };
-        };
         lastCycleSummary: {
           placed: number; skipped: number; scanned: number; btcRegime: string;
-          aggressionState?: string; aggressionReason?: string;
           placements: Array<{ symbol: string; positionSide: string; score: number; tier: number }>;
         } | null;
         config: { globalMax: number; perSymbolMax: number; cycleMs: number };
@@ -1140,40 +1123,6 @@ export default function DemoPage() {
                       ))}
                     </div>
                   ) : null}
-
-                  {sniperStatus?.aggression && (
-                    <div className="rounded-md border border-border/15 bg-muted/10 p-2">
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="text-[9px] text-muted-foreground uppercase tracking-wider font-semibold">Aggression</span>
-                        <span className={`px-1.5 py-0.5 rounded text-[9px] font-mono font-bold ${
-                          sniperStatus.aggression.aggressionState === "MAX_SNIPER" ? "bg-fuchsia-500/15 text-fuchsia-300"
-                          : sniperStatus.aggression.aggressionState === "BOOST" ? "bg-green-500/15 text-green-400"
-                          : sniperStatus.aggression.aggressionState === "DEFENSIVE" ? "bg-amber-500/15 text-amber-300"
-                          : sniperStatus.aggression.aggressionState === "PAUSED" ? "bg-red-500/15 text-red-400"
-                          : "bg-muted/20 text-muted-foreground"
-                        }`}>
-                          {sniperStatus.aggression.aggressionState}
-                        </span>
-                      </div>
-                      <div className="mt-2 grid grid-cols-4 gap-1.5">
-                        {[
-                          ["Cand", sniperStatus.aggression.maxCandidatesThisCycle],
-                          ["Pos", sniperStatus.aggression.maxPositionsThisCycle],
-                          ["Margin", `${sniperStatus.aggression.marginMultiplier.toFixed(2)}x`],
-                          ["Score", sniperStatus.aggression.minAggressiveScore.toFixed(2)],
-                        ].map(([label, value]) => (
-                          <div key={String(label)} className="text-center">
-                            <div className="font-mono text-[11px] font-bold">{value}</div>
-                            <div className="text-[7px] uppercase tracking-wider text-muted-foreground">{label}</div>
-                          </div>
-                        ))}
-                      </div>
-                      <div className="mt-2 flex items-center justify-between gap-2 text-[8px] text-muted-foreground">
-                        <span>{sniperStatus.aggression.stackingAllowed ? "Stacking on" : "Stacking off"}</span>
-                        <span className="truncate text-right">{sniperStatus.aggression.reason.replaceAll("_", " ")}</span>
-                      </div>
-                    </div>
-                  )}
 
                   {sniperStatus?.lastCycleSummary && (
                     <div className="space-y-1.5">
