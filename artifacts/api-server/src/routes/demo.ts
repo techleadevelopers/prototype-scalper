@@ -2,7 +2,7 @@ import { Router } from "express";
 import { createHmac, randomUUID } from "crypto";
 import type { Request, Response } from "express";
 import { getBotConfig } from "../lib/botConfig";
-import { getEngine, recordTradeOutcome, updateTradeOutcome } from "../lib/telemetryStore";
+import { exportAllOutcomes, getEngine, recordTradeOutcome, updateTradeOutcome } from "../lib/telemetryStore";
 import { evaluateQuantBrainEdge, quantBrainGateMode, syncQuantBrainOutcome } from "../lib/quantBrainClient";
 import type { BtcRegime, TradeOutcome } from "../lib/adaptiveEngine";
 import { feeDragRejectReason, getCorrelation } from "../lib/executionRisk";
@@ -40,6 +40,13 @@ import {
   evaluateStackingInsertion,
 } from "../lib/stackingPolicy";
 import {
+  applyAggressionToConfig,
+  evaluateAggression,
+  getAggressionStatus,
+  recordAggressionCycleImpact,
+  type AggressionCandidate,
+} from "../lib/aggressionController";
+import {
   getServiceState,
   isEntryAllowed,
   isExecutionAllowed,
@@ -70,6 +77,10 @@ import {
   updateOrderState,
 } from "../lib/vstOrderJournal";
 import { assertCampaignAccounting, assertExposureInvariant } from "../lib/vstAccounting";
+
+function isDemoOutcome(outcome: TradeOutcome): boolean {
+  return outcome.isDemo === true || outcome.source === "bingx-vst";
+}
 
 // Initialise persistent demo trade store on module load, then restore runtime state
 void initDemoTradeStore().then(() => {
@@ -1741,6 +1752,8 @@ interface DemoSniperCycleSummary {
   placed: number;
   skipped: number;
   placements: DemoSniperPlacement[];
+  aggressionState?: string;
+  aggressionReason?: string;
 }
 
 interface DemoSniperState {
@@ -1952,10 +1965,11 @@ async function runDemoSniperCycle(): Promise<void> {
   }
 
   const candidates: ScoredCandidate[] = [];
+  const aggressionCandidates: AggressionCandidate[] = [];
 
   for (let i = 0; i < symbols.length; i++) {
     const sym = symbols[i];
-    const candle = candleEdges[i] as { longScore?: number; shortScore?: number } | undefined;
+    const candle = candleEdges[i] as { longScore?: number; shortScore?: number; volumeRatio?: number } | undefined;
     if (!candle) continue;
 
     for (const ps of ["LONG", "SHORT"] as const) {
@@ -1971,6 +1985,13 @@ async function runDemoSniperCycle(): Promise<void> {
       const ev = clusterProfile?.ev ?? symProfile?.ev ?? 0;
       const candleScore = ps === "LONG" ? (candle.longScore ?? 0) : (candle.shortScore ?? 0);
       const combinedScore = engine.combinedEdgeScore(clusterKey, ev, candleScore);
+      aggressionCandidates.push({
+        symbol: sym,
+        positionSide: ps,
+        score: combinedScore,
+        candleScore,
+        volumeRatio: candle.volumeRatio,
+      });
 
       const tier = scoreTierMaxEntries(combinedScore);
       if (tier === 0) continue;
@@ -2001,24 +2022,61 @@ async function runDemoSniperCycle(): Promise<void> {
     }
   }
 
+  const aggression = evaluateAggression({
+    config,
+    outcomes: exportAllOutcomes().filter(isDemoOutcome),
+    serviceState: getServiceState(),
+    candidates: aggressionCandidates,
+    btcRegime,
+    btcChangePct,
+    openPositionsCount: globalOpen,
+    maxOpenPositions: DEMO_SNIPER_GLOBAL_MAX,
+    dataFresh: freshness.fresh,
+    apiHealthy: getServiceState().apiErrors < 5,
+    executionHealthy: true,
+    source: "demo",
+  });
+  if (aggression.aggressionState === "PAUSED") {
+    demoSniper.lastCycleAt = Date.now();
+    demoSniper.lastCycleSummary = {
+      cycle: cycleNum,
+      startedAt: t0,
+      durationMs: Date.now() - t0,
+      btcRegime,
+      openTotal: globalOpen,
+      scanned: candidates.length,
+      placed: 0,
+      skipped: candidates.length,
+      placements: [],
+      aggressionState: aggression.aggressionState,
+      aggressionReason: aggression.reason,
+    };
+    demoSniper.cycleHistory.push(demoSniper.lastCycleSummary);
+    if (demoSniper.cycleHistory.length > 50) demoSniper.cycleHistory.shift();
+    return;
+  }
+  const aggressiveConfig = applyAggressionToConfig(config, aggression);
+
   // 5. Sort by score descending, allocate entries respecting caps
   candidates.sort((a, b) => b.score - a.score);
 
   const placements: DemoSniperPlacement[] = [];
   let placed = 0;
   let skipped = 0;
-  let globalHeadroom = DEMO_SNIPER_GLOBAL_MAX - globalOpen;
+  let globalHeadroom = Math.min(DEMO_SNIPER_GLOBAL_MAX - globalOpen, aggression.maxPositionsThisCycle);
   // Per-cycle dedup: skip any candidate whose candle event was already processed
   // this cycle (prevents double-firing on the same closed candle).
   const cycleProcessedEventIds = new Set<string>();
 
   for (const c of candidates) {
     if (globalHeadroom <= 0) break;
+    if (placed >= aggression.maxCandidatesThisCycle) break;
+    if (c.score < aggression.minAggressiveScore) { skipped++; continue; }
 
     const posKey = `${c.symbol}:${c.positionSide}`;
     const entriesToAdd = Math.min(
       c.tier - c.currentOpen,
-      DEMO_SNIPER_PER_SYMBOL_MAX - c.currentOpen,
+      Math.min(DEMO_SNIPER_PER_SYMBOL_MAX, aggression.symbolConcentrationLimit) - c.currentOpen,
       globalHeadroom,
     );
 
@@ -2043,6 +2101,7 @@ async function runDemoSniperCycle(): Promise<void> {
         : [];
       const campaignAlreadyHasEntry = openCampaignEntries.length > 0 || c.currentOpen > 0;
       if (!isEntryAllowed(campaignAlreadyHasEntry)) { skipped++; break; }
+      if (!aggression.stackingAllowed && campaignAlreadyHasEntry) { skipped++; break; }
 
       const fallback = isFallbackMode();
       const campaignSignalId = openCampaignEntries[0]?.signalId ?? `vst-campaign:${campaignId}`;
@@ -2093,9 +2152,9 @@ async function runDemoSniperCycle(): Promise<void> {
         marketEventId: c.marketEventId ?? null,
         stateFingerprint: c.stateFingerprint,
         now: entryNow,
-        cooldownMs: DEMO_STACKING_COOLDOWN_MS,
+        cooldownMs: Math.round(DEMO_STACKING_COOLDOWN_MS * aggression.cooldownMultiplier),
         campaignCap: controlMaxEntries,
-        proposedMargin: config.marginPerTrade,
+        proposedMargin: aggressiveConfig.marginPerTrade,
         campaignDrawdownPct,
         maxCampaignDrawdownPct: DEMO_STACKING_MAX_CAMPAIGN_DRAWDOWN_PCT,
         portfolioCapacityAvailable:
@@ -2116,10 +2175,10 @@ async function runDemoSniperCycle(): Promise<void> {
       const price = await fetchDemoLastPrice(c.symbol).catch(() => null);
       if (!price || price <= 0) { skipped++; break; }
 
-      const qty = Math.floor(((config.marginPerTrade * config.leverage) / price) * 1000) / 1000;
+      const qty = Math.floor(((aggressiveConfig.marginPerTrade * aggressiveConfig.leverage) / price) * 1000) / 1000;
       if (!qty || qty <= 0) { skipped++; break; }
 
-      const protection = buildAttachedProtection(price, c.positionSide, config);
+      const protection = buildAttachedProtection(price, c.positionSide, aggressiveConfig);
       const clientOrderId = createClientOrderId(
         `sniper:${c.symbol}:${c.positionSide}`,
         `${c.marketEventId ?? c.stateFingerprint}:${stackingGate.depth}`,
@@ -2146,7 +2205,7 @@ async function runDemoSniperCycle(): Promise<void> {
             positionSide: c.positionSide,
             type: config.orderType,
             quantity: qty,
-            leverage: config.leverage,
+            leverage: aggressiveConfig.leverage,
             stopLoss: protection?.stopLoss,
             takeProfit: protection?.takeProfit,
           },
@@ -2166,9 +2225,9 @@ async function runDemoSniperCycle(): Promise<void> {
           entryTime,
           hourUtc,
           btcRegime,
-          leverage: config.leverage,
-          marginUsed: config.marginPerTrade,
-          expectedTpProfit: config.marginPerTrade * config.leverage * (config.takeProfitPct / 100),
+          leverage: aggressiveConfig.leverage,
+          marginUsed: aggressiveConfig.marginPerTrade,
+          expectedTpProfit: aggressiveConfig.marginPerTrade * aggressiveConfig.leverage * (aggressiveConfig.takeProfitPct / 100),
         });
 
         // Persist to durable trade store — idempotent, survives server restarts
@@ -2184,11 +2243,11 @@ async function runDemoSniperCycle(): Promise<void> {
           entryPrice,
           expectedEntryPrice: price,
           qty,
-          leverage: config.leverage,
-          marginUsed: config.marginPerTrade,
+          leverage: aggressiveConfig.leverage,
+          marginUsed: aggressiveConfig.marginPerTrade,
           notional: entryPrice * qty,
-          tpPct: config.takeProfitPct,
-          slPct: config.stopLossPct,
+          tpPct: aggressiveConfig.takeProfitPct,
+          slPct: aggressiveConfig.stopLossPct,
           btcRegime,
           hourUtc,
           edgeScore: c.score,
@@ -2236,7 +2295,10 @@ async function runDemoSniperCycle(): Promise<void> {
     placed,
     skipped,
     placements,
+    aggressionState: aggression.aggressionState,
+    aggressionReason: aggression.reason,
   };
+  recordAggressionCycleImpact(placed + skipped, placed);
 
   demoSniper.lastCycleAt = Date.now();
   demoSniper.lastCycleSummary = summary;
@@ -2500,6 +2562,8 @@ async function runDemoSniperMonitor(): Promise<void> {
         clientOrderId: co.clientOrderId,
         exchangeOrderId: co.exchangeOrderId,
         featureVersion: co.featureVersion ?? undefined,
+        labelVersion: "campaign-pnl-v1",
+        sourceType: "demo",
       };
 
       // Single QB sync per campaign — the ML training boundary
@@ -2530,6 +2594,7 @@ function getSniperStatus() {
     stopReason: demoSniper.stopReason,
     lastCycleAt: demoSniper.lastCycleAt,
     lastCycleSummary: demoSniper.lastCycleSummary,
+    aggression: getAggressionStatus(),
     recentHistory: demoSniper.cycleHistory.slice(-10),
     openTrades: sniperOpenTrades.size,
     placementInFlight: demoPlacementInFlight,
