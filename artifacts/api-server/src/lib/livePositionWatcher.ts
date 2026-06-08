@@ -19,6 +19,8 @@
  */
 
 import { createHmac } from "crypto";
+import fs from "fs";
+import path from "path";
 import { buildOutcomeFromOrders, recordTradeOutcome } from "./telemetryStore";
 import { syncQuantBrainOutcome } from "./quantBrainClient";
 import { logger } from "./logger";
@@ -35,6 +37,10 @@ const STALE_ENTRY_TTL_MS = 24 * 60 * 60 * 1000; // 24h — evict unresolvable en
 const MAX_TRACKED_ENTRIES = 500; // safety cap on registry size
 const BINGX_BASE = "https://open-api.bingx.com";
 const BINGX_TIMEOUT_MS = 8_000;
+const LIVE_WATCHER_JOURNAL_PATH = process.env["LIVE_WATCHER_JOURNAL_PATH"]
+  ?? path.join(process.cwd(), "data", "live-watcher-journal.json");
+const LIVE_WATCHER_DEADLETTER_PATH = process.env["LIVE_WATCHER_DEADLETTER_PATH"]
+  ?? path.join(process.cwd(), "data", "live-watcher-deadletter.jsonl");
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -62,8 +68,18 @@ export interface LiveTradeEntry {
   notional?: number;
   signalId?: string;
   marketEventId?: string;
+  clientOrderId?: string;
   predictionId?: string;
   featureVersion?: string;
+  strategyVersion?: string;
+  configVersion?: string;
+  policyVersion?: string;
+  labelVersion?: string;
+  modelVersion?: string;
+  scoreCalibrationVersion?: string;
+  sizingPolicyVersion?: string;
+  rotationPolicyVersion?: string;
+  playbookVersion?: string;
   signalCreatedAt?: number;
   qbEvaluatedAt?: number;
   orderRequestedAt?: number;
@@ -129,6 +145,62 @@ let statOutcomesRecorded = 0;
 let statLastPollAt = 0;
 let statLastError: string | null = null;
 let statLastClosedAt: number | null = null;
+let statDeadLettered = 0;
+
+function persistWatcherJournal(): void {
+  try {
+    fs.mkdirSync(path.dirname(LIVE_WATCHER_JOURNAL_PATH), { recursive: true });
+    const tmp = `${LIVE_WATCHER_JOURNAL_PATH}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify({
+      tracked: Array.from(tracked.values()),
+      recordedIds: Array.from(recordedIds).slice(-5_000),
+      savedAt: Date.now(),
+    }), "utf8");
+    fs.renameSync(tmp, LIVE_WATCHER_JOURNAL_PATH);
+  } catch (err) {
+    statLastError = err instanceof Error ? err.message : String(err);
+    logger.warn({ err }, "[watcher] failed to persist live watcher journal");
+  }
+}
+
+function deadLetterEntry(entry: LiveTradeEntry, reason: string): void {
+  statDeadLettered++;
+  try {
+    fs.mkdirSync(path.dirname(LIVE_WATCHER_DEADLETTER_PATH), { recursive: true });
+    fs.appendFileSync(LIVE_WATCHER_DEADLETTER_PATH, `${JSON.stringify({
+      reason,
+      deadLetteredAt: Date.now(),
+      entry,
+    })}\n`, "utf8");
+  } catch (err) {
+    statLastError = err instanceof Error ? err.message : String(err);
+    logger.warn({ err, entryOrderId: entry.entryOrderId, reason }, "[watcher] failed to dead-letter live entry");
+  }
+}
+
+function loadWatcherJournal(): void {
+  try {
+    if (!fs.existsSync(LIVE_WATCHER_JOURNAL_PATH)) return;
+    const parsed = JSON.parse(fs.readFileSync(LIVE_WATCHER_JOURNAL_PATH, "utf8")) as {
+      tracked?: LiveTradeEntry[];
+      recordedIds?: string[];
+    };
+    for (const id of parsed.recordedIds ?? []) {
+      if (typeof id === "string" && id) recordedIds.add(id);
+    }
+    for (const entry of parsed.tracked ?? []) {
+      if (entry?.entryOrderId && !recordedIds.has(entry.entryOrderId)) {
+        tracked.set(entry.entryOrderId, entry);
+      }
+    }
+    logger.info({ tracked: tracked.size, recordedIds: recordedIds.size }, "[watcher] restored live watcher journal");
+  } catch (err) {
+    statLastError = err instanceof Error ? err.message : String(err);
+    logger.warn({ err }, "[watcher] failed to load live watcher journal");
+  }
+}
+
+loadWatcherJournal();
 
 // ── BingX HTTP ────────────────────────────────────────────────────────────────
 
@@ -236,6 +308,7 @@ async function pollCycle(): Promise<void> {
   for (const [orderId, entry] of tracked.entries()) {
     if (recordedIds.has(orderId)) {
       tracked.delete(orderId); // clean up already-recorded entries
+      persistWatcherJournal();
       continue;
     }
     // Evict stale entries that are too old to recover
@@ -245,8 +318,10 @@ async function pollCycle(): Promise<void> {
         symbol: entry.symbol,
         positionSide: entry.positionSide,
         ageHours: ((now - entry.entryTime) / 3600_000).toFixed(1),
-      }, "[watcher] evicting stale unresolved entry");
+      }, "[watcher] dead-lettering stale unresolved entry");
+      deadLetterEntry(entry, "STALE_UNRESOLVED_ENTRY");
       tracked.delete(orderId);
+      persistWatcherJournal();
       continue;
     }
     activeEntries.push(entry);
@@ -417,8 +492,14 @@ async function pollCycle(): Promise<void> {
         );
         outcome.signalId = entry.signalId;
         outcome.marketEventId = entry.marketEventId;
+        outcome.clientOrderId = entry.clientOrderId;
         outcome.predictionId = entry.predictionId;
         outcome.featureVersion = entry.featureVersion;
+        outcome.strategyVersion = entry.strategyVersion;
+        outcome.configVersion = entry.configVersion;
+        outcome.policyVersion = entry.policyVersion;
+        outcome.labelVersion = entry.labelVersion;
+        outcome.modelVersion = entry.modelVersion;
         outcome.expectedEntryPrice = entry.expectedEntryPrice;
         outcome.markPriceBeforeOrder = entry.expectedEntryPrice;
         outcome.actualAvgEntryPrice = outcome.entryPrice;
@@ -452,6 +533,7 @@ async function pollCycle(): Promise<void> {
         recordTradeOutcome(outcome);
         recordedIds.add(entry.entryOrderId);
         tracked.delete(entry.entryOrderId);
+        persistWatcherJournal();
         statOutcomesRecorded++;
         statLastClosedAt = Date.now();
 
@@ -504,12 +586,14 @@ export function registerLiveEntry(entry: LiveTradeEntry): void {
     const oldest = sorted[0];
     if (oldest) {
       logger.warn({ orderId: oldest.entryOrderId },
-        "[watcher] registry cap reached — evicting oldest unresolved entry");
+        "[watcher] registry cap reached — dead-lettering oldest unresolved entry");
+      deadLetterEntry(oldest, "REGISTRY_CAP_REACHED");
       tracked.delete(oldest.entryOrderId);
     }
   }
 
   tracked.set(entry.entryOrderId, entry);
+  persistWatcherJournal();
 
   logger.info({
     entryOrderId: entry.entryOrderId,
@@ -558,6 +642,7 @@ export function stopLivePositionWatcher(): void {
     watchHandle = null;
   }
   isRunning = false;
+  persistWatcherJournal();
   logger.info("[watcher] live position watcher stopped");
 }
 
@@ -578,6 +663,9 @@ export function getLiveWatcherStats(): {
   lastError: string | null;
   pollInFlight: boolean;
   skippedOverlaps: number;
+  deadLettered: number;
+  journalPath: string;
+  deadLetterPath: string;
   entries: Array<{
     entryOrderId: string;
     symbol: string;
@@ -585,6 +673,12 @@ export function getLiveWatcherStats(): {
     entryTime: number;
     ageMs: number;
     btcRegime: BtcRegime;
+    qty: number;
+    leverage: number;
+    marginUsed: number;
+    protectionAttachedAt: number | null;
+    exitPolicy: string | null;
+    riskTier: string | null;
   }>;
 } {
   const now = Date.now();
@@ -602,6 +696,9 @@ export function getLiveWatcherStats(): {
     lastError: statLastError,
     pollInFlight,
     skippedOverlaps: statSkippedOverlaps,
+    deadLettered: statDeadLettered,
+    journalPath: LIVE_WATCHER_JOURNAL_PATH,
+    deadLetterPath: LIVE_WATCHER_DEADLETTER_PATH,
     entries: Array.from(tracked.values()).map((e) => ({
       entryOrderId: e.entryOrderId,
       symbol: e.symbol,
@@ -609,6 +706,12 @@ export function getLiveWatcherStats(): {
       entryTime: e.entryTime,
       ageMs: now - e.entryTime,
       btcRegime: e.btcRegime,
+      qty: e.qty,
+      leverage: e.leverage,
+      marginUsed: e.marginUsed,
+      protectionAttachedAt: e.protectionAttachedAt ?? null,
+      exitPolicy: e.exitPolicy ?? null,
+      riskTier: e.riskTier ?? null,
     })),
   };
 }
