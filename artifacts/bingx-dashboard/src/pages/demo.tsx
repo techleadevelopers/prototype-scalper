@@ -1227,7 +1227,7 @@ export default function DemoPage() {
                 </div>
 
                 {/* Sparkline */}
-                <svg viewBox="0 0 100 30" preserveAspectRatio="none" className="flex-1 h-6 mx-3 overflow-visible hidden md:block">
+                <svg viewBox="0 0 100 30" preserveAspectRatio="none" className="w-24 h-6 mx-3 overflow-visible hidden md:block shrink-0">
                   <polyline
                     points={sparkPts}
                     fill="none"
