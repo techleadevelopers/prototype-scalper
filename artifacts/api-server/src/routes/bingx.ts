@@ -1,15 +1,18 @@
 import { Router } from "express";
 import { createHmac } from "crypto";
 import type { Request, Response } from "express";
+import {
+  createExecutionCredentials,
+  credentialFingerprint,
+  endpointForCredentials,
+  type ExecutionCredentials,
+} from "../lib/executionSecurity";
 
 const router = Router();
 
-const BINGX_BASE = "https://open-api.bingx.com";
-
 declare module "express-session" {
   interface SessionData {
-    bingxApiKey?: string;
-    bingxSecretKey?: string;
+    liveCredentials?: ExecutionCredentials;
   }
 }
 
@@ -26,6 +29,7 @@ async function bingxGet(
   params: Record<string, string | number | undefined>,
   apiKey: string,
   secretKey: string,
+  baseUrl: string,
 ) {
   const timestamp = Date.now();
   const allParams = { ...params, timestamp };
@@ -34,24 +38,22 @@ async function bingxGet(
     .filter(([, v]) => v !== undefined)
     .map(([k, v]) => `${k}=${encodeURIComponent(String(v))}`)
     .join("&");
-  const url = `${BINGX_BASE}${path}?${qs}&signature=${signature}`;
+  const url = `${baseUrl}${path}?${qs}&signature=${signature}`;
   const res = await fetch(url, {
     headers: { "X-BX-APIKEY": apiKey },
   });
   return res.json() as Promise<Record<string, unknown>>;
 }
 
-function getCredentials(req: Request): { apiKey: string; secretKey: string } | null {
-  const { bingxApiKey, bingxSecretKey } = req.session;
-  if (!bingxApiKey || !bingxSecretKey) return null;
-  return { apiKey: bingxApiKey, secretKey: bingxSecretKey };
+function getCredentials(req: Request): ExecutionCredentials | null {
+  return req.session.liveCredentials ?? null;
 }
 
 router.get("/bingx/market/ticker", async (req: Request, res: Response) => {
   const symbol = (req.query.symbol as string) ?? "BTC-USDT";
   try {
     const timestamp = Date.now();
-    const url = `${BINGX_BASE}/openApi/swap/v2/quote/ticker?symbol=${encodeURIComponent(symbol)}&timestamp=${timestamp}`;
+    const url = `https://open-api.bingx.com/openApi/swap/v2/quote/ticker?symbol=${encodeURIComponent(symbol)}&timestamp=${timestamp}`;
     const data = (await (await fetch(url)).json()) as Record<string, unknown>;
     if (data.code !== 0) {
       res.status(500).json({ error: (data.msg as string) ?? "BingX API error" });
@@ -75,20 +77,44 @@ router.get("/bingx/market/ticker", async (req: Request, res: Response) => {
 });
 
 router.post("/bingx/connect", async (req: Request, res: Response) => {
-  const { apiKey, secretKey } = req.body as { apiKey?: string; secretKey?: string };
-  if (!apiKey || !secretKey) {
-    res.status(400).json({ error: "apiKey and secretKey are required" });
+  const { apiKey, secretKey, environment, accountId } = req.body as {
+    apiKey?: string;
+    secretKey?: string;
+    environment?: string;
+    accountId?: string;
+  };
+  if (!apiKey || !secretKey || (environment && environment !== "live")) {
+    res.status(400).json({ error: 'apiKey and secretKey are required; environment must be "live" when provided.' });
     return;
   }
   try {
-    const data = await bingxGet("/openApi/swap/v2/user/balance", {}, apiKey, secretKey);
+    // Connecting only verifies credentials and creates a browser session.
+    // Real-money order routes independently enforce the live deployment,
+    // configured account identity, and execution confirmation.
+    const resolvedAccountId =
+      accountId?.trim() ||
+      process.env.LIVE_ACCOUNT_ID?.trim() ||
+      `session-${credentialFingerprint(apiKey)}`;
+    const credentials = createExecutionCredentials({
+      environment: "live",
+      accountId: resolvedAccountId,
+      apiKey,
+      secretKey,
+      source: "live-connect",
+    });
+    const baseUrl = endpointForCredentials(credentials, "live");
+    const data = await bingxGet("/openApi/swap/v2/user/balance", {}, apiKey, secretKey, baseUrl);
     if (data.code !== 0) {
       res.status(401).json({ error: (data.msg as string) ?? "Invalid credentials" });
       return;
     }
-    req.session.bingxApiKey = apiKey;
-    req.session.bingxSecretKey = secretKey;
-    res.json({ connected: true, uid: null, displayName: null });
+    req.session.liveCredentials = credentials;
+    res.json({
+      connected: true,
+      accountId: credentials.accountId,
+      environment: credentials.environment,
+      credentialFingerprint: credentials.fingerprint,
+    });
   } catch (err) {
     req.log.error({ err }, "BingX connect error");
     res.status(500).json({ error: "Failed to connect to BingX" });
@@ -96,8 +122,7 @@ router.post("/bingx/connect", async (req: Request, res: Response) => {
 });
 
 router.post("/bingx/disconnect", (req: Request, res: Response) => {
-  req.session.bingxApiKey = undefined;
-  req.session.bingxSecretKey = undefined;
+  req.session.liveCredentials = undefined;
   res.json({ disconnected: true });
 });
 
@@ -108,7 +133,7 @@ router.get("/bingx/balance", async (req: Request, res: Response) => {
     return;
   }
   try {
-    const data = await bingxGet("/openApi/swap/v2/user/balance", {}, creds.apiKey, creds.secretKey);
+    const data = await bingxGet("/openApi/swap/v2/user/balance", {}, creds.apiKey, creds.secretKey, endpointForCredentials(creds, "live"));
     if (data.code !== 0) {
       res.status(401).json({ error: (data.msg as string) ?? "BingX API error" });
       return;
@@ -140,6 +165,7 @@ router.get("/bingx/positions", async (req: Request, res: Response) => {
       {},
       creds.apiKey,
       creds.secretKey,
+      endpointForCredentials(creds, "live"),
     );
     if (data.code !== 0) {
       res.status(401).json({ error: (data.msg as string) ?? "BingX API error" });
@@ -183,6 +209,7 @@ router.get("/bingx/orders", async (req: Request, res: Response) => {
       params,
       creds.apiKey,
       creds.secretKey,
+      endpointForCredentials(creds, "live"),
     );
     if (data.code !== 0) {
       res.status(401).json({ error: (data.msg as string) ?? "BingX API error" });
@@ -229,9 +256,9 @@ router.get("/bingx/summary", async (req: Request, res: Response) => {
   }
   try {
     const [balData, posData, orderData] = await Promise.all([
-      bingxGet("/openApi/swap/v2/user/balance", {}, creds.apiKey, creds.secretKey),
-      bingxGet("/openApi/swap/v2/user/positions", {}, creds.apiKey, creds.secretKey),
-      bingxGet("/openApi/swap/v2/trade/allOrders", { limit: 50 }, creds.apiKey, creds.secretKey),
+      bingxGet("/openApi/swap/v2/user/balance", {}, creds.apiKey, creds.secretKey, endpointForCredentials(creds, "live")),
+      bingxGet("/openApi/swap/v2/user/positions", {}, creds.apiKey, creds.secretKey, endpointForCredentials(creds, "live")),
+      bingxGet("/openApi/swap/v2/trade/allOrders", { limit: 50 }, creds.apiKey, creds.secretKey, endpointForCredentials(creds, "live")),
     ]);
 
     const bal = (balData.code === 0
