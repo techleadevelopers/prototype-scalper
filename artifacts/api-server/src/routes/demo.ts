@@ -2148,6 +2148,12 @@ async function runDemoSniperMonitor(): Promise<void> {
         estimated: co.estimated,
         exitReason: dominantReason,
         expectedTpProfit: 0,
+        // Audit trail — aggregate campaign metrics
+        mfe: co.mfe,
+        mae: co.mae,
+        holdDurationMs: co.holdDurationMs,
+        entryCount: co.entryCount,
+        modelVersion: co.modelVersion ?? undefined,
       };
 
       // Single QB sync per campaign — the ML training boundary

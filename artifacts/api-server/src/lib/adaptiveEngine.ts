@@ -77,7 +77,7 @@ export const TradeOutcomeSchema = z.object({
   grossPnl: z.number(),
   fee: z.number().nonnegative(),
   realizedPnl: z.number(),
-  pnlSource: z.enum(["balance_delta", "price_estimate"]).optional(),
+  pnlSource: z.enum(["balance_delta", "price_estimate", "exchange_reported"]).optional(),
   estimated: z.boolean().optional(),
   expectedEntryPrice: z.number().optional(),
   expectedExitPrice: z.number().optional(),
@@ -87,6 +87,13 @@ export const TradeOutcomeSchema = z.object({
   slippagePctNotional: z.number().optional(),
   exitReason: ExitReasonSchema,
   expectedTpProfit: z.number(),
+  // Audit trail — populated by demo campaign aggregation; optional for live outcomes
+  mfe: z.number().optional(),
+  mae: z.number().optional(),
+  holdDurationMs: z.number().optional(),
+  entryCount: z.number().int().positive().optional(),
+  modelVersion: z.string().nullable().optional(),
+  signalId: z.string().optional(),
 });
 export type TradeOutcome = z.infer<typeof TradeOutcomeSchema>;
 

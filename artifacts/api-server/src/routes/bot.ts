@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { createHmac } from "crypto";
+import { createHmac, randomUUID } from "crypto";
 import type { Request, Response } from "express";
 import { getBotConfig, setConfigOverrides, resetConfigOverrides } from "../lib/botConfig";
 import {
@@ -1460,6 +1460,9 @@ async function executeSingleOrder(
 
   // ── QB gate — hard 600ms cap so sniper is never held hostage ──────────────
   const qbMode = quantBrainGateMode();
+  const signalId = randomUUID();
+  const marketEventId = `${symbol}:${positionSide}:${Math.floor(Date.now() / 300_000)}`;
+  const expiresAt = Date.now() + 30_000; // 30s — signal must be evaluated before expiry
   if (qbMode === "enforce") {
     try {
       const [sentiment, qbResult] = await Promise.all([
@@ -1468,6 +1471,7 @@ async function executeSingleOrder(
           evaluateQuantBrainEdge({
             symbol, side, positionSide, hourUtc: currentHour,
             btcChangePct, currentEv: item.currentEv, config,
+            signalId, marketEventId, expiresAt, featureVersion: "sniper-v1",
           }),
           new Promise<never>((_, reject) =>
             setTimeout(() => reject(new Error("QB_TIMEOUT")), QB_SNIPER_TIMEOUT_MS),
@@ -1488,6 +1492,7 @@ async function executeSingleOrder(
         evaluateQuantBrainEdge({
           symbol, side, positionSide, hourUtc: currentHour,
           btcChangePct, currentEv: item.currentEv, config,
+          signalId, marketEventId, expiresAt, featureVersion: "sniper-v1",
           sentimentContext: sentiment ? {
             direction: sentiment.direction, confidence: sentiment.confidence,
             biasRatio: sentiment.biasRatio, dominantSide: sentiment.dominantSide,

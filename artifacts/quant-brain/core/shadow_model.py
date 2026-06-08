@@ -719,14 +719,37 @@ def predict_shadow(row: dict[str, Any]) -> dict[str, Any]:
             except Exception:
                 pass
 
+        # Uncertainty classification
+        if not METADATA_PATH.exists():
+            uncertainty_type = "UNCALIBRATED"
+        elif confidence >= 0.5:
+            uncertainty_type = "STRONG_EVIDENCE"
+        elif confidence >= 0.25:
+            uncertainty_type = "WEAK_EVIDENCE"
+        else:
+            uncertainty_type = "INSUFFICIENT_DATA"
+
+        # Model version from metadata
+        model_version = "shadow-unknown"
+        if METADATA_PATH.exists():
+            try:
+                meta_raw = json.loads(METADATA_PATH.read_text(encoding="utf-8"))
+                trained_at = int(meta_raw.get("trainedAt", 0))
+                if trained_at:
+                    model_version = f"shadow-{trained_at}"
+            except Exception:
+                pass
+
         return {
             "available": True,
             "authority": "shadow_ensemble",
-            "rawProbability": round(ensemble_proba if 'ensemble_proba' in dir() else raw, 6),
+            "rawProbability": round(ensemble_proba if 'ensemble_proba' in locals() else raw, 6),
             "calibratedProbability": round(calibrated, 6),
             "confidence": round(confidence, 3),
             "verdict": verdict,
             "recommendation": "ALLOW" if calibrated >= 0.55 else "BLOCK" if calibrated <= 0.45 else "UNCERTAIN",
+            "uncertaintyType": uncertainty_type,
+            "modelVersion": model_version,
             **metadata_ev,
         }
 

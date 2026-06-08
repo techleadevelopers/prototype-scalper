@@ -1,0 +1,318 @@
+Act as a principal observability, quantitative reliability, and production incident-response engineer.
+
+CONTEXT
+
+The system executes exclusively on BingX VST/demo but must use production-grade operational standards.
+
+Keep:
+
+SCALP_ALLOW_EXECUTION=true
+DEMO_SNIPER_GLOBAL_MAX=50
+DEMO_SNIPER_PER_SYMBOL_MAX=10
+
+Do not enable real-money credentials.
+
+PRIMARY OBJECTIVE
+
+Implement safe, structured and mathematically intelligent observability across:
+
+BingX market data
+→ Quant Brain
+→ edge calculation
+→ backend gates
+→ campaign and stacking
+→ VST order
+→ fill
+→ TP/SL
+→ close
+→ realized PnL
+→ outcome delivery
+→ ML training
+
+When any operation freezes, fails, becomes stale or produces an incorrect financial result, the logs must identify:
+
+- what failed;
+- where it failed;
+- when it failed;
+- which signal, campaign and order were affected;
+- the last successful stage;
+- whether retry occurred;
+- whether financial state remained consistent;
+- whether manual intervention is required.
+
+Do not add uncontrolled console logging.
+
+1. STRUCTURED LOGGING
+
+Use structured JSON logs with a canonical schema:
+
+- timestamp;
+- level;
+- service;
+- environment;
+- event_name;
+- event_version;
+- trace_id;
+- request_id;
+- cycle_id;
+- market_event_id;
+- signal_id;
+- campaign_id;
+- trade_id;
+- client_order_id;
+- exchange_order_id;
+- symbol;
+- side;
+- model_version;
+- feature_version;
+- service_state;
+- duration_ms;
+- outcome;
+- error_code;
+- retry_count;
+- message;
+- metadata.
+
+Use stable event names and error codes instead of relying on free-form messages.
+
+2. SECRET REDACTION
+
+Never log:
+
+- API keys;
+- API secrets;
+- authentication tokens;
+- authorization headers;
+- cookies;
+- database credentials;
+- complete signed BingX requests;
+- environment-variable contents.
+
+Implement automatic recursive redaction for fields matching:
+
+apiKey, secret, token, authorization, cookie, password,
+signature, DATABASE_URL, QUANT_BRAIN_API_TOKEN.
+
+Redaction must also apply to nested objects, arrays and errors.
+
+Add tests proving secrets cannot appear in logs.
+
+3. END-TO-END TRACE
+
+Create one trace across the complete lifecycle:
+
+SNIPER_CYCLE_STARTED
+MARKET_DATA_FETCHED
+FEATURES_CREATED
+QB_REQUEST_SENT
+QB_PREDICTION_RECEIVED
+EDGE_CALCULATED
+GATE_EVALUATED
+CAMPAIGN_SELECTED
+ORDER_REQUESTED
+ORDER_ACCEPTED
+ORDER_FILLED
+POSITION_MONITORED
+POSITION_PARTIALLY_CLOSED
+POSITION_CLOSED
+PNL_RECONCILED
+OUTCOME_DELIVERED
+ML_SAMPLE_ACCEPTED
+
+Every stage must reuse the same trace identifiers.
+
+Persist the last completed stage so server restarts do not destroy incident evidence.
+
+4. STALL DETECTION
+
+Track active operations in a bounded in-flight registry.
+
+Every operation must have:
+
+- started_at;
+- deadline_at;
+- current_stage;
+- last_progress_at;
+- retry_count;
+- owner;
+- identifiers;
+- financial impact.
+
+Detect:
+
+- QB inference stalls;
+- BingX request stalls;
+- sniper cycles that never finish;
+- monitor cycles that overlap;
+- orders without acknowledgement;
+- positions without recent monitoring;
+- closed positions without outcomes;
+- outcomes not acknowledged by Quant Brain;
+- training jobs blocking inference;
+- database operations exceeding their budget.
+
+Emit STALL_DETECTED once per incident, not continuously.
+
+5. WATCHDOG
+
+Implement a watchdog that checks:
+
+- last market-data success;
+- last Quant Brain success;
+- last sniper-cycle success;
+- last position-monitor success;
+- oldest pending order;
+- oldest unreconciled position;
+- oldest pending outcome;
+- queue depth;
+- event-loop delay;
+- database latency;
+- memory usage;
+- CPU pressure.
+
+The watchdog must never place or close orders.
+
+It may:
+
+- mark DEGRADED;
+- reduce stacking;
+- mark SHADOW_ONLY;
+- pause new entries;
+- trigger safe retries;
+- create an incident record.
+
+Position monitoring and TP/SL reconciliation must continue.
+
+6. MATHEMATICAL INVARIANTS
+
+Implement runtime assertions for:
+
+position_quantity >= 0
+filled_quantity <= requested_quantity
+remaining_quantity = opened_quantity - closed_quantity
+campaign_pnl = sum(execution_pnl)
+net_pnl = gross_pnl - exchange_commission
+global_open_count <= global_limit
+symbol_open_count <= symbol_limit
+one active direction per symbol
+exactly one final campaign outcome
+no duplicate market_event execution
+
+Also reconcile:
+
+equity_delta =
+realized_net_pnl
++ unrealized_pnl
++ deposits
+- withdrawals
+
+Use the fields available in VST. Report unsupported components explicitly.
+
+If an invariant fails:
+
+- do not silently repair financial history;
+- generate a CRITICAL incident;
+- pause affected new entries;
+- preserve raw evidence;
+- continue protecting existing positions.
+
+7. NUMERICAL SAFETY
+
+Reject or quarantine:
+
+- NaN;
+- Infinity;
+- negative quantities;
+- zero or invalid prices;
+- impossible leverage;
+- timestamps from the future;
+- stale predictions;
+- PnL sign inconsistencies;
+- probabilities outside [0,1];
+- edge scores outside their defined range;
+- division by zero;
+- precision overflow.
+
+Use explicit decimal and rounding rules for prices, quantities and PnL.
+
+Add boundary and property-based tests.
+
+8. ERROR TAXONOMY
+
+Create stable categories:
+
+DATA_STALE
+DATA_INVALID
+QB_TIMEOUT
+QB_UNAVAILABLE
+QB_SCHEMA_INVALID
+MODEL_UNREADY
+EDGE_EXPIRED
+GATE_REJECTED
+DUPLICATE_SIGNAL
+ORDER_TIMEOUT
+ORDER_REJECTED
+ORDER_STATE_UNKNOWN
+PARTIAL_FILL
+POSITION_UNRECONCILED
+PNL_MISMATCH
+OUTCOME_DUPLICATE
+OUTCOME_DELIVERY_FAILED
+DATABASE_TIMEOUT
+QUEUE_OVERFLOW
+JOB_OVERLAP
+INVARIANT_VIOLATION
+SECRET_REDACTION_FAILURE
+
+Each error must define:
+
+- severity;
+- retryable status;
+- maximum retries;
+- backoff policy;
+- service-state consequence;
+- required operator action.
+
+9. SAFE RETRIES
+
+Retries must use:
+
+- idempotency keys;
+- bounded attempts;
+- exponential backoff;
+- jitter;
+- retry budgets;
+- dead-letter state.
+
+Never retry order placement blindly when exchange state is unknown.
+
+First query BingX using client_order_id or exchange_order_id.
+
+A timeout must never cause a duplicate VST order.
+
+10. LOG LEVEL POLICY
+
+DEBUG:
+- local development only;
+- sampled feature details;
+- never secrets.
+
+INFO:
+- lifecycle transitions;
+- accepted orders;
+- reconciled closures;
+- state changes.
+
+WARN:
+- retries;
+- latency degradation;
+- stale noncritical data;
+- fallback use.
+
+ERROR:
+- failed operation requiring recovery.
+
+CRITICAL:
+- unknown order state;
+- unprotected position;
+- PnL

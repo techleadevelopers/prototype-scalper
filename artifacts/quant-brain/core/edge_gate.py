@@ -374,6 +374,26 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
     config = payload.get("config") or {}
     gate_rejects: list[str] = []
 
+    # ── Signal expiry check (contract v2) ──────────────────────────────────────
+    signal_id = payload.get("signalId")
+    market_event_id = payload.get("marketEventId")
+    feature_version = payload.get("featureVersion", "sniper-v1")
+    expires_at_ms = payload.get("expiresAt")
+    if expires_at_ms is not None:
+        try:
+            if time.time() * 1000 > float(expires_at_ms):
+                return {
+                    "allow": False,
+                    "gateRejects": ["SIGNAL_EXPIRED: signal expired before QB evaluation"],
+                    "authority": "quant-brain",
+                    "mode": "expired",
+                    "signalId": signal_id,
+                    "marketEventId": market_event_id,
+                    "predictionTimestamp": time.time(),
+                }
+        except (TypeError, ValueError):
+            pass
+
     # ── Sentiment context (24h directional bias from sentimentEngine.ts) ──────
     sentiment_ctx = payload.get("sentimentContext") or {}
     sentiment_direction = str(sentiment_ctx.get("direction", "NEUTRAL")).upper()
@@ -683,12 +703,28 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
     elif sentiment_counter and sentiment_confidence > 0.3:
         score = score * (1.0 - sentiment_confidence * 0.10)
 
+    # ── Contract v2 audit fields from shadow ML ────────────────────────────────
+    ml_model_version: str = shadow_ml.get("modelVersion", "shadow-unknown")
+    ml_calibrated_prob: float | None = shadow_ml.get("calibratedProbability")
+    if shadow_ml.get("available"):
+        ml_uncertainty_type = shadow_ml.get("uncertaintyType", "UNCALIBRATED")
+    else:
+        ml_uncertainty_type = "MODEL_UNAVAILABLE"
+
     # ========== NOVOS CAMPOS NO RETORNO ==========
     return {
         "allow": allow,
         "gateRejects": gate_rejects,
         "score": round(score, 4),
         "authority": "quant-brain",
+        # Contract v2 — provenance & ML audit
+        "signalId": signal_id,
+        "marketEventId": market_event_id,
+        "featureVersion": feature_version,
+        "modelVersion": ml_model_version,
+        "calibratedProbability": round(ml_calibrated_prob, 6) if ml_calibrated_prob is not None else None,
+        "uncertaintyType": ml_uncertainty_type,
+        "predictionTimestamp": time.time(),
         "symbol": symbol,
         "side": side,
         "positionSide": position_side,

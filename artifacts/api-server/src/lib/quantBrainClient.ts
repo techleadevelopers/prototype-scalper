@@ -111,6 +111,13 @@ export interface QuantBrainEdgeResult {
   score?: number;
   authority?: string;
   mode?: string;
+  // Contract v2 — audit fields
+  modelVersion?: string;
+  featureVersion?: string;
+  calibratedProbability?: number;
+  uncertaintyType?: string;
+  predictionTimestamp?: number;
+  dataAge?: number;
   sniper?: unknown;
   realizedEdge?: unknown;
   error?: string;
@@ -154,6 +161,13 @@ function outcomeToQuantPayload(outcome: TradeOutcome): Record<string, unknown> {
     slippageBps: (outcome.slippagePctNotional ?? 0) * 10_000,
     source: outcome.source ?? "manual",
     isDemo: outcome.isDemo ?? false,
+    // Audit trail — present when populated by campaign aggregation
+    mfe: outcome.mfe,
+    mae: outcome.mae,
+    holdDurationMs: outcome.holdDurationMs,
+    entryCount: outcome.entryCount,
+    modelVersion: outcome.modelVersion,
+    signalId: outcome.signalId,
   };
 }
 
@@ -397,6 +411,11 @@ export interface QuantBrainEdgeInput {
   currentProfitFactor?: number;
   config: BotConfig;
   sentimentContext?: SentimentContext;
+  // Contract v2 — signal provenance & lifecycle
+  signalId?: string;
+  marketEventId?: string;
+  expiresAt?: number;
+  featureVersion?: string;
 }
 
 export async function evaluateQuantBrainEdge(
