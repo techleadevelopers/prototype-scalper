@@ -27,6 +27,7 @@ The Coach NEVER blocks. Any situation that warrants blocking is the Judge's job.
 from __future__ import annotations
 
 from typing import Any
+from core.score_calibration import calibrate_score
 
 
 # ---------------------------------------------------------------------------
@@ -53,6 +54,7 @@ def compute_aggressive_score(
     data_quality: dict,
     position_side: str,
     score_penalties: float = 0.0,
+    score_adjustments: dict[str, Any] | None = None,
 ) -> float:
     """
     Momentum-first composite score [0, 1].
@@ -68,9 +70,11 @@ def compute_aggressive_score(
     """
     alt_features = sniper.get("altFeatures") or {}
     btc_features = sniper.get("btcFeatures") or {}
+    adjustments = score_adjustments or {}
 
     # 1. Momentum
     momentum_score = max(0.0, min(1.0, float(sniper.get("score", 0.0))))
+    momentum_score = max(0.0, min(1.0, momentum_score + _num(adjustments.get("momentumBonus"), 0.0)))
 
     # 2. Candle alignment
     candle_score = max(0.0, min(1.0, float(sniper.get("candleScore", momentum_score * 0.85))))
@@ -83,6 +87,7 @@ def compute_aggressive_score(
         + min(0.30, (volume_ratio - 1.0) * 0.15)
         + min(0.20, abs(oi_change_pct) * 0.05)
     ))
+    volume_oi_score = max(0.0, min(1.0, volume_oi_score + _num(adjustments.get("volumeBonus"), 0.0)))
 
     # 4. BTC alignment (counter-regime allowed, just lower score)
     want_long = position_side == "LONG"
@@ -97,6 +102,7 @@ def compute_aggressive_score(
         btc_alignment = 0.38
     if abs(btc_price_change) > 0.5:
         btc_alignment = min(1.0, btc_alignment + 0.10)
+    btc_alignment = max(0.0, min(1.0, btc_alignment + _num(adjustments.get("btcFollowBonus"), 0.0)))
 
     # 5. Data freshness
     coverages = [
@@ -126,7 +132,8 @@ def compute_aggressive_score(
         + realized_edge_score * 0.05
         + shadow_ml_score    * 0.05
     )
-    return max(0.0, min(1.0, raw - score_penalties))
+    playbook_bonus = _num(adjustments.get("rangeBonus"), 0.0)
+    return max(0.0, min(1.0, raw + playbook_bonus - score_penalties))
 
 
 def _soft_penalties(
@@ -145,6 +152,7 @@ def _soft_penalties(
     sentiment_counter: bool,
     sentiment_confidence: float,
     position_side: str,
+    score_adjustments: dict[str, Any] | None = None,
 ) -> tuple[float, list[str]]:
     """
     Compute cumulative soft penalties [0, 0.80] and their reasons.
@@ -152,6 +160,7 @@ def _soft_penalties(
     """
     penalties = 0.0
     reasons: list[str] = []
+    adjustments = score_adjustments or {}
 
     def add(amount: float, reason: str) -> None:
         nonlocal penalties
@@ -232,6 +241,17 @@ def _soft_penalties(
     if news_action == "reduce_aggression":
         add(0.06, "news_risk")
 
+    for key, label in (
+        ("counterTrendPenalty", "playbook_counter_trend"),
+        ("meanReversionPenalty", "playbook_mean_reversion"),
+        ("lowLiquidityPenalty", "playbook_low_liquidity"),
+        ("chaosPenalty", "playbook_chaos"),
+        ("drawdownPenalty", "playbook_drawdown_recovery"),
+    ):
+        amount = _num(adjustments.get(key), 0.0)
+        if amount > 0:
+            add(min(0.20, amount), label)
+
     return min(penalties, 0.80), reasons
 
 
@@ -256,6 +276,8 @@ def score_candidate(
     sentiment_counter: bool = False,
     sentiment_confidence: float = 0.0,
     sentiment_aligned: bool = False,
+    regime_playbook: dict[str, Any] | None = None,
+    score_calibration: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
     Score a single candidate. Never blocks — only adjusts rank.
@@ -270,6 +292,7 @@ def score_candidate(
       coachVersion        str
     """
     is_aggressive = risk_profile in ("aggressive", "sniper_max", "demo_learning_aggressive")
+    score_adjustments = (regime_playbook or {}).get("scoreAdjustments") or {}
 
     penalties, penalty_reasons = _soft_penalties(
         sniper=sniper,
@@ -286,6 +309,7 @@ def score_candidate(
         sentiment_counter=sentiment_counter,
         sentiment_confidence=sentiment_confidence,
         position_side=position_side,
+        score_adjustments=score_adjustments,
     )
 
     aggressive_score = compute_aggressive_score(
@@ -296,6 +320,7 @@ def score_candidate(
         data_quality=data_quality,
         position_side=position_side,
         score_penalties=penalties,
+        score_adjustments=score_adjustments,
     )
 
     # ── Learning score — blended as realized data accumulates ───────────────
@@ -326,15 +351,35 @@ def score_candidate(
     elif sentiment_counter and sentiment_confidence > 0.3:
         base_priority = base_priority * (1.0 - sentiment_confidence * 0.08)
     execution_priority = max(0.0, min(1.0, base_priority))
+    min_score_boost = _num(score_adjustments.get("minScoreBoost"), 0.0)
+    if min_score_boost > 0:
+        execution_priority = max(0.0, execution_priority - min(0.20, min_score_boost))
+    calibrated_score = calibrate_score(execution_priority, score_calibration) if score_calibration else execution_priority
+    calibration_actions: list[str] = []
+    if score_calibration:
+        truth = score_calibration.get("scoreTruth") or {}
+        recommended = score_calibration.get("recommendedThresholds") or {}
+        if truth.get("overconfidence") and execution_priority >= float(recommended.get("minBoostScore", 0.76)):
+            calibration_actions.append("reduce_priority_overconfidence")
+        if calibrated_score < execution_priority - 0.03:
+            calibration_actions.append("use_calibrated_score_for_sizing")
+        execution_priority = calibrated_score
 
     return {
         "aggressiveScore": round(aggressive_score, 4),
         "learningScore": round(learning_score, 4),
         "executionPriority": round(execution_priority, 4),
+        "calibratedScore": round(calibrated_score, 4),
+        "calibrationActions": calibration_actions,
         "scorePenalties": round(penalties, 4),
         "penaltyReasons": penalty_reasons,
         "learningBlend": blend,
-        "coachVersion": "coach-ranker-v1",
+        "regime": (regime_playbook or {}).get("regime"),
+        "playbook": (regime_playbook or {}).get("playbook"),
+        "allowedSetups": (regime_playbook or {}).get("allowedSetups", []),
+        "blockedSetups": (regime_playbook or {}).get("blockedSetups", []),
+        "scoreAdjustments": score_adjustments,
+        "coachVersion": "coach-ranker-v2-playbook",
     }
 
 
