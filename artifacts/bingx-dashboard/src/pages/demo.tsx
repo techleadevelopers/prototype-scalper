@@ -849,102 +849,219 @@ export default function DemoPage() {
           </div>
         </div>
 
-        <div className="grid grid-cols-1 xl:grid-cols-[380px_1fr_320px] gap-5">
-          {/* ── LEFT PANEL ── */}
-          <div className="space-y-4">
-            {/* Connect form */}
-            {!demoConnected && (
-              <Card className="bg-card/50 border-blue-500/20">
-                <CardHeader className="px-4 pt-4 pb-3">
-                  <CardTitle className="text-sm font-semibold flex items-center gap-2">
-                    <FlaskConical className="w-4 h-4 text-blue-400" />
-                    Ativar Modo Demo VST
-                  </CardTitle>
-                  <p className="text-[10px] text-muted-foreground mt-1 leading-relaxed">
-                    Usa as mesmas credenciais da conexão principal, mas direciona as ordens para o servidor VST da BingX
-                    (<span className="font-mono">open-api-vst.bingx.com</span>) — sem risco real.
-                  </p>
-                </CardHeader>
-                <CardContent className="px-4 pb-4 space-y-3">
-                  <div className="flex items-start gap-2 px-3 py-2.5 rounded-lg bg-blue-500/8 border border-blue-500/20">
-                    <ShieldCheck className="w-3.5 h-3.5 text-blue-400 shrink-0 mt-0.5" />
-                    <p className="text-[10px] text-muted-foreground leading-relaxed">
-                      Certifique-se de que o <strong>Demo Trading</strong> está ativado no app BingX
-                      (Futuros → Demo Trading) antes de conectar.
+        {/* ── CONTROL ROW ── */}
+        {!demoConnected ? (
+          <div className="flex gap-4 items-stretch">
+            <Card className="flex-1 bg-card/50 border-blue-500/20">
+              <CardContent className="px-4 py-3 flex items-center gap-4 h-full">
+                <div className="flex items-start gap-2 flex-1 min-w-0">
+                  <FlaskConical className="w-4 h-4 text-blue-400 shrink-0 mt-0.5" />
+                  <div>
+                    <p className="text-sm font-semibold">Ativar Modo Demo VST</p>
+                    <p className="text-[10px] text-muted-foreground mt-0.5 leading-relaxed">
+                      Usa as mesmas credenciais, direciona para{" "}
+                      <span className="font-mono">open-api-vst.bingx.com</span> — sem risco real.
                     </p>
                   </div>
-                  <Button
-                    className="w-full bg-blue-600 hover:bg-blue-500 text-white"
-                    size="sm"
-                    onClick={handleConnect}
-                    disabled={connectMutation.isPending}
-                  >
-                    {connectMutation.isPending
-                      ? <Loader2 className="w-3.5 h-3.5 animate-spin mr-2" />
-                      : <Radio className="w-3.5 h-3.5 mr-2" />
-                    }
-                    Ativar Demo VST
-                  </Button>
+                </div>
+                <Button
+                  className="shrink-0 bg-blue-600 hover:bg-blue-500 text-white"
+                  size="sm"
+                  onClick={handleConnect}
+                  disabled={connectMutation.isPending}
+                >
+                  {connectMutation.isPending
+                    ? <Loader2 className="w-3.5 h-3.5 animate-spin mr-2" />
+                    : <Radio className="w-3.5 h-3.5 mr-2" />}
+                  Ativar Demo VST
+                </Button>
+              </CardContent>
+            </Card>
+            {config && (
+              <Card className="w-[260px] bg-card/30 border-border/40">
+                <CardContent className="px-4 py-3">
+                  <div className="flex items-center gap-1.5 mb-2">
+                    <Target className="w-3.5 h-3.5 text-primary" />
+                    <span className="text-xs font-semibold">Parâmetros do Sniper</span>
+                  </div>
+                  <div className="grid grid-cols-2 gap-x-4 gap-y-0.5">
+                    {[
+                      ["Leverage", `${config.leverage}×`],
+                      ["Margin / trade", `${config.marginPerTrade} USDT`],
+                      ["Take profit", `${config.takeProfitPct}%`],
+                      ["Stop loss", `${config.stopLossPct}%`],
+                      ["EV mínimo", config.evMinThreshold > 0 ? `≥ ${config.evMinThreshold.toFixed(4)}` : "off"],
+                      ["Win rate mín", config.winRateMin > 0 ? `≥ ${(config.winRateMin * 100).toFixed(0)}%` : "off"],
+                    ].map(([label, value]) => (
+                      <div key={label} className="flex justify-between text-[10px]">
+                        <span className="text-muted-foreground">{label}</span>
+                        <span className="font-mono font-semibold">{value}</span>
+                      </div>
+                    ))}
+                  </div>
                 </CardContent>
               </Card>
             )}
-
-            {/* Demo account balance */}
-            {demoConnected && demoStatus && (
+          </div>
+        ) : (
+          <div className="grid grid-cols-2 xl:grid-cols-4 gap-4">
+            {/* 1 — Conta Demo (VST) */}
+            {demoStatus && (
               <Card className="bg-card/50 border-blue-500/20">
-                <CardHeader className="px-4 pt-4 pb-3">
-                  <CardTitle className="text-sm font-semibold flex items-center gap-2">
-                    <DollarSign className="w-4 h-4 text-blue-400" />
-                    Conta Demo ({demoStatus.currency ?? "VST"})
-                  </CardTitle>
-                </CardHeader>
-                <CardContent className="px-4 pb-4 space-y-2">
-                  <div className="flex justify-between text-xs">
-                    <span className="text-muted-foreground">Balance</span>
-                    <span className="font-mono font-bold">
-                      {parseFloat(demoStatus.balance ?? "0").toFixed(4)}
-                    </span>
+                <CardContent className="px-4 py-3">
+                  <div className="flex items-center justify-between mb-2">
+                    <div className="flex items-center gap-1.5">
+                      <DollarSign className="w-3.5 h-3.5 text-blue-400" />
+                      <span className="text-xs font-semibold">Conta Demo ({demoStatus.currency ?? "VST"})</span>
+                    </div>
+                    <button onClick={() => refetchStatus()} className="text-muted-foreground hover:text-foreground transition-colors">
+                      <RefreshCw className="w-3 h-3" />
+                    </button>
                   </div>
-                  <div className="flex justify-between text-xs">
-                    <span className="text-muted-foreground">Equity</span>
-                    <span className="font-mono">{parseFloat(demoAccount?.equity ?? demoStatus.balance ?? "0").toFixed(4)}</span>
+                  <div className="space-y-1">
+                    {[
+                      ["Balance", parseFloat(demoStatus.balance ?? "0").toFixed(4)],
+                      ["Disponível", parseFloat(demoStatus.availableBalance ?? "0").toFixed(4)],
+                      ["Equity", parseFloat(demoAccount?.equity ?? demoStatus.balance ?? "0").toFixed(4)],
+                      ["Margem usada", parseFloat(demoAccount?.usedMargin ?? "0").toFixed(4)],
+                    ].map(([label, value]) => (
+                      <div key={label} className="flex justify-between text-[10px]">
+                        <span className="text-muted-foreground">{label}</span>
+                        <span className="font-mono font-semibold">{value}</span>
+                      </div>
+                    ))}
+                    <div className="flex justify-between text-[10px]">
+                      <span className="text-muted-foreground">PnL unrealizado</span>
+                      <span className={`font-mono font-semibold ${parseFloat(demoStatus.unrealizedPnl ?? "0") >= 0 ? "text-green-400" : "text-red-400"}`}>
+                        {parseFloat(demoStatus.unrealizedPnl ?? "0") >= 0 ? "+" : ""}{parseFloat(demoStatus.unrealizedPnl ?? "0").toFixed(4)}
+                      </span>
+                    </div>
                   </div>
-                  <div className="flex justify-between text-xs">
-                    <span className="text-muted-foreground">Disponível</span>
-                    <span className="font-mono">{parseFloat(demoStatus.availableBalance ?? "0").toFixed(4)}</span>
-                  </div>
-                  <div className="flex justify-between text-xs">
-                    <span className="text-muted-foreground">Margem usada</span>
-                    <span className="font-mono">{parseFloat(demoAccount?.usedMargin ?? "0").toFixed(4)}</span>
-                  </div>
-                  <div className="flex justify-between text-xs">
-                    <span className="text-muted-foreground">PnL unrealizado</span>
-                    <span className={`font-mono ${parseFloat(demoStatus.unrealizedPnl ?? "0") >= 0 ? "text-green-400" : "text-red-400"}`}>
-                      {parseFloat(demoStatus.unrealizedPnl ?? "0") >= 0 ? "+" : ""}{parseFloat(demoStatus.unrealizedPnl ?? "0").toFixed(4)}
-                    </span>
-                  </div>
-                  <div className="flex justify-between text-xs">
-                    <span className="text-muted-foreground">Posições abertas</span>
-                    <span className="font-mono font-semibold">{demoStatus.openPositionsCount ?? 0}</span>
-                  </div>
-                  <div className="flex justify-between text-[10px]">
-                    <span className="text-muted-foreground">Confirmacao</span>
-                    <span className={demoAccount?.positionsConfirmed === false ? "text-red-400" : "text-green-400"}>
-                      {demoAccount?.positionsConfirmed === false ? "INDISPONIVEL" : "BINGX VST"}
-                    </span>
-                  </div>
-                  <Button
-                    variant="ghost" size="sm"
-                    className="w-full h-7 text-[10px] text-muted-foreground mt-1"
-                    onClick={() => refetchStatus()}
-                  >
-                    <RefreshCw className="w-3 h-3 mr-1.5" /> Atualizar
-                  </Button>
                 </CardContent>
               </Card>
             )}
 
-            {demoConnected && (
+            {/* 2 — Parâmetros do Sniper */}
+            {config && (
+              <Card className="bg-card/30 border-border/40">
+                <CardContent className="px-4 py-3">
+                  <div className="flex items-center gap-1.5 mb-2">
+                    <Target className="w-3.5 h-3.5 text-primary" />
+                    <span className="text-xs font-semibold">Parâmetros do Sniper</span>
+                  </div>
+                  <div className="space-y-1">
+                    {[
+                      ["Leverage", `${config.leverage}×`],
+                      ["Margin / trade", `${config.marginPerTrade} USDT`],
+                      ["Take profit", `${config.takeProfitPct}%`],
+                      ["Stop loss", `${config.stopLossPct}%`],
+                      ["EV mínimo", config.evMinThreshold > 0 ? `≥ ${config.evMinThreshold.toFixed(4)}` : "off"],
+                      ["Win rate mín", config.winRateMin > 0 ? `≥ ${(config.winRateMin * 100).toFixed(0)}%` : "off"],
+                    ].map(([label, value]) => (
+                      <div key={label} className="flex justify-between text-[10px]">
+                        <span className="text-muted-foreground">{label}</span>
+                        <span className="font-mono font-semibold">{value}</span>
+                      </div>
+                    ))}
+                  </div>
+                </CardContent>
+              </Card>
+            )}
+
+            {/* 3 — Auto-Fire */}
+            <Card className={`border-2 transition-colors ${autoFire ? "border-orange-500/50 bg-orange-500/5" : "border-border/40 bg-card/30"}`}>
+              <CardContent className="px-4 py-3">
+                <div className="flex items-center justify-between mb-2">
+                  <div className="flex items-center gap-1.5">
+                    {autoFire ? <Play className="w-3.5 h-3.5 text-orange-400" /> : <Square className="w-3.5 h-3.5 text-muted-foreground" />}
+                    <span className={`text-xs font-bold ${autoFire ? "text-orange-400" : "text-muted-foreground"}`}>Auto-Fire</span>
+                  </div>
+                  <Switch checked={autoFire} onCheckedChange={setAutoFire} />
+                </div>
+                <p className="text-[10px] text-muted-foreground leading-relaxed">
+                  {autoFire
+                    ? "Disparando automaticamente em todos os candidatos a cada scan (8s)."
+                    : "Quando ativado, dispara ordens nos candidatos que passam todos os gates."}
+                </p>
+                {autoFire && (
+                  <div className="mt-2 flex items-center gap-1.5 text-[9px] text-orange-400 font-semibold">
+                    <span className="w-1.5 h-1.5 rounded-full bg-orange-400 animate-pulse" />
+                    ESCANEANDO · {candidates.length} candidato{candidates.length !== 1 ? "s" : ""}
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+
+            {/* 4 — Sniper Autopilot */}
+            <Card className={`border-2 transition-colors ${sniperStatus?.running ? "border-purple-500/50 bg-purple-500/5" : "border-border/40 bg-card/30"}`}>
+              <CardContent className="px-4 py-3 space-y-2">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-1.5">
+                    <Crosshair className={`w-3.5 h-3.5 ${sniperStatus?.running ? "text-purple-400" : "text-muted-foreground"}`} />
+                    <span className={`text-xs font-bold ${sniperStatus?.running ? "text-purple-400" : "text-muted-foreground"}`}>Sniper Autopilot</span>
+                    {sniperStatus?.running && (
+                      <span className="flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-purple-500/20 text-[9px] font-mono font-bold text-purple-400">
+                        <span className="w-1.5 h-1.5 rounded-full bg-purple-400 animate-pulse" />
+                        LIVE
+                      </span>
+                    )}
+                  </div>
+                  <Button
+                    size="sm"
+                    disabled={sniperLoading}
+                    onClick={sniperStatus?.running ? handleSniperStop : handleSniperStart}
+                    className={`h-6 px-2.5 text-[10px] font-bold ${sniperStatus?.running
+                      ? "bg-red-600/20 hover:bg-red-600/40 text-red-400 border border-red-500/30"
+                      : "bg-purple-600 hover:bg-purple-500 text-white"}`}
+                    variant="ghost"
+                  >
+                    {sniperLoading ? <Loader2 className="w-3 h-3 animate-spin" />
+                      : sniperStatus?.running ? <><Square className="w-3 h-3 mr-1" />Stop</>
+                      : <><Play className="w-3 h-3 mr-1" />Start</>}
+                  </Button>
+                </div>
+                {sniperStatus && (
+                  <div className="grid grid-cols-4 gap-1">
+                    {[
+                      ["Cycles", sniperStatus.cycleCount],
+                      ["Placed", sniperStatus.totalPlaced],
+                      ["Open", sniperStatus.openTrades],
+                      ["Uptime", sniperStatus.uptimeMs ? `${Math.floor(sniperStatus.uptimeMs / 60000)}m` : "-"],
+                    ].map(([label, value]) => (
+                      <div key={String(label)} className="flex flex-col items-center py-1 px-1 rounded-md bg-muted/10 border border-border/15">
+                        <span className="text-sm font-bold font-mono">{value}</span>
+                        <span className="text-[8px] text-muted-foreground uppercase tracking-wider mt-0.5">{label}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {sniperStatus?.lastCycleSummary && (
+                  <div className="flex flex-wrap gap-1">
+                    <span className={`px-1.5 py-0.5 rounded text-[9px] font-mono font-bold ${
+                      sniperStatus.lastCycleSummary.btcRegime === "BULL" ? "bg-green-500/15 text-green-400"
+                      : sniperStatus.lastCycleSummary.btcRegime === "BEAR" ? "bg-red-500/15 text-red-400"
+                      : "bg-muted/20 text-muted-foreground"
+                    }`}>{sniperStatus.lastCycleSummary.btcRegime}</span>
+                    <span className="px-1.5 py-0.5 rounded text-[9px] font-mono bg-muted/15 text-muted-foreground">
+                      {sniperStatus.lastCycleSummary.scanned} scanned
+                    </span>
+                    <span className="px-1.5 py-0.5 rounded text-[9px] font-mono bg-green-500/10 text-green-400">
+                      +{sniperStatus.lastCycleSummary.placed} placed
+                    </span>
+                  </div>
+                )}
+                <div className="text-[8px] text-muted-foreground border-t border-border/15 pt-1">
+                  Score ≥0.90 → ×10 · ≥0.80 → ×5 · ≥0.70 → ×3 · ≥0.60 → ×1
+                </div>
+              </CardContent>
+            </Card>
+          </div>
+        )}
+
+        <div className={`grid grid-cols-1 gap-5 ${demoConnected ? "xl:grid-cols-[260px_1fr_320px]" : "xl:grid-cols-[1fr_320px]"}`}>
+          {/* ── LEFT PANEL (Posições Demo only) ── */}
+          {demoConnected && (
+            <div>
               <Card className="bg-card/40 border-border/40">
                 <CardHeader className="px-4 pt-4 pb-3 border-b border-border/20">
                   <CardTitle className="text-sm font-semibold flex items-center justify-between gap-2">
@@ -963,7 +1080,7 @@ export default function DemoPage() {
                       Nenhuma posição aberta
                     </div>
                   ) : (
-                    <div className="max-h-[320px] overflow-y-auto">
+                    <div className="max-h-[480px] overflow-y-auto custom-scrollbar">
                       {visibleDemoPositions.map((position) => {
                         const key = `${position.symbol}-${position.positionSide}`;
                         return (
@@ -979,160 +1096,8 @@ export default function DemoPage() {
                   )}
                 </CardContent>
               </Card>
-            )}
-
-            {/* Bot config summary */}
-            {config && (
-              <Card className="bg-card/30 border-border/40">
-                <CardHeader className="px-4 pt-4 pb-3">
-                  <CardTitle className="text-sm font-semibold flex items-center gap-2">
-                    <Target className="w-4 h-4 text-primary" />
-                    Parâmetros do Sniper
-                  </CardTitle>
-                </CardHeader>
-                <CardContent className="px-4 pb-4 space-y-2">
-                  {[
-                    ["Leverage", `${config.leverage}×`],
-                    ["Margin / trade", `${config.marginPerTrade} USDT`],
-                    ["Take profit", `${config.takeProfitPct}%`],
-                    ["Stop loss", `${config.stopLossPct}%`],
-                    ["EV mínimo", config.evMinThreshold > 0 ? `≥ ${config.evMinThreshold.toFixed(4)}` : "off"],
-                    ["Win rate mín", config.winRateMin > 0 ? `≥ ${(config.winRateMin * 100).toFixed(0)}%` : "off"],
-                  ].map(([label, value]) => (
-                    <div key={label} className="flex justify-between text-xs">
-                      <span className="text-muted-foreground">{label}</span>
-                      <span className="font-mono font-semibold">{value}</span>
-                    </div>
-                  ))}
-                </CardContent>
-              </Card>
-            )}
-
-            {/* Auto-fire control */}
-            {demoConnected && (
-              <Card className={`border-2 transition-colors ${autoFire ? "border-orange-500/50 bg-orange-500/5" : "border-border/40 bg-card/30"}`}>
-                <CardContent className="px-4 py-4">
-                  <div className="flex items-center justify-between mb-3">
-                    <div className="flex items-center gap-2">
-                      {autoFire
-                        ? <Play className="w-4 h-4 text-orange-400" />
-                        : <Square className="w-4 h-4 text-muted-foreground" />}
-                      <span className={`text-sm font-bold ${autoFire ? "text-orange-400" : "text-muted-foreground"}`}>
-                        Auto-Fire
-                      </span>
-                    </div>
-                    <Switch checked={autoFire} onCheckedChange={setAutoFire} />
-                  </div>
-                  <p className="text-[10px] text-muted-foreground leading-relaxed">
-                    {autoFire
-                      ? "Disparando automaticamente em todos os candidatos a cada scan (8s). Monitore o log."
-                      : "Quando ativado, dispara ordens demo nos candidatos que passam todos os gates."}
-                  </p>
-                  {autoFire && (
-                    <div className="mt-3 flex items-center gap-2 text-[10px] text-orange-400 font-semibold">
-                      <span className="w-2 h-2 rounded-full bg-orange-400 animate-pulse" />
-                      ESCANEANDO · {candidates.length} candidato{candidates.length !== 1 ? "s" : ""} ativo{candidates.length !== 1 ? "s" : ""}
-                    </div>
-                  )}
-                </CardContent>
-              </Card>
-            )}
-
-            {/* ── Demo Sniper Autopilot ── */}
-            {demoConnected && (
-              <Card className={`border-2 transition-colors ${sniperStatus?.running ? "border-purple-500/50 bg-purple-500/5" : "border-border/40 bg-card/30"}`}>
-                <CardContent className="px-4 py-4 space-y-3">
-                  <div className="flex items-center justify-between">
-                    <div className="flex items-center gap-2">
-                      <Crosshair className={`w-4 h-4 ${sniperStatus?.running ? "text-purple-400" : "text-muted-foreground"}`} />
-                      <span className={`text-sm font-bold ${sniperStatus?.running ? "text-purple-400" : "text-muted-foreground"}`}>
-                        Sniper Autopilot
-                      </span>
-                      {sniperStatus?.running && (
-                        <span className="flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-purple-500/20 text-[9px] font-mono font-bold text-purple-400">
-                          <span className="w-1.5 h-1.5 rounded-full bg-purple-400 animate-pulse" />
-                          LIVE
-                        </span>
-                      )}
-                    </div>
-                    <Button
-                      size="sm"
-                      disabled={sniperLoading}
-                      onClick={sniperStatus?.running ? handleSniperStop : handleSniperStart}
-                      className={`h-7 px-3 text-[11px] font-bold ${sniperStatus?.running
-                        ? "bg-red-600/20 hover:bg-red-600/40 text-red-400 border border-red-500/30"
-                        : "bg-purple-600 hover:bg-purple-500 text-white"}`}
-                      variant="ghost"
-                    >
-                      {sniperLoading ? <Loader2 className="w-3 h-3 animate-spin" />
-                        : sniperStatus?.running ? <><Square className="w-3 h-3 mr-1" />Stop</>
-                        : <><Play className="w-3 h-3 mr-1" />Start</>}
-                    </Button>
-                  </div>
-
-                  {sniperStatus ? (
-                    <div className="grid grid-cols-2 gap-2">
-                      {[
-                        ["Cycles", sniperStatus.cycleCount],
-                        ["Placed", sniperStatus.totalPlaced],
-                        ["Open (sniper)", sniperStatus.openTrades],
-                        ["Uptime", sniperStatus.uptimeMs ? `${Math.floor(sniperStatus.uptimeMs / 60000)}m` : "-"],
-                      ].map(([label, value]) => (
-                        <div key={String(label)} className="flex flex-col items-center py-1.5 px-2 rounded-md bg-muted/10 border border-border/15">
-                          <span className="text-base font-bold font-mono">{value}</span>
-                          <span className="text-[8px] text-muted-foreground uppercase tracking-wider mt-0.5">{label}</span>
-                        </div>
-                      ))}
-                    </div>
-                  ) : null}
-
-                  {sniperStatus?.lastCycleSummary && (
-                    <div className="space-y-1.5">
-                      <div className="text-[9px] text-muted-foreground uppercase tracking-wider font-semibold">Último ciclo</div>
-                      <div className="flex flex-wrap gap-1.5">
-                        <span className={`px-1.5 py-0.5 rounded text-[9px] font-mono font-bold ${
-                          sniperStatus.lastCycleSummary.btcRegime === "BULL" ? "bg-green-500/15 text-green-400"
-                          : sniperStatus.lastCycleSummary.btcRegime === "BEAR" ? "bg-red-500/15 text-red-400"
-                          : "bg-muted/20 text-muted-foreground"
-                        }`}>{sniperStatus.lastCycleSummary.btcRegime}</span>
-                        <span className="px-1.5 py-0.5 rounded text-[9px] font-mono bg-muted/15 text-muted-foreground">
-                          {sniperStatus.lastCycleSummary.scanned} scanned
-                        </span>
-                        <span className="px-1.5 py-0.5 rounded text-[9px] font-mono bg-green-500/10 text-green-400">
-                          +{sniperStatus.lastCycleSummary.placed} placed
-                        </span>
-                      </div>
-                      {sniperStatus.lastCycleSummary.placements.length > 0 && (
-                        <div className="flex flex-wrap gap-1">
-                          {sniperStatus.lastCycleSummary.placements.slice(0, 4).map((p, i) => (
-                            <span key={i} className={`px-1.5 py-0.5 rounded text-[8px] font-mono ${
-                              p.positionSide === "LONG" ? "bg-green-500/10 text-green-400" : "bg-red-500/10 text-red-400"
-                            }`}>
-                              {p.symbol.replace("-USDT", "")} {p.positionSide === "LONG" ? "▲" : "▼"} ×{p.tier}
-                            </span>
-                          ))}
-                          {sniperStatus.lastCycleSummary.placements.length > 4 && (
-                            <span className="text-[8px] text-muted-foreground">+{sniperStatus.lastCycleSummary.placements.length - 4} more</span>
-                          )}
-                        </div>
-                      )}
-                    </div>
-                  )}
-
-                  <div className="text-[9px] text-muted-foreground leading-relaxed pt-0.5 border-t border-border/15">
-                    Score ≥0.90 → ×10 · ≥0.80 → ×5 · ≥0.70 → ×3 · ≥0.60 → ×1
-                  </div>
-                </CardContent>
-              </Card>
-            )}
-
-            {!demoConnected && (
-              <div className="px-4 py-8 rounded-lg border border-dashed border-border/30 text-center">
-                <FlaskConical className="w-8 h-8 text-muted-foreground/30 mx-auto mb-3" />
-                <p className="text-xs text-muted-foreground">Conecte a conta demo para habilitar o scanner e auto-fire</p>
-              </div>
-            )}
-          </div>
+            </div>
+          )}
 
        {/* ── CENTER PANEL — scanner ── */}
 <Card className="bg-card/30 border-border/40 flex flex-col h-[525px] overflow-hidden">
