@@ -19,6 +19,8 @@
  * Cache: 5 minutes per symbol (1h candles are slow-moving for scalp macro direction).
  */
 
+import { assessCandleBatch } from "./marketDataQuality";
+
 const BINGX_PUBLIC = "https://open-api.bingx.com";
 const CACHE_TTL_MS = 5 * 60 * 1000;
 const CANDLE_LIMIT = 48;
@@ -52,6 +54,7 @@ export interface SentimentResult {
 }
 
 interface CandleRaw {
+  openTime: number;
   open: number;
   high: number;
   low: number;
@@ -118,16 +121,29 @@ async function fetchCandles(symbol: string): Promise<CandleRaw[]> {
   if (json.code !== 0 || !Array.isArray(json.data)) throw new Error(`BingX klines code=${json.code}`);
 
   const rows = json.data as BingXKlineRow[];
-  return rows
+  const parsed = rows
     .map((r) => ({
+      openTime: Number(r.time),
       open: parseFloat(r.open),
       high: parseFloat(r.high),
       low: parseFloat(r.low),
       close: parseFloat(r.close),
       volume: parseFloat(r.volume),
     }))
-    .filter((c) => c.close > 0)
-    .sort((a, b) => 0);
+    .sort((a, b) => a.openTime - b.openTime);
+  const quality = assessCandleBatch(symbol, "1h", parsed);
+  if (quality.stale) throw new Error(`stale_sentiment_candles:${quality.freshnessMs}`);
+  if (quality.completedCandles.length < 24) {
+    throw new Error(`insufficient_completed_sentiment_candles:${quality.completedCandles.length}`);
+  }
+  return quality.completedCandles.map((c) => ({
+    openTime: c.openTime,
+    open: c.open,
+    high: c.high,
+    low: c.low,
+    close: c.close,
+    volume: c.volume,
+  }));
 }
 
 function computeEma(values: number[], period: number): number[] {
