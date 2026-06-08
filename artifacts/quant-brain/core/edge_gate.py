@@ -433,6 +433,8 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
     now_hour = datetime.now(timezone.utc).hour
     hour_utc = int(payload.get("hourUtc", payload.get("hour_utc", now_hour)))
     config = payload.get("config") or {}
+    if payload.get("observationSourceType"):
+        config = {**config, "signalSourceType": payload.get("observationSourceType")}
 
     risk_profile = str(
         config.get("riskProfile")
@@ -493,7 +495,24 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
     sniper = evaluate_sniper_window(
         symbol, alt_history, btc_history, target_moves_pct=target_moves_pct
     )
-    signal_memory = await record_signal_from_gate(symbol, position_side, sniper, config)
+    signal_metadata = {
+        "signalId": signal_id,
+        "marketEventId": market_event_id,
+        "featureVersion": feature_version,
+        "featureTimestampMs": payload.get("featureTimestampMs"),
+        "requestTimestamp": payload.get("requestTimestamp"),
+        "expiresAt": payload.get("expiresAt"),
+        "referencePrice": payload.get("referencePrice"),
+        "configVersion": payload.get("configVersion") or config.get("configVersion"),
+    }
+    signal_memory = await record_signal_from_gate(
+        symbol,
+        position_side,
+        sniper,
+        config,
+        metadata=signal_metadata,
+    )
+    signal_id = signal_memory["signalId"]
     signal_edge = await score_signal_context(
         symbol, signal_memory["side"], signal_memory["contextKey"]
     )
@@ -832,6 +851,17 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
         shadow_ml.get("uncertaintyType", "UNCALIBRATED")
         if shadow_ml.get("available")
         else "MODEL_UNAVAILABLE"
+    )
+    await kb.update_signal_decision_audit(
+        signal_id,
+        allowed=allow,
+        reject_reasons=all_blocks,
+        raw_score=float(coaching["executionPriority"]),
+        calibrated_score=float(coaching.get("calibratedScore", coaching["executionPriority"])),
+        policy_version=primary_experiment["policyVersion"] if primary_experiment else None,
+        playbook=regime_playbook.get("playbook"),
+        regime=regime_playbook.get("regime"),
+        setup_type=(regime_playbook.get("allowedSetups") or [None])[0],
     )
 
     return {
