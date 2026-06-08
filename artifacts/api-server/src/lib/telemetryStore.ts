@@ -53,6 +53,8 @@ let isShuttingDown = false;
 let lastHealthCheck = Date.now();
 let totalRecords = 0;
 let lastBackupSize = 0;
+let rewriteInFlight = false;
+const recordedOutcomeIds = new Set<string>();
 
 // ========== WRITE LOCK ==========
 // Serializes all updateTradeOutcome calls — prevents race conditions during
@@ -355,7 +357,7 @@ function appendToDiskAsync(outcome: TradeOutcome): void {
   totalRecords++;
 
   // Force flush if buffer is getting large
-  if (writeBuffer.length >= 100) {
+  if (writeBuffer.length >= 100 && !rewriteInFlight) {
     flushWriteBuffer().catch(err => {
       logger.error({ err }, "Failed to flush telemetry buffer");
     });
@@ -363,9 +365,16 @@ function appendToDiskAsync(outcome: TradeOutcome): void {
 }
 
 function rewriteTelemetryFile(outcomes: TradeOutcome[]): void {
-  const content = outcomes.map((outcome) => JSON.stringify(outcome)).join("\n");
-  fs.writeFileSync(TELEMETRY_FILE, content ? `${content}\n` : "", "utf-8");
-  totalRecords = outcomes.length;
+  rewriteInFlight = true;
+  try {
+    const content = outcomes.map((outcome) => JSON.stringify(outcome)).join("\n");
+    fs.writeFileSync(TELEMETRY_FILE, content ? `${content}\n` : "", "utf-8");
+    totalRecords = outcomes.length;
+    recordedOutcomeIds.clear();
+    for (const outcome of outcomes) recordedOutcomeIds.add(outcome.id);
+  } finally {
+    rewriteInFlight = false;
+  }
 }
 
 // ========== HEALTH MONITORING ==========
@@ -412,6 +421,8 @@ export function initTelemetryStore(): AdaptiveEngine {
 
   const historical = loadFromDisk();
   totalRecords = historical.length;
+  recordedOutcomeIds.clear();
+  for (const outcome of historical) recordedOutcomeIds.add(outcome.id);
 
   logger.info({ historicalTrades: totalRecords }, "Loaded historical trades");
 
@@ -477,11 +488,21 @@ export function getTelemetryStats(): {
  * Equivalent to the storage.record_outcome() + adaptive.apply_outcome() pipeline.
  */
 export function recordTradeOutcome(raw: Omit<TradeOutcome, "id"> & { id?: string }): TradeOutcome {
+  const deterministicId = raw.id
+    ?? raw.exchangeOrderId
+    ?? raw.entryOrderId
+    ?? raw.clientOrderId
+    ?? (raw.marketEventId && raw.positionSide ? `event:${raw.marketEventId}:${raw.positionSide}` : undefined);
   const outcome: TradeOutcome = {
-    id: raw.id ?? crypto.randomUUID(),
+    id: deterministicId ?? crypto.randomUUID(),
     ...raw,
     hourUtc: raw.hourUtc ?? new Date(raw.entryTime).getUTCHours(),
   };
+  if (recordedOutcomeIds.has(outcome.id)) {
+    const existing = loadFromDisk().find((entry) => entry.id === outcome.id);
+    if (existing) return existing;
+    logger.warn({ id: outcome.id }, "telemetry outcome id was indexed but not found on disk; recording replacement");
+  }
 
   // Validate before recording
   const validation = TradeOutcomeSchema.safeParse(outcome);
@@ -491,6 +512,7 @@ export function recordTradeOutcome(raw: Omit<TradeOutcome, "id"> & { id?: string
   }
 
   appendToDiskAsync(outcome);
+  recordedOutcomeIds.add(outcome.id);
   getEngine().recordOutcome(outcome);
   recordKillSwitchOutcome(outcome);
   emitSseTrade(outcome);
@@ -600,15 +622,21 @@ export function buildOutcomeFromOrders(
     expectedExitPrice?: number;
   },
 ): TradeOutcome {
-  const grossPnl = parseFloat(exitOrder.profit ?? "0");
   const entryFee = Math.abs(parseFloat(entryOrder.commission ?? "0"));
   const exitFee = Math.abs(parseFloat(exitOrder.commission ?? "0"));
   const fee = entryFee + exitFee;
-  const realizedPnl = grossPnl - fee;
   const entryPrice = parseFloat(entryOrder.avgPrice);
   const exitPrice = parseFloat(exitOrder.avgPrice);
   const qty = parseFloat(entryOrder.origQty);
   const positionSide = entryOrder.positionSide as PositionSide;
+  const reportedProfit = exitOrder.profit === null || exitOrder.profit === undefined || exitOrder.profit === ""
+    ? Number.NaN
+    : parseFloat(exitOrder.profit);
+  const pricePnl = Number.isFinite(entryPrice) && Number.isFinite(exitPrice) && Number.isFinite(qty)
+    ? (positionSide === "LONG" ? exitPrice - entryPrice : entryPrice - exitPrice) * qty
+    : 0;
+  const grossPnl = Number.isFinite(reportedProfit) ? reportedProfit : pricePnl;
+  const realizedPnl = grossPnl - fee;
   const expectedEntryPrice = context.expectedEntryPrice;
   const expectedExitPrice = context.expectedExitPrice;
   const entrySlippage = computeSlippage(positionSide, expectedEntryPrice, entryPrice, qty, "entry");
@@ -635,6 +663,8 @@ export function buildOutcomeFromOrders(
     grossPnl,
     fee,
     realizedPnl,
+    pnlSource: Number.isFinite(reportedProfit) ? "exchange_reported" : "price_estimate",
+    estimated: !Number.isFinite(reportedProfit),
     expectedEntryPrice,
     expectedExitPrice,
     entrySlippage,
