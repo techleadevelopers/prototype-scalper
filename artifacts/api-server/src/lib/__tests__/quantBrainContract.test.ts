@@ -1,6 +1,90 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
+import os from "node:os";
+
+const baseOutcome = (id: string) => ({
+  id,
+  isDemo: true,
+  source: "bingx-vst" as const,
+  symbol: "ETH-USDT",
+  positionSide: "LONG" as const,
+  side: "BUY" as const,
+  entryTime: 1_700_000_000_000,
+  exitTime: 1_700_000_060_000,
+  hourUtc: 14,
+  btcRegime: "BULL" as const,
+  entryPrice: 2000,
+  exitPrice: 2020,
+  qty: 0.01,
+  leverage: 10,
+  marginUsed: 2,
+  grossPnl: 0.2,
+  fee: 0.02,
+  realizedPnl: 0.18,
+  exitReason: "TP" as const,
+  expectedTpProfit: 0.2,
+});
+
+describe("Quant Brain batch ack", () => {
+  async function importClientWithOutbox() {
+    vi.resetModules();
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "qb-outbox-"));
+    const outboxPath = path.join(dir, "outbox.json");
+    vi.stubEnv("QUANT_BRAIN_URL", "http://localhost:9000");
+    vi.stubEnv("QUANT_BRAIN_ENABLED", "true");
+    vi.stubEnv("QUANT_BRAIN_OUTBOX_PATH", outboxPath);
+    const client = await import("../quantBrainClient");
+    client._resetQuantBrainOutcomeStateForTesting();
+    return { client, outboxPath };
+  }
+
+  it("deletes only recorded items and keeps recorded=false pending", async () => {
+    const { client, outboxPath } = await importClientWithOutbox();
+    client._enqueueQuantBrainOutcomeForTesting(baseOutcome("A"));
+    client._enqueueQuantBrainOutcomeForTesting(baseOutcome("B"));
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(new Response(JSON.stringify({
+      items: [
+        { sourceId: "A", recorded: true, duplicate: false, blockedReasons: [] },
+        { sourceId: "B", recorded: false, duplicate: false, blockedReasons: ["bad_label"], error: "blocked" },
+      ],
+    }), { status: 200 }));
+
+    await client.flushPendingQuantBrainOutcomes();
+
+    const persisted = JSON.parse(fs.readFileSync(outboxPath, "utf8"));
+    expect(persisted.map((item: { id: string }) => item.id)).toEqual(["B"]);
+    expect(persisted[0].quantBrainLastError).toBe("blocked");
+  });
+
+  it("deletes duplicate items", async () => {
+    const { client, outboxPath } = await importClientWithOutbox();
+    client._enqueueQuantBrainOutcomeForTesting(baseOutcome("A"));
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(new Response(JSON.stringify({
+      items: [{ sourceId: "A", recorded: false, duplicate: true, blockedReasons: [] }],
+    }), { status: 200 }));
+
+    await client.flushPendingQuantBrainOutcomes();
+
+    expect(JSON.parse(fs.readFileSync(outboxPath, "utf8"))).toEqual([]);
+  });
+
+  it("keeps every item when batch response is invalid", async () => {
+    const { client, outboxPath } = await importClientWithOutbox();
+    client._enqueueQuantBrainOutcomeForTesting(baseOutcome("A"));
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(new Response(JSON.stringify({ ok: true }), { status: 200 }));
+
+    await client.flushPendingQuantBrainOutcomes();
+
+    const persisted = JSON.parse(fs.readFileSync(outboxPath, "utf8"));
+    expect(persisted.map((item: { id: string }) => item.id)).toEqual(["A"]);
+  });
+});
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllEnvs();
+});
 
 describe("shared edge-v3 contract", () => {
   it("uses the same unavailable and side semantics as Quant Brain", () => {
@@ -79,6 +163,26 @@ describe("shared edge-v3 contract", () => {
       request,
       now,
     )).toThrow(/unavailable/);
+    expect(() => validateQuantBrainEdgeResponse(
+      valid,
+      { ...request, candleIsComplete: false },
+      now,
+    )).toThrow(/incomplete candle/);
+    expect(() => validateQuantBrainEdgeResponse(
+      valid,
+      { ...request, featureTimestampMs: now + 1 },
+      now,
+    )).toThrow(/future/);
+    expect(() => validateQuantBrainEdgeResponse(
+      valid,
+      { ...request, featureTimestampMs: now - 60_000 },
+      now,
+    )).toThrow(/stale feature/);
+    expect(() => validateQuantBrainEdgeResponse(
+      { ...valid, predictionTimestamp: now - 2_000 },
+      { ...request, featureTimestampMs: now },
+      now,
+    )).toThrow(/predates feature/);
   });
 });
 
@@ -88,6 +192,118 @@ vi.mock("../quantBrainClient", async (importOriginal) => {
 });
 
 describe("outcomeToQuantPayload — audit trail fields", () => {
+  it("uses the same mapper for single and batch rich trade payloads", async () => {
+    const { tradeOutcomeToQuantPayload, tradeOutcomesToQuantBatchPayload } = await import("../quantBrainClient");
+    const outcome = {
+      id: "campaign:rich-123",
+      isDemo: true,
+      source: "bingx-vst" as const,
+      sourceType: "demo" as const,
+      symbol: "ETH-USDT",
+      positionSide: "LONG" as const,
+      side: "BUY" as const,
+      entryTime: 1_700_000_000_000,
+      exitTime: 1_700_000_060_000,
+      hourUtc: 14,
+      btcRegime: "BULL" as const,
+      entryPrice: 2000,
+      exitPrice: 2020,
+      qty: 0.01,
+      leverage: 10,
+      marginUsed: 2,
+      grossPnl: 0.2,
+      fee: 0.02,
+      realizedPnl: 0.18,
+      exitReason: "TP" as const,
+      expectedTpProfit: 0.2,
+      expectedEntryPrice: 1998,
+      markPriceBeforeOrder: 1999,
+      actualAvgEntryPrice: 2000.5,
+      expectedExitPrice: 2022,
+      actualExitPrice: 2020,
+      signalCreatedAt: 1_700_000_000_100,
+      qbEvaluatedAt: 1_700_000_000_200,
+      orderRequestedAt: 1_700_000_000_300,
+      orderSentAt: 1_700_000_000_400,
+      orderAckAt: 1_700_000_000_500,
+      positionConfirmedAt: 1_700_000_000_600,
+      positionClosedAt: 1_700_000_060_000,
+      protectionAttachedAt: 1_700_000_001_000,
+      monitorDetectedCloseAt: 1_700_000_060_100,
+      spreadBps: 1.2,
+      spreadAtSignal: 1.1,
+      spreadAtEntry: 1.3,
+      spreadAtExit: 1.5,
+      orderType: "MARKET",
+      entrySlippage: 0.05,
+      exitSlippage: 0.03,
+      totalSlippage: 0.08,
+      slippagePctNotional: 0.0004,
+      mfe: 0.8,
+      mae: -0.3,
+      holdDurationMs: 60_000,
+      entryCount: 2,
+      riskTier: "BOOST" as const,
+      sizeMultiplier: 1.5,
+      sizeReason: "edge_boost",
+      recommendedMargin: 3,
+      recommendedLeverage: 12,
+      maxLossIfStop: 0.18,
+      notional: 36,
+      sizing: {
+        riskTier: "BOOST",
+        recommendedMargin: 3,
+        recommendedLeverage: 12,
+        notional: 36,
+      },
+      strategyVersion: "strategy-v2",
+      configVersion: "config-v3",
+      modelVersion: "shadow-1700000000",
+      policyVersion: "policy-v4",
+      labelVersion: "label-v5",
+      featureVersion: "sniper-v1",
+      playbook: "breakout",
+      setup: "momentum-continuation",
+      aggressiveScore: 0.81,
+      executionPriority: 0.77,
+      coachScore: 0.7,
+      playbookScore: 0.74,
+      mlProbability: 0.66,
+      calibratedProbability: 0.64,
+      calibratedScore: 0.69,
+      executionQuality: 0.91,
+      signalId: "signal-123",
+      marketEventId: "ETH-USDT:LONG:5666666",
+      predictionId: "prediction-123",
+      campaignId: "campaign-123",
+      clientOrderId: "client-123",
+      exchangeOrderId: "exchange-123",
+    };
+
+    const singlePayload = tradeOutcomeToQuantPayload(outcome);
+    const [batchPayload] = tradeOutcomesToQuantBatchPayload([outcome]);
+
+    expect(batchPayload).toEqual(singlePayload);
+    expect(singlePayload).toMatchObject({
+      riskTier: "BOOST",
+      recommendedMargin: 3,
+      recommendedLeverage: 12,
+      notional: 36,
+      sizing: outcome.sizing,
+      strategyVersion: "strategy-v2",
+      configVersion: "config-v3",
+      modelVersion: "shadow-1700000000",
+      policyVersion: "policy-v4",
+      labelVersion: "label-v5",
+      playbook: "breakout",
+      setup: "momentum-continuation",
+      orderAckAt: 1_700_000_000_500,
+      executionQuality: 0.91,
+      predictionId: "prediction-123",
+      exchangeOrderId: "exchange-123",
+    });
+  });
+
   it("includes mfe, mae, holdDurationMs, entryCount, modelVersion in payload", async () => {
     const { syncQuantBrainOutcome } = await import("../quantBrainClient");
     const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
@@ -142,6 +358,75 @@ describe("outcomeToQuantPayload — audit trail fields", () => {
     }
 
     fetchSpy.mockRestore();
+  });
+});
+
+describe("OutcomeAckSchema - Quant Brain /kb/trades response", () => {
+  it("accepts the real acknowledgement shape returned by Quant Brain", async () => {
+    vi.stubEnv("QUANT_BRAIN_URL", "http://localhost:9000");
+    vi.stubEnv("QUANT_BRAIN_API_TOKEN", "test-token");
+
+    const { syncQuantBrainOutcome } = await import("../quantBrainClient");
+    const sourceId = "campaign:ack-contract-1";
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      new Response(JSON.stringify({
+        ok: true,
+        sourceId,
+        recorded: true,
+        duplicate: false,
+        symbol: "ETH-USDT",
+        pnl_pct: 9,
+        experiment: {},
+        executionAudit: {
+          sourceId,
+          symbol: "ETH-USDT",
+          side: "LONG",
+          executionQuality: "ACCEPTABLE_EXECUTION",
+        },
+      }), { status: 200 })
+    );
+
+    const result = await syncQuantBrainOutcome({
+      id: sourceId,
+      isDemo: true,
+      source: "bingx-vst" as const,
+      sourceType: "demo",
+      symbol: "ETH-USDT",
+      positionSide: "LONG" as const,
+      side: "BUY" as const,
+      entryTime: 1_700_000_000_000,
+      exitTime: 1_700_000_060_000,
+      signalCreatedAt: 1_700_000_000_000,
+      orderRequestedAt: 1_700_000_001_000,
+      orderSentAt: 1_700_000_001_100,
+      orderAckAt: 1_700_000_001_300,
+      positionConfirmedAt: 1_700_000_002_000,
+      positionClosedAt: 1_700_000_060_000,
+      hourUtc: 14,
+      btcRegime: "BULL" as const,
+      entryPrice: 2000,
+      exitPrice: 2020,
+      expectedEntryPrice: 2000,
+      actualAvgEntryPrice: 2000,
+      expectedExitPrice: 2020,
+      actualExitPrice: 2020,
+      qty: 0.01,
+      leverage: 10,
+      marginUsed: 2,
+      grossPnl: 0.2,
+      fee: 0.02,
+      realizedPnl: 0.18,
+      exitReason: "TP" as const,
+      expectedTpProfit: 0.2,
+      signalId: "signal-ack-contract-1",
+      marketEventId: "ETH-USDT:LONG:ack-contract-1",
+    });
+
+    expect(result).toEqual({ synced: true });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+    fetchSpy.mockRestore();
+    vi.unstubAllEnvs();
   });
 });
 
