@@ -88,6 +88,27 @@ class SignalOutcomeOrderingTest(unittest.TestCase):
             ("target-first", 1, 0, "TARGET_CONFIGURED"),
         ])
 
+    async def _run_stale_no_history_scenario(self) -> tuple[dict, tuple]:
+        created_at = time.time() - 2000
+        await self._seed("stale-no-history", "ETH-USDT", created_at)
+        sl.get_snapshot_history = lambda _symbol, _window: []
+
+        result = await sl.finalize_due_signal_outcomes()
+
+        async with aiosqlite.connect(kb.DB_PATH) as db:
+            row = await (await db.execute(
+                """SELECT finalized, hit_configured, first_event, label_source
+                   FROM signal_outcomes
+                   WHERE signal_id='stale-no-history'"""
+            )).fetchone()
+        return result, row
+
+    def test_stale_signal_without_history_expires_without_hit_label(self) -> None:
+        result, row = asyncio.run(self._run_stale_no_history_scenario())
+        self.assertEqual(result["finalized"], 0)
+        self.assertEqual(result["expired"], 1)
+        self.assertEqual(row, (1, None, "EXPIRED_NO_HISTORY", "expired_no_history"))
+
 
 if __name__ == "__main__":
     unittest.main()
