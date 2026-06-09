@@ -72,7 +72,7 @@ _MODEL_MAINTENANCE_SECONDS = float(os.environ.get("MODEL_MAINTENANCE_SECONDS", "
 _SIGNAL_FINALIZER_SECONDS = float(os.environ.get("SIGNAL_FINALIZER_SECONDS", str(_MODEL_MAINTENANCE_SECONDS)))
 _MIN_TRAINING_SAMPLES = max(1, int(os.environ.get("MIN_TRAINING_SAMPLES", "300")))
 _TACTICAL_LOOP_SECONDS = max(5, int(float(os.environ.get("TACTICAL_LOOP_SECONDS", "15"))))
-_JOB_MAX_CONCURRENCY = max(1, int(os.environ.get("JOB_MAX_CONCURRENCY", "1")))
+_JOB_MAX_CONCURRENCY = max(1, int(os.environ.get("JOB_MAX_CONCURRENCY", "2")))
 _JOB_MAX_QUEUE_SIZE = max(1, int(os.environ.get("JOB_MAX_QUEUE_SIZE", "256")))
 _JOB_RESERVED_PRIORITY = max(0, int(os.environ.get("JOB_RESERVED_PRIORITY", "1")))
 _JOB_STALE_AFTER_SECONDS = max(30, int(float(os.environ.get("JOB_STALE_AFTER_SECONDS", "120"))))
@@ -81,6 +81,7 @@ _SHADOW_SAMPLER_JOB_TIMEOUT_SECONDS = max(5, int(float(os.environ.get("SHADOW_SA
 _MODEL_JOB_TIMEOUT_SECONDS = max(10, int(float(os.environ.get("MODEL_JOB_TIMEOUT_SECONDS", "45"))))
 _MACRO_CANDLE_ANALYSIS_SECONDS = max(60, int(float(os.environ.get("MACRO_CANDLE_ANALYSIS_SECONDS", "900"))))
 _MACRO_CANDLE_JOB_TIMEOUT_SECONDS = max(10, int(float(os.environ.get("MACRO_CANDLE_JOB_TIMEOUT_SECONDS", "30"))))
+_EDGE_EVALUATE_TIMEOUT_SECONDS = max(5, int(float(os.environ.get("EDGE_EVALUATE_TIMEOUT_SECONDS", "55"))))
 job_supervisor = JobSupervisor(
     max_concurrent_jobs=_JOB_MAX_CONCURRENCY,
     max_queue_size=_JOB_MAX_QUEUE_SIZE,
@@ -103,20 +104,44 @@ _training_status: dict[str, Any] = {
 }
 
 
-def _quant_fail_closed(reason: str, *, symbol: str = "", position_side: str = "", error: str | None = None) -> dict[str, Any]:
+def _quant_fail_closed(
+    reason: str,
+    *,
+    symbol: str = "",
+    position_side: str = "",
+    side: str | None = None,
+    signal_id: str | None = None,
+    market_event_id: str | None = None,
+    feature_version: str | None = None,
+    error: str | None = None,
+) -> dict[str, Any]:
+    normalized_position_side = str(position_side or "").upper()
+    normalized_side = str(side or "").upper() or ("SELL" if normalized_position_side == "SHORT" else "BUY")
+    now_ms = int(time.time() * 1000)
     return {
         "allow": False,
         "available": False,
+        "contractVersion": "edge-v3",
         "gateRejects": [reason],
-        "score": 0.0,
+        "score": None,
         "calibratedProbability": None,
+        "calibratedScore": None,
+        "probabilityDefinition": "probability_configured_target_hit_before_stop",
         "uncertainty": 1.0,
+        "uncertaintyType": "MODEL_UNAVAILABLE",
         "authority": "quant-brain-fail-closed",
         "mode": "degraded_fail_closed",
         "symbol": symbol,
-        "positionSide": position_side,
+        "side": normalized_side if normalized_side in {"BUY", "SELL"} else "BUY",
+        "positionSide": normalized_position_side or "LONG",
+        "predictionId": str(uuid.uuid4()),
+        "signalId": str(signal_id or uuid.uuid4()),
+        "marketEventId": str(market_event_id or f"degraded:{symbol or 'UNKNOWN'}:{now_ms}"),
+        "modelVersion": "shadow-unavailable",
+        "featureVersion": str(feature_version or "sniper-v1"),
+        "dataAgeMs": None,
         "error": error or reason,
-        "predictionTimestamp": time.time(),
+        "predictionTimestamp": now_ms,
     }
 
 # ========== NOVAS ESTRUTURAS PARA EXCELÊNCIA ==========
@@ -480,7 +505,7 @@ async def _initialize_runtime_services():
         _run_signal_finalizer_once,
         interval_seconds=_SIGNAL_FINALIZER_SECONDS,
         timeout_seconds=max(10, int(float(os.environ.get("SIGNAL_FINALIZER_JOB_TIMEOUT_SECONDS", "30")))),
-        priority="low",
+        priority="normal",
     )
     log.info(
         "Signal finalizer registered (%.1fs); model maintenance registered (%.1fs)",
@@ -502,7 +527,7 @@ async def _initialize_runtime_services():
         "shadow_signal_sampler",
         lambda: sample_shadow_signals_once(engine),
         interval_seconds=sampler_interval,
-        timeout_seconds=max(30, int(float(os.environ.get("SHADOW_SAMPLER_JOB_TIMEOUT_SECONDS", "60")))),
+        timeout_seconds=_SHADOW_SAMPLER_JOB_TIMEOUT_SECONDS,
         priority="normal",
         enabled=os.environ.get("SHADOW_SAMPLER_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"},
         run_immediately=True,
@@ -1199,13 +1224,17 @@ async def evaluate_edge_endpoint(body: dict):
     if "symbol" not in body:
         raise HTTPException(400, "Required field: symbol")
     try:
-        return await asyncio.wait_for(evaluate_edge_gate(body), timeout=25)
+        return await asyncio.wait_for(evaluate_edge_gate(body), timeout=_EDGE_EVALUATE_TIMEOUT_SECONDS)
     except asyncio.TimeoutError:
         log.exception("edge evaluate timeout")
         return _quant_fail_closed(
             "QB_TIMEOUT_REJECT",
             symbol=str(body.get("symbol", "")),
             position_side=str(body.get("positionSide", body.get("side", ""))),
+            side=str(body.get("side", "")),
+            signal_id=str(body.get("signalId") or ""),
+            market_event_id=str(body.get("marketEventId") or ""),
+            feature_version=str(body.get("featureVersion") or ""),
             error="edge_evaluate_timeout",
         )
     except Exception as exc:
@@ -1214,6 +1243,10 @@ async def evaluate_edge_endpoint(body: dict):
             "QB_ERROR_REJECT",
             symbol=str(body.get("symbol", "")),
             position_side=str(body.get("positionSide", body.get("side", ""))),
+            side=str(body.get("side", "")),
+            signal_id=str(body.get("signalId") or ""),
+            market_event_id=str(body.get("marketEventId") or ""),
+            feature_version=str(body.get("featureVersion") or ""),
             error=f"{type(exc).__name__}: {exc}",
         )
 
