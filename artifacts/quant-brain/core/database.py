@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import asyncio
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -23,6 +24,7 @@ IntegrityError = (
 _SCHEMA_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _postgres_pool = None
 _postgres_pool_url: Optional[str] = None
+_postgres_pool_loop = None
 
 
 def database_url() -> Optional[str]:
@@ -60,18 +62,25 @@ def _postgres_ddl(script: str) -> str:
 
 
 async def _get_postgres_pool():
-    global _postgres_pool, _postgres_pool_url
+    global _postgres_pool, _postgres_pool_url, _postgres_pool_loop
 
     url = database_url()
     if not url:
         raise RuntimeError("PostgreSQL requested without DATABASE_URL")
     if asyncpg is None:
         raise RuntimeError("asyncpg is required when DATABASE_URL is configured")
-    if _postgres_pool is not None and _postgres_pool_url == url:
+    current_loop = asyncio.get_running_loop()
+    if _postgres_pool is not None and _postgres_pool_url == url and _postgres_pool_loop is current_loop:
         return _postgres_pool
 
     if _postgres_pool is not None:
-        await _postgres_pool.close()
+        if _postgres_pool_loop is current_loop:
+            await _postgres_pool.close()
+        else:
+            _postgres_pool.terminate()
+        _postgres_pool = None
+        _postgres_pool_url = None
+        _postgres_pool_loop = None
 
     schema = database_schema()
     bootstrap = await asyncpg.connect(url)
@@ -88,6 +97,7 @@ async def _get_postgres_pool():
         server_settings={"search_path": f'"{schema}",public'},
     )
     _postgres_pool_url = url
+    _postgres_pool_loop = current_loop
     return _postgres_pool
 
 
@@ -166,8 +176,9 @@ async def table_columns(table: str, path: Path | str) -> set[str]:
 
 
 async def close_pool():
-    global _postgres_pool, _postgres_pool_url
+    global _postgres_pool, _postgres_pool_url, _postgres_pool_loop
     if _postgres_pool is not None:
         await _postgres_pool.close()
     _postgres_pool = None
     _postgres_pool_url = None
+    _postgres_pool_loop = None
