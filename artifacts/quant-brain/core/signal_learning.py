@@ -23,6 +23,9 @@ MIN_CONTEXT_SAMPLES = 12
 STRATEGY_VERSION = "sniper-v2"
 OUTCOME_WINDOW_SECONDS = int(os.environ.get("SIGNAL_OUTCOME_WINDOW_SECONDS", "300"))
 SIGNAL_OUTCOME_MIN_AGE_SECONDS = int(os.environ.get("SIGNAL_OUTCOME_MIN_AGE_SECONDS", str(OUTCOME_WINDOW_SECONDS)))
+SIGNAL_OUTCOME_STALE_SECONDS = int(
+    os.environ.get("SIGNAL_OUTCOME_STALE_SECONDS", str(max(900, OUTCOME_WINDOW_SECONDS * 4)))
+)
 PRICE_TOLERANCE_SECONDS = 35
 
 # Cache para contexto e decisões
@@ -342,9 +345,13 @@ async def record_signal_from_gate(
             "contextKey": context_key,
             "side": side,
             "entryPrice": entry_price,
+            "targetMovesPct": target_moves,
+            "estimatedCostPct": round(estimated_cost_pct, 6),
             "decisionGroup": _decision_group(decision),
             "sourceType": source_type,
             "strategyVersion": STRATEGY_VERSION,
+            "optimalTargetUsdt": optimal_target,
+            "optimalScore": round(optimal_score, 4),
         }
     feature_timestamp = metadata.get("featureTimestamp")
     if feature_timestamp is None and metadata.get("featureTimestampMs") is not None:
@@ -390,7 +397,7 @@ async def record_signal_from_gate(
         entry_price=entry_price,
         estimated_cost_pct=estimated_cost_pct,
         target_moves=target_moves,
-        market_event_id=metadata.get("marketEventId"),
+        market_event_id=str(metadata.get("marketEventId") or "") or None,
         feature_timestamp=float(feature_timestamp) if feature_timestamp is not None else None,
         decision_timestamp=decision_timestamp,
         reference_price=float(metadata.get("referencePrice") or entry_price),
@@ -398,15 +405,15 @@ async def record_signal_from_gate(
         ask=float(getattr(alt, "ask", 0) or 0) or None,
         spread_bps=float(getattr(alt, "spread_bps", 0) or 0) or None,
         position_side=side,
-        playbook=metadata.get("playbook"),
-        regime=metadata.get("regime"),
-        setup_type=metadata.get("setup"),
+        playbook=str(metadata.get("playbook") or "") or None,
+        regime=str(metadata.get("regime") or "") or None,
+        setup_type=str(metadata.get("setup") or "") or None,
         raw_score=float(sniper.get("score", 0) or 0),
         calibrated_score=metadata.get("calibratedScore"),
-        policy_version=metadata.get("policyVersion"),
-        config_version=metadata.get("configVersion") or str(config.get("configVersion") or ""),
-        feature_version=metadata.get("featureVersion"),
-        label_version=metadata.get("labelVersion"),
+        policy_version=str(metadata.get("policyVersion") or "") or None,
+        config_version=str(metadata.get("configVersion") or config.get("configVersion") or "") or None,
+        feature_version=str(metadata.get("featureVersion") or "") or None,
+        label_version=str(metadata.get("labelVersion") or "") or None,
         expires_at=expires_at,
     )
 
@@ -485,7 +492,11 @@ async def _finalize_due_signal_outcomes_locked() -> dict[str, Any]:
     batch_size = max(1, int(os.environ.get("SIGNAL_OUTCOME_FINALIZE_BATCH_SIZE", "50")))
     pending = await kb.get_pending_signal_outcomes(min_age_seconds=SIGNAL_OUTCOME_MIN_AGE_SECONDS, limit=batch_size)
     finalized = 0
+    expired = 0
     results = []
+    now = time.time()
+    persisted_history_cache: dict[str, list[dict[str, Any]]] = {}
+    expire_signal_ids: list[str] = []
 
     for signal in pending:
         symbol = str(signal["symbol"])
@@ -501,12 +512,23 @@ async def _finalize_due_signal_outcomes_locked() -> dict[str, Any]:
             if created_at <= float(h.get("timestamp", 0)) <= window_end
         ]
         if not future:
-            persisted = await kb.get_feature_history(symbol, hours=2)
+            if symbol not in persisted_history_cache:
+                persisted_history_cache[symbol] = await kb.get_feature_history(symbol, hours=2)
+            persisted = persisted_history_cache[symbol]
             future = [
                 h for h in persisted
                 if created_at <= float(h.get("timestamp", 0)) <= window_end
             ]
         if entry <= 0 or not future:
+            stale_cutoff = created_at + OUTCOME_WINDOW_SECONDS + SIGNAL_OUTCOME_STALE_SECONDS
+            if now >= stale_cutoff:
+                expire_signal_ids.append(str(signal["signal_id"]))
+                results.append({
+                    "signal_id": signal["signal_id"],
+                    "expired": True,
+                    "reason": "no_history" if entry > 0 else "no_entry_price",
+                })
+                await asyncio.sleep(0)
             continue
 
         prices = {}
@@ -599,11 +621,18 @@ async def _finalize_due_signal_outcomes_locked() -> dict[str, Any]:
         finalized += 1
         await asyncio.sleep(0)
 
+    if expire_signal_ids:
+        expired = await kb.expire_signal_outcomes(expire_signal_ids)
+
     return {
         "pending": len(pending),
         "finalized": finalized,
+        "expired": expired,
         "results": results[:20],
-        "hit_rate_finalized": round(sum(1 for r in results if r["hit"]) / max(1, len(results)) * 100, 1),
+        "hit_rate_finalized": round(
+            sum(1 for r in results if r.get("hit")) / max(1, finalized) * 100,
+            1,
+        ),
     }
 
 
