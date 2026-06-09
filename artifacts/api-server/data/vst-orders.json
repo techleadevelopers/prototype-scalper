@@ -838,5 +838,35 @@
     "requestedAt": 1780967572335,
     "updatedAt": 1780967572797,
     "lastError": null
+  },
+  {
+    "clientOrderId": "vst-7885b19710c9b840e9458d36",
+    "campaignId": "34b5a49c-9f39-43e8-8e49-1700884f64b2",
+    "symbol": "NEAR-USDT",
+    "side": "SELL",
+    "positionSide": "SHORT",
+    "requestedQuantity": 33.783,
+    "exchangeOrderId": "2064154947604193300",
+    "filledQuantity": 33.783,
+    "closedQuantity": 0,
+    "state": "FILLED",
+    "requestedAt": 1780967863240,
+    "updatedAt": 1780967864412,
+    "lastError": null
+  },
+  {
+    "clientOrderId": "vst-55304d652da3d715b0d6b86b",
+    "campaignId": "3c4cc3a7-db29-4ac9-857d-2baa6ff55e94",
+    "symbol": "VVV-USDT",
+    "side": "SELL",
+    "positionSide": "SHORT",
+    "requestedQuantity": 4.381,
+    "exchangeOrderId": "2064154951110631400",
+    "filledQuantity": 4.381,
+    "closedQuantity": 0,
+    "state": "FILLED",
+    "requestedAt": 1780967864075,
+    "updatedAt": 1780967865249,
+    "lastError": null
   }
 ]
