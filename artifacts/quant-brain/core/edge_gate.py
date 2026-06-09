@@ -20,6 +20,7 @@ from core.signal_learning import (
     score_signal_context,
 )
 from core.shadow_model import predict_shadow
+from core.training_serving_skew import record_serving_vector
 from core.database import connect
 from layers.tactical import get_snapshot_history
 from core.judge_sniper import judge_entry, judge_high_sample_context
@@ -27,6 +28,7 @@ from core.coach_ranker import score_candidate
 from core.experiment_engine import assign_signal_to_experiments, persist_assignments, primary_assignment
 from core.regime_playbook import classify_regime_playbook
 from core.score_calibration import run_score_calibration
+from core.drift_monitor import drift_state_snapshot
 
 _score_calibration_cache: dict[str, Any] = {"expires_at": 0.0, "status": None}
 
@@ -129,6 +131,122 @@ def _risk_geometry_blocks(
         "probabilityEstimate": round(probability_estimate, 4) if probability_estimate is not None else None,
         "probabilitySource": probability_source,
         "lossPctWithCost": round(loss_pct, 6),
+    }
+
+
+def _ml_economic_gate(
+    *,
+    config: dict[str, Any],
+    shadow_ml: dict[str, Any],
+    risk_geometry: dict[str, Any],
+    current_profit_factor: Any,
+    drift_policy: dict[str, Any],
+    correlation_penalty: float,
+    regime_confidence: float,
+) -> tuple[list[str], dict[str, Any]]:
+    """
+    Promote a trained profitable shadow model from soft score input to economic gate.
+
+    This gate only has authority when the shadow model is available. Cold-start or
+    unavailable models stay neutral so live behavior is controlled by the existing
+    Judge/Coach stack until the model is trained.
+    """
+    enabled = _bool(
+        config.get("shadowMlEconomicGate"),
+        _bool(os.environ.get("SHADOW_ML_ECONOMIC_GATE"), True),
+    )
+    min_profit_factor = max(
+        0.0,
+        _num(
+            config.get("mlEconomicMinProfitFactor"),
+            _num(os.environ.get("ML_ECONOMIC_MIN_PROFIT_FACTOR"), 1.10),
+        ),
+    )
+    min_regime_confidence = max(
+        0.0,
+        _num(
+            config.get("mlEconomicMinRegimeConfidence"),
+            _num(os.environ.get("ML_ECONOMIC_MIN_REGIME_CONFIDENCE"), 0.40),
+        ),
+    )
+    excellent_buffer = max(
+        0.0,
+        _num(
+            config.get("mlExcellentProbabilityBuffer"),
+            _num(os.environ.get("ML_EXCELLENT_PROBABILITY_BUFFER"), 0.08),
+        ),
+    )
+
+    available = bool(shadow_ml.get("available")) and shadow_ml.get("calibratedProbability") is not None
+    probability = max(0.0, min(1.0, _num(shadow_ml.get("calibratedProbability"), 0.0))) if available else None
+    optimal_threshold = max(0.0, min(1.0, _num(shadow_ml.get("optimalThreshold"), 0.60)))
+    expected_value_pct = _num(shadow_ml.get("expectedValuePct"), 0.0)
+    profitability_verified = bool(shadow_ml.get("profitabilityVerified"))
+    required_probability = _num(risk_geometry.get("requiredProbability"), optimal_threshold)
+    effective_threshold = max(optimal_threshold, required_probability)
+    pf = _num(current_profit_factor, 0.0) if current_profit_factor is not None else None
+    ml_enforcement_allowed = bool(drift_policy.get("mlEnforcementAllowed", True))
+    new_entries_allowed = bool(drift_policy.get("newEntriesAllowed", True))
+
+    blocks: list[str] = []
+    sizing_multiplier = 1.0
+    risk_tier = "BASE"
+    reasons: list[str] = []
+
+    if not enabled:
+        reasons.append("ml_economic_gate_disabled")
+    elif not available:
+        reasons.append("model_unavailable_neutral")
+    else:
+        if not profitability_verified:
+            blocks.append("ML_ECONOMIC_REJECT: profitability not verified")
+        if probability is not None and probability < effective_threshold:
+            blocks.append(
+                "ML_THRESHOLD_REJECT: "
+                f"prob {probability:.3f} < threshold {effective_threshold:.3f}"
+            )
+        if expected_value_pct <= 0:
+            blocks.append(f"ML_EV_REJECT: expectedValuePct {expected_value_pct:.6f} <= 0")
+        if pf is not None and min_profit_factor > 0 and pf < min_profit_factor:
+            blocks.append(f"ML_PF_REJECT: PF {pf:.2f}x < {min_profit_factor:.2f}x")
+        if not new_entries_allowed:
+            blocks.append("ML_DRIFT_REJECT: drift policy blocks new entries")
+        elif not ml_enforcement_allowed:
+            blocks.append("ML_DRIFT_REJECT: drift policy disables ML enforcement")
+
+        if blocks:
+            sizing_multiplier = 0.0
+            risk_tier = "NO_TRADE"
+            reasons.append("ml_economic_gate_block")
+        else:
+            edge_buffer = (probability or 0.0) - effective_threshold
+            if correlation_penalty < 0.7 or regime_confidence < min_regime_confidence:
+                sizing_multiplier = 0.50
+                risk_tier = "SCOUT"
+                reasons.append("ml_edge_context_reduced")
+            elif edge_buffer >= excellent_buffer and expected_value_pct > 0:
+                sizing_multiplier = 1.25
+                risk_tier = "BOOST"
+                reasons.append("ml_edge_excellent")
+            else:
+                reasons.append("ml_edge_verified")
+
+    return blocks, {
+        "enabled": enabled,
+        "available": available,
+        "approved": len(blocks) == 0,
+        "reasons": reasons,
+        "rejects": blocks,
+        "probability": round(probability, 6) if probability is not None else None,
+        "optimalThreshold": round(optimal_threshold, 6),
+        "effectiveThreshold": round(effective_threshold, 6),
+        "expectedValuePct": round(expected_value_pct, 8),
+        "profitabilityVerified": profitability_verified,
+        "profitFactor": round(pf, 4) if pf is not None else None,
+        "minProfitFactor": round(min_profit_factor, 4),
+        "driftPolicy": drift_policy,
+        "sizingMultiplier": round(sizing_multiplier, 4),
+        "riskTier": risk_tier,
     }
 
 
@@ -642,21 +760,32 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
     ev_samples = int(effective_stats.get("samples", 0))
 
     # ── Shadow ML ────────────────────────────────────────────────────────────
-    shadow_ml = await run_edge_blocking(
-        predict_shadow,
-        {
-            "symbol": symbol,
-            "side": signal_memory["side"],
-            "context_key": signal_memory["contextKey"],
-            "target_configured_move_pct": target_moves_pct["configured"],
-            "estimated_cost_pct": cost_pct,
-            "features": {
-                "alt": sniper["altFeatures"],
-                "btc": sniper["btcFeatures"],
-                "alt_timeframes": sniper["altTimeframes"],
-            },
+    shadow_row = {
+        "symbol": symbol,
+        "side": signal_memory["side"],
+        "context_key": signal_memory["contextKey"],
+        "target_configured_move_pct": target_moves_pct["configured"],
+        "estimated_cost_pct": cost_pct,
+        "features": {
+            "alt": sniper["altFeatures"],
+            "btc": sniper["btcFeatures"],
+            "alt_timeframes": sniper["altTimeframes"],
+            "btc_timeframes": sniper.get("btcTimeframes", {}),
+            "candle_regime": sniper.get("candleRegime", {}),
         },
-    )
+    }
+    shadow_ml = await run_edge_blocking(predict_shadow, shadow_row)
+    if not intelligence_only:
+        try:
+            await record_serving_vector(
+                signal_id=memory_signal_id,
+                prediction_id=str(signal_metadata.get("predictionId") or ""),
+                row=shadow_row,
+                model_version=str(shadow_ml.get("modelVersion") or "shadow-unknown"),
+                feature_version=feature_version,
+            )
+        except Exception:
+            pass
 
     # ── Realized edge recommendation ─────────────────────────────────────────
     recommendation = await recommend_entry({
@@ -773,34 +902,35 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
         shadow_ml=shadow_ml,
         min_samples=int(signal_edge.get("minSamples", 8)),
     )
+    drift_snapshot = drift_state_snapshot()
+    drift_policy = drift_snapshot.get("policy") or {
+        "mlEnforcementAllowed": True,
+        "stackingMultiplier": 1.0,
+        "newEntriesAllowed": True,
+    }
+    ml_economic_blocks, ml_economic_gate = _ml_economic_gate(
+        config=config,
+        shadow_ml=shadow_ml,
+        risk_geometry=risk_geometry,
+        current_profit_factor=payload.get("currentProfitFactor"),
+        drift_policy=drift_policy,
+        correlation_penalty=correlation_penalty,
+        regime_confidence=regime_confidence_val,
+    )
+    if ml_economic_gate["sizingMultiplier"] != 1.0:
+        optimal_size["ml_economic_size_multiplier"] = ml_economic_gate["sizingMultiplier"]
+        optimal_size["optimal_margin_usdt"] = round(
+            max(0.0, optimal_size["optimal_margin_usdt"] * ml_economic_gate["sizingMultiplier"]),
+            2,
+        )
 
     # In non-aggressive profiles: also apply the optional user-configured thresholds
     # (WR / PF / EV minimums). In demo_learning_aggressive these are IGNORED so the
     # system gathers real data without premature filtering.
     extra_blocks: list[str] = []
     if not is_aggressive:
-        # BTC regime required (direction) — only hard-block in conservative/balanced
-        btc_regime_required = _bool(config.get("btcRegimeRequired"), False)
-        allow_counter = _bool(config.get("allowCounterRegimeScalp"), True)
-        if btc_regime_required:
-            if btc_regime == "NEUTRAL":
-                extra_blocks.append(
-                    f"REGIME_REJECT: BTC change {btc_change_pct:.2f}% < threshold +/-{btc_threshold}%"
-                )
-            elif not allow_counter:
-                want_long = position_side == "LONG"
-                btc_bull = btc_regime == "BULL"
-                if btc_bull != want_long:
-                    extra_blocks.append(
-                        f"REGIME_DIRECTION: BTC {btc_regime} but entry is {position_side}"
-                    )
-
-        # Sentiment counter — hard block only in non-aggressive modes
-        if sentiment_counter and sentiment_confidence >= 0.75 and sentiment_bias_ratio >= 0.72:
-            extra_blocks.append(
-                f"SENTIMENT_COUNTER_REJECT: 24h bias {sentiment_direction} "
-                f"({sentiment_confidence:.0%} conf) conflicts with {position_side}"
-            )
+        # BTC regime and 24h sentiment tags are telemetry only. They must not
+        # hard-block or force LONG/SHORT; candle and edge evidence own direction.
 
         # User-configured WR / PF / EV thresholds
         current_ev = payload.get("currentEv")
@@ -921,7 +1051,7 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
                 "COST_EDGE_REJECT: target does not clear execution costs + noise margin"
             )
 
-    all_blocks = judge_result["blocks"] + high_sample_blocks + risk_geometry_blocks + extra_blocks
+    all_blocks = judge_result["blocks"] + high_sample_blocks + risk_geometry_blocks + ml_economic_blocks + extra_blocks
     allow = len(all_blocks) == 0
 
     # ── LAYER 2: Coach Ranker — scoring, soft penalties, ranking ────────────
@@ -1001,6 +1131,7 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
         "contractVersion": "edge-v3",
         "probabilityDefinition": "probability_configured_target_hit_before_stop",
         "dataAgeMs": None,
+        "driftPolicy": drift_policy,
         "symbol": symbol,
         "side": side,
         "positionSide": position_side,
@@ -1037,8 +1168,10 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
             "optimalMarginKelly": optimal_size["optimal_margin_usdt"],
             "kellyFraction": optimal_size["kelly_fraction"],
             "playbookSizeMultiplier": size_multiplier,
+            "mlEconomicSizeMultiplier": optimal_size.get("ml_economic_size_multiplier", 1.0),
             "baseOptimalMarginKelly": optimal_size.get("base_optimal_margin_usdt", 0.0),
             "riskGeometry": risk_geometry,
+            "mlEconomicGate": ml_economic_gate,
         },
         "newsContext": news_context,
         "dataQuality": data_quality,
