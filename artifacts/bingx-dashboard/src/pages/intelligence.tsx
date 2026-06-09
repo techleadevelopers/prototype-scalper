@@ -475,6 +475,17 @@ export default function IntelligencePage() {
               off={query.isFetching && !data ? "Conectando" : serviceError?.includes("aborted") ? "QB timeout" : "QB offline"}
             />
             <Badge variant="outline" className="font-mono text-[10px] uppercase">{quant?.gateMode ?? "—"}</Badge>
+            {demoAnalysis?.connected && (
+              <span className="flex items-center gap-1.5 rounded-md border border-blue-500/25 bg-blue-500/8 px-2 py-0.5 ml-1">
+                <span className="text-[9px] font-bold text-blue-400 uppercase tracking-wide">VST</span>
+                <span className="h-2.5 w-px bg-border/40" />
+                <span className={`font-mono text-[10px] font-bold tabular-nums ${openDemoPnl >= 0 ? "text-green-400" : "text-red-400"}`}>
+                  {openDemoPnl >= 0 ? "+" : ""}{openDemoPnl.toFixed(3)}
+                </span>
+                <span className="h-2.5 w-px bg-border/40" />
+                <span className="font-mono text-[10px] text-muted-foreground tabular-nums">{demoAnalysis.positions?.length ?? 0} pos</span>
+              </span>
+            )}
           </div>
           <div className="flex items-center gap-2">
             <Select value={symbol} onValueChange={setSymbol}>
@@ -512,22 +523,6 @@ export default function IntelligencePage() {
 
         {/* ── Sentiment strip ── */}
         <SentimentPanel symbol={symbol} />
-
-        {/* ── Demo banner ── */}
-        {demoAnalysis?.connected && (
-          <div className="flex flex-wrap items-center gap-4 rounded-xl border border-blue-500/25 bg-blue-500/5 px-4 py-2.5 shadow shadow-black/20">
-            <span className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Operação</span>
-            <span className="font-mono text-sm font-bold text-blue-400">VST DEMO</span>
-            <span className="mx-1 h-3 w-px bg-border/40" />
-            <span className="text-[10px] text-muted-foreground">PnL aberto</span>
-            <span className={`font-mono text-sm font-bold ${openDemoPnl >= 0 ? "text-green-400" : "text-red-400"}`}>
-              {openDemoPnl >= 0 ? "+" : ""}{openDemoPnl.toFixed(4)} VST
-            </span>
-            <span className="mx-1 h-3 w-px bg-border/40" />
-            <span className="text-[10px] text-muted-foreground">Posições</span>
-            <span className="font-mono text-sm font-bold">{demoAnalysis.positions?.length ?? 0}</span>
-          </div>
-        )}
 
         {query.isPending && !data ? (
           <div className="grid gap-3 md:grid-cols-4">
