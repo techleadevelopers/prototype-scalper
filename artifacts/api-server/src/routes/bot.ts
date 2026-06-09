@@ -81,6 +81,7 @@ import {
 } from "../lib/live_readiness";
 import { loadClosedTrades } from "../lib/demoTradeStore";
 import { getPolicyStatus } from "../lib/policyManifest";
+import { armLimitOrderExpiry } from "../lib/exhaustionTriggerManager";
 
 const router = Router();
 
@@ -2668,6 +2669,11 @@ async function executeSingleOrder(
   let predictionTimestamp: number | undefined;
   let predictionId: string | undefined;
   let qbEvaluatedAt: number | undefined;
+  // Exhaustion Trigger fields — populated from QB enforce result
+  let qbExecutionType: "TRIGGER_LIMIT" | "MARKET" | undefined;
+  let qbTriggerPrice: number | null | undefined;
+  let qbTriggerExpirationSeconds = parseInt(process.env["TRIGGER_EXPIRATION_SECONDS"] ?? "45", 10);
+  let qbExhaustionType: string | undefined;
   const expiresAt = Date.now() + 30_000; // 30s — signal must be evaluated before expiry
   if (qbMode === "enforce") {
     try {
@@ -2707,6 +2713,18 @@ async function executeSingleOrder(
       qbEvaluatedAt = Date.now();
       if (!qbResult.allow) {
         gateRejects.push(...qbResult.gateRejects.map((r) => `QB_${r}`));
+      }
+      // Capture exhaustion trigger recommendation from microframe intelligence
+      if (
+        qbResult.executionType === "TRIGGER_LIMIT" &&
+        typeof qbResult.triggerPrice === "number" &&
+        qbResult.triggerPrice > 0
+      ) {
+        qbExecutionType = "TRIGGER_LIMIT";
+        qbTriggerPrice = qbResult.triggerPrice;
+        qbTriggerExpirationSeconds = qbResult.triggerExpirationSeconds ?? qbTriggerExpirationSeconds;
+        const regime = qbResult.microframeRegime as Record<string, unknown> | undefined;
+        qbExhaustionType = regime?.exhaustionType as string | undefined;
       }
     } catch (err) {
       gateRejects.push(`QB_ENFORCE_REJECT: ${err instanceof Error ? err.message : "Quant Brain unavailable"}`);
@@ -2784,9 +2802,18 @@ async function executeSingleOrder(
   }
 
   // Compute qty from mark price (use pre-fetched price hint if available via item)
+  // When using a trigger limit, triggerPrice IS the intended entry — use it directly.
+  const useTriggerLimit =
+    qbExecutionType === "TRIGGER_LIMIT" &&
+    qbTriggerPrice != null &&
+    qbTriggerPrice > 0;
+
   let expectedEntryPrice = item.expectedEntryPrice ?? 0;
   let qty = item.quantity;
-  if (!qty || expectedEntryPrice <= 0) {
+  if (useTriggerLimit && qbTriggerPrice != null && qbTriggerPrice > 0) {
+    expectedEntryPrice = qbTriggerPrice;
+    if (!qty) qty = Math.floor((orderMargin * orderLeverage) / qbTriggerPrice * 1000) / 1000;
+  } else if (!qty || expectedEntryPrice <= 0) {
     try {
       const url = `${BINGX_BASE}/openApi/swap/v2/quote/ticker?symbol=${encodeURIComponent(symbol)}&timestamp=${Date.now()}`;
       const json = (await (await fetch(url, { signal: AbortSignal.timeout(3000) })).json()) as Record<string, unknown>;
@@ -2825,14 +2852,18 @@ async function executeSingleOrder(
     recordPredictionExecutionAge(predictionTimestamp);
     const orderRequestedAt = Date.now();
     const orderSentAt = orderRequestedAt;
+    // When QB detects microframe exhaustion, place a LIMIT order at triggerPrice
+    // instead of an immediate MARKET order — catching the reversal at the exact
+    // mathematical turning point (sell exhaustion → LONG, buy exhaustion → SHORT).
     const baseOrderParams: Record<string, string | number> = {
       symbol,
       side,
       positionSide,
-      type: config.orderType,
+      type: useTriggerLimit ? "LIMIT" : config.orderType,
       quantity: qty,
       leverage: orderLeverage,
       clientOrderID: clientOrderId,
+      ...(useTriggerLimit && qbTriggerPrice != null ? { price: qbTriggerPrice } : {}),
     };
     const protection = withEntryProtection(baseOrderParams, expectedEntryPrice, positionSide, config);
     const data = await bingxPost(
@@ -2930,13 +2961,35 @@ async function executeSingleOrder(
         orderAckAt,
         positionConfirmedAt: orderAckAt,
         protectionAttachedAt: protection.protectionAttached ? orderAckAt : undefined,
-        orderType: config.orderType,
+        orderType: useTriggerLimit ? "LIMIT" : config.orderType,
         playbook,
         readinessScopeId,
         promotionState,
         stackingDepth: item.stackingDepth,
         exitPolicy: item.exitPolicy ?? protection.riskMode,
       });
+
+      // Arm expiry timer for LIMIT orders placed by Exhaustion Trigger system.
+      // If price never reaches triggerPrice within the TTL window, cancel the
+      // open order so it doesn't linger and fill at a stale price.
+      if (useTriggerLimit && qbTriggerPrice != null) {
+        armLimitOrderExpiry({
+          orderId: placedOrderId,
+          symbol,
+          direction: positionSide as "LONG" | "SHORT",
+          triggerPrice: qbTriggerPrice,
+          exhaustionType: qbExhaustionType,
+          expirationMs: qbTriggerExpirationSeconds * 1_000,
+          cancelFn: async () => {
+            await bingxPost(
+              "/openApi/swap/v2/trade/cancel",
+              { symbol, orderId: placedOrderId },
+              creds.apiKey,
+              creds.secretKey,
+            ).catch(() => {});
+          },
+        });
+      }
     }
 
     return {

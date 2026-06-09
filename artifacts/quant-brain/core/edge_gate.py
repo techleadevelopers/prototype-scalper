@@ -13,6 +13,7 @@ from core.movement_sniper import MovementFeatures, evaluate_sniper_window
 from core import knowledge_base as kb
 from core.recommendation import recommend_entry
 from core.async_utils import run_edge_blocking
+from core.candle_regime import analyze_microframe_regime
 from core.signal_learning import (
     build_context_key,
     finalize_due_signal_outcomes,
@@ -1101,6 +1102,23 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
             setup_type=(regime_playbook.get("allowedSetups") or [None])[0],
         )
 
+    # ── Microframe Intelligence — Exhaustion Trigger ──────────────────────────
+    # Análise 1m/5m/15m para detecção de exaustão de microestrutura.
+    # Roda em paralelo com best-effort timeout (3.5s) para não atrasar o gate.
+    # executionType = "TRIGGER_LIMIT" → bot coloca LIMIT ao invés de MARKET.
+    _microframe: dict[str, Any] = {
+        "executionType": "MARKET",
+        "triggerPrice": None,
+        "triggerExpirationSeconds": int(os.environ.get("TRIGGER_EXPIRATION_SECONDS", "45")),
+    }
+    try:
+        _microframe = await asyncio.wait_for(
+            analyze_microframe_regime(symbol),
+            timeout=3.5,
+        )
+    except Exception:
+        pass
+
     return {
         "allow": allow,
         "available": True,
@@ -1190,4 +1208,9 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
             "adjustedStopPct": adjusted_stop,
         },
         "mode": "expired" if signal_expired else "judge-coach-dual-layer-v1",
+        # Exhaustion Trigger fields (microframe 1m/5m/15m intelligence)
+        "executionType": _microframe.get("executionType", "MARKET"),
+        "triggerPrice": _microframe.get("triggerPrice"),
+        "triggerExpirationSeconds": _microframe.get("triggerExpirationSeconds", 45),
+        "microframeRegime": _microframe,
     }

@@ -252,6 +252,11 @@ export interface QuantBrainEdgeResult {
   sniper?: unknown;
   realizedEdge?: unknown;
   error?: string;
+  // Exhaustion Trigger — microframe intelligence fields
+  executionType?: "TRIGGER_LIMIT" | "MARKET";
+  triggerPrice?: number | null;
+  triggerExpirationSeconds?: number;
+  microframeRegime?: unknown;
 }
 
 export interface QuantBrainMlEconomicGate {
