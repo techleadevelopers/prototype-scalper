@@ -59,9 +59,8 @@ export function validateExecutionStartup(env: NodeJS.ProcessEnv = process.env): 
     if (required(env, "REAL_EXECUTION_CONFIRMATION") !== LIVE_CONFIRMATION) {
       throw new Error("Startup refused: REAL_EXECUTION_CONFIRMATION is invalid.");
     }
-    required(env, "LIVE_ACCOUNT_ID");
-    const adminToken = required(env, "ADMIN_API_TOKEN");
-    if (adminToken.length < MIN_ADMIN_TOKEN_LENGTH) {
+    const adminToken = env.ADMIN_API_TOKEN?.trim();
+    if (adminToken && adminToken.length < MIN_ADMIN_TOKEN_LENGTH) {
       throw new Error(`Startup refused: ADMIN_API_TOKEN must be at least ${MIN_ADMIN_TOKEN_LENGTH} characters in live environment.`);
     }
     if (env.LOAD_PERSISTED_CONFIG === "true") {
@@ -128,7 +127,8 @@ export function assertLiveExecutionAllowed(
   if (startup.environment !== "live" || credentials.environment !== "live") {
     throw new Error("Real-money execution refused: environment is not live.");
   }
-  if (credentials.accountId !== env.LIVE_ACCOUNT_ID?.trim()) {
+  const approvedAccountId = env.LIVE_ACCOUNT_ID?.trim();
+  if (approvedAccountId && credentials.accountId !== approvedAccountId) {
     throw new Error("Real-money execution refused: credential account identity does not match LIVE_ACCOUNT_ID.");
   }
 }
@@ -164,9 +164,27 @@ function tokenMatches(actual: string, expected: string): boolean {
 export function requireAdminAuthorization(req: Request, res: Response, next: NextFunction): void {
   const expected = process.env.ADMIN_API_TOKEN?.trim();
   const actual = req.header("x-admin-token")?.trim() ?? "";
-  if (!expected || !actual || !tokenMatches(actual, expected)) {
+  if (expected && actual && tokenMatches(actual, expected)) {
+    next();
+    return;
+  }
+
+  const credentials = req.session?.liveCredentials;
+  if (credentials?.environment === "live") {
+    try {
+      assertLiveExecutionAllowed(credentials);
+      next();
+      return;
+    } catch {
+      // Fall through to the standard 403 response.
+    }
+  }
+
+  if (expected || process.env.EXECUTION_ENV === "live") {
     res.status(403).json({ error: "Administrative authorization required." });
     return;
   }
-  next();
+
+  res.status(403).json({ error: "Verified live session required." });
+  return;
 }
