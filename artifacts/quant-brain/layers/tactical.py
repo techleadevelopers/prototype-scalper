@@ -604,6 +604,7 @@ async def _process_snapshot(snap: MarketSnapshot):
             },
             confidence=confidence,
         )
+        await asyncio.sleep(0)
 
         for cb in _alert_callbacks:
             try:
@@ -675,12 +676,9 @@ async def _detect_lead_lag(snaps: dict[str, MarketSnapshot]):
 
 
 _tactical_initialized = False
-_last_signal_finalize = 0.0
-
-
 async def process_tactical_cycle(engine: FeatureEngine) -> dict:
     """Run one bounded tactical cycle. Runtime supervisor owns scheduling."""
-    global _tactical_initialized, _last_signal_finalize
+    global _tactical_initialized
 
     if not _tactical_initialized:
         await kb.init_db()
@@ -689,17 +687,10 @@ async def process_tactical_cycle(engine: FeatureEngine) -> dict:
 
     snaps = await engine.snapshot_all()
     await _detect_lead_lag(snaps)
-    now = time.time()
-    finalized = False
-    if now - _last_signal_finalize >= 60:
-        from core.signal_learning import finalize_due_signal_outcomes
-        await finalize_due_signal_outcomes()
-        _last_signal_finalize = now
-        finalized = True
 
     return {
         "snapshots": len(snaps),
-        "finalizedSignals": finalized,
+        "finalizedSignals": False,
         "activeAlerts": len(_active_alerts),
     }
 
