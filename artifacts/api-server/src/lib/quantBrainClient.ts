@@ -40,7 +40,7 @@ const ENFORCE_EDGE_TIMEOUT_MS = Math.max(
 );
 const INTELLIGENCE_TIMEOUT_MS = Math.max(
   1_000,
-  Number(process.env["QUANT_BRAIN_INTELLIGENCE_TIMEOUT_MS"] ?? 4_000),
+  Math.min(5_000, Number(process.env["QUANT_BRAIN_INTELLIGENCE_TIMEOUT_MS"] ?? 4_000)),
 );
 const INTELLIGENCE_EDGE_CACHE_TTL_MS = Math.max(
   1_000,
@@ -48,11 +48,11 @@ const INTELLIGENCE_EDGE_CACHE_TTL_MS = Math.max(
 );
 const INTELLIGENCE_SIDECAR_TIMEOUT_MS = Math.max(
   500,
-  Number(process.env["QUANT_BRAIN_INTELLIGENCE_SIDECAR_TIMEOUT_MS"] ?? 2_000),
+  Math.min(3_000, Number(process.env["QUANT_BRAIN_INTELLIGENCE_SIDECAR_TIMEOUT_MS"] ?? 2_000)),
 );
 const INTELLIGENCE_HEALTH_TIMEOUT_MS = Math.max(
   1_000,
-  Number(process.env["QUANT_BRAIN_INTELLIGENCE_HEALTH_TIMEOUT_MS"] ?? 1_500),
+  Math.min(2_000, Number(process.env["QUANT_BRAIN_INTELLIGENCE_HEALTH_TIMEOUT_MS"] ?? 1_500)),
 );
 const INTELLIGENCE_SIDECAR_CACHE_TTL_MS = Math.max(
   5_000,
@@ -248,9 +248,44 @@ export interface QuantBrainEdgeResult {
   predictionTimestamp?: number;
   dataAgeMs?: number | null;
   driftPolicy?: QuantBrainDriftPolicy;
+  economics?: QuantBrainEconomics;
   sniper?: unknown;
   realizedEdge?: unknown;
   error?: string;
+}
+
+export interface QuantBrainMlEconomicGate {
+  enabled: boolean;
+  available: boolean;
+  approved: boolean;
+  reasons: string[];
+  rejects: string[];
+  probability: number | null;
+  optimalThreshold: number;
+  effectiveThreshold: number;
+  expectedValuePct: number;
+  profitabilityVerified: boolean;
+  profitFactor: number | null;
+  minProfitFactor: number;
+  sizingMultiplier: number;
+  riskTier: string;
+}
+
+export interface QuantBrainEconomics {
+  targetMovesPct?: Record<string, number>;
+  estimatedCostPct?: number;
+  hitProbability?: number;
+  estimatedLossUsdt?: number;
+  estimatedNetTargetUsdt?: number;
+  netEvUsdt?: number;
+  adjustedStopPct?: number;
+  optimalMarginKelly?: number;
+  kellyFraction?: number;
+  playbookSizeMultiplier?: number;
+  mlEconomicSizeMultiplier?: number;
+  baseOptimalMarginKelly?: number;
+  riskGeometry?: unknown;
+  mlEconomicGate?: QuantBrainMlEconomicGate;
 }
 
 export interface QuantBrainDriftPolicy {
@@ -327,6 +362,24 @@ const QuantBrainEdgeResponseSchema = z.object({
     stackingMultiplier: z.number().min(0).max(1),
     newEntriesAllowed: z.boolean(),
   }).optional(),
+  economics: z.object({
+    mlEconomicGate: z.object({
+      enabled: z.boolean(),
+      available: z.boolean(),
+      approved: z.boolean(),
+      reasons: z.array(z.string()),
+      rejects: z.array(z.string()),
+      probability: z.number().min(0).max(1).nullable(),
+      optimalThreshold: z.number().min(0).max(1),
+      effectiveThreshold: z.number().min(0).max(1),
+      expectedValuePct: z.number(),
+      profitabilityVerified: z.boolean(),
+      profitFactor: z.number().nullable(),
+      minProfitFactor: z.number().min(0),
+      sizingMultiplier: z.number().min(0),
+      riskTier: z.string(),
+    }).optional(),
+  }).passthrough().optional(),
   sniper: z.unknown().optional(),
   realizedEdge: z.unknown().optional(),
 }).passthrough();
