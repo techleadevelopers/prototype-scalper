@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import asyncio
 import json
 import os
 import time
@@ -27,6 +28,14 @@ PRICE_TOLERANCE_SECONDS = 35
 # Cache para contexto e decisões
 _context_performance_cache: dict[str, dict] = {}
 _cache_ttl = 300  # 5 minutos
+_finalize_lock: asyncio.Lock | None = None
+
+
+def _get_finalize_lock() -> asyncio.Lock:
+    global _finalize_lock
+    if _finalize_lock is None:
+        _finalize_lock = asyncio.Lock()
+    return _finalize_lock
 
 
 @dataclass
@@ -303,20 +312,40 @@ async def record_signal_from_gate(
 
     target_moves["configured"] = max(0.0, float(config.get("takeProfitPct", 0.15) or 0.15))
     stop_move_pct = max(0.0, float(config.get("stopLossPct", 0.10) or 0.10))
-    dedupe_seconds = max(
-        OUTCOME_WINDOW_SECONDS,
-        int(
-            config.get(
-                "signalDedupeSeconds",
-                os.environ.get("SIGNAL_DEDUPE_SECONDS", OUTCOME_WINDOW_SECONDS),
-            )
-            or OUTCOME_WINDOW_SECONDS
-        ),
-    )
-    created_bucket = int(time.time() // dedupe_seconds)
-    signal_id = str(metadata.get("signalId") or "") or _signal_id(symbol, side, str(sniper.get("decision", "")), created_bucket, context_key)
     decision = str(sniper.get("decision", "WAIT"))
     source_type = str(config.get("signalSourceType", "hypothetical")).lower()
+    raw_dedupe_seconds = int(
+        config.get(
+            "signalDedupeSeconds",
+            os.environ.get("SIGNAL_DEDUPE_SECONDS", OUTCOME_WINDOW_SECONDS),
+        )
+        or OUTCOME_WINDOW_SECONDS
+    )
+    if source_type == "shadow_sampler":
+        dedupe_seconds = max(30, raw_dedupe_seconds)
+    else:
+        dedupe_seconds = max(OUTCOME_WINDOW_SECONDS, raw_dedupe_seconds)
+    created_bucket = int(time.time() // dedupe_seconds)
+    generated_signal_id = _signal_id(
+        f"{source_type}:{symbol}",
+        side,
+        decision,
+        created_bucket,
+        context_key,
+    )
+    signal_id = str(metadata.get("signalId") or "") or generated_signal_id
+    if entry_price <= 0:
+        return {
+            "recorded": False,
+            "recordStatus": "zero_entry_price",
+            "signalId": signal_id,
+            "contextKey": context_key,
+            "side": side,
+            "entryPrice": entry_price,
+            "decisionGroup": _decision_group(decision),
+            "sourceType": source_type,
+            "strategyVersion": STRATEGY_VERSION,
+        }
     feature_timestamp = metadata.get("featureTimestamp")
     if feature_timestamp is None and metadata.get("featureTimestampMs") is not None:
         feature_timestamp = float(metadata["featureTimestampMs"]) / 1000
@@ -381,8 +410,16 @@ async def record_signal_from_gate(
         expires_at=expires_at,
     )
 
+    if recorded:
+        record_status = "recorded"
+    elif await kb.signal_outcome_exists(signal_id):
+        record_status = "deduped"
+    else:
+        record_status = "insert_failed"
+
     return {
         "recorded": recorded,
+        "recordStatus": record_status,
         "signalId": signal_id,
         "contextKey": context_key,
         "side": side,
@@ -436,8 +473,17 @@ def _calculate_sharpe_from_outcome(moves: list[float]) -> float:
 
 
 async def finalize_due_signal_outcomes() -> dict[str, Any]:
+    lock = _get_finalize_lock()
+    if lock.locked():
+        return {"pending": 0, "finalized": 0, "results": [], "skipped": "already_running"}
+    async with lock:
+        return await _finalize_due_signal_outcomes_locked()
+
+
+async def _finalize_due_signal_outcomes_locked() -> dict[str, Any]:
     """Finaliza outcomes pendentes com métricas avançadas."""
-    pending = await kb.get_pending_signal_outcomes(min_age_seconds=SIGNAL_OUTCOME_MIN_AGE_SECONDS, limit=250)
+    batch_size = max(1, int(os.environ.get("SIGNAL_OUTCOME_FINALIZE_BATCH_SIZE", "50")))
+    pending = await kb.get_pending_signal_outcomes(min_age_seconds=SIGNAL_OUTCOME_MIN_AGE_SECONDS, limit=batch_size)
     finalized = 0
     results = []
 
@@ -551,6 +597,7 @@ async def finalize_due_signal_outcomes() -> dict[str, Any]:
             "max_adverse": round(max_adverse, 2),
         })
         finalized += 1
+        await asyncio.sleep(0)
 
     return {
         "pending": len(pending),
