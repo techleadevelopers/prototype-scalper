@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { PieChart, Pie, Cell } from "recharts";
 import { useQuery } from "@tanstack/react-query";
 import {
   Activity,
@@ -161,23 +162,83 @@ function SentimentPanel({ symbol }: { symbol: string }) {
             <span className="text-[9px] font-semibold text-muted-foreground uppercase tracking-wider">VIÉS DE ENTRADA</span>
             <span className="text-[8px] text-muted-foreground/50 font-mono">proporção long vs short</span>
           </div>
-          <div className="relative h-10 w-full overflow-hidden rounded-lg border border-border/30 bg-muted/10">
-            <div className="absolute inset-y-0 left-0 flex items-center justify-end pr-2 bg-gradient-to-r from-green-600/80 to-green-500/60 text-[10px] font-bold text-white shadow-sm transition-all duration-300" style={{ width: `${longPct}%` }}>
-              {longPct >= 25 && <span>{longPct}% LONG</span>}
-            </div>
-            <div className="absolute inset-y-0 right-0 flex items-center justify-start pl-2 bg-gradient-to-l from-red-600/80 to-red-500/60 text-[10px] font-bold text-white shadow-sm transition-all duration-300" style={{ width: `${shortPct}%` }}>
-              {shortPct >= 25 && <span>{shortPct}% SHORT</span>}
-            </div>
-            {longPct < 25 && shortPct < 25 && (
-              <div className="absolute inset-0 flex items-center justify-center text-[10px] font-bold text-muted-foreground">
-                {longPct}% LONG · {shortPct}% SHORT
+
+          {/* Donut chart + barra lado a lado */}
+          <div className="flex items-center gap-3">
+            {/* Donut chart animado */}
+            <div className="relative flex-shrink-0" style={{ width: 56, height: 56 }}>
+              <PieChart width={56} height={56}>
+                <Pie
+                  data={[
+                    { name: "LONG", value: longPct },
+                    { name: "SHORT", value: shortPct },
+                  ]}
+                  cx={27}
+                  cy={27}
+                  innerRadius={18}
+                  outerRadius={26}
+                  startAngle={90}
+                  endAngle={-270}
+                  paddingAngle={longPct > 0 && shortPct > 0 ? 2 : 0}
+                  dataKey="value"
+                  isAnimationActive={true}
+                  animationBegin={0}
+                  animationDuration={900}
+                  animationEasing="ease-out"
+                  stroke="none"
+                >
+                  <Cell fill={longPct >= shortPct ? "#16a34a" : "#22c55e"} opacity={0.85} />
+                  <Cell fill={shortPct > longPct ? "#dc2626" : "#ef4444"} opacity={0.75} />
+                </Pie>
+              </PieChart>
+              {/* Porcentagem dominante no centro */}
+              <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none">
+                <span className={`text-[10px] font-bold leading-none tabular-nums ${longPct >= shortPct ? "text-green-400" : "text-red-400"}`}>
+                  {longPct >= shortPct ? longPct : shortPct}%
+                </span>
+                <span className={`text-[7px] font-semibold leading-none mt-0.5 ${longPct >= shortPct ? "text-green-500/70" : "text-red-500/70"}`}>
+                  {longPct >= shortPct ? "L" : "S"}
+                </span>
               </div>
-            )}
-          </div>
-          <div className="flex items-center justify-end mt-1.5">
-            <div className={`flex items-center gap-1 px-1.5 py-0.5 rounded ${breakoutBgColor}`}>
-              <Zap className={`h-2.5 w-2.5 ${breakoutColor}`} />
-              <span className={`text-[9px] font-mono font-bold ${breakoutColor}`}>{breakoutLabel}</span>
+            </div>
+
+            {/* Barra + breakout */}
+            <div className="flex-1 flex flex-col gap-1.5">
+              <div className="relative h-8 w-full overflow-hidden rounded-md border border-border/30 bg-muted/10">
+                <div
+                  className="absolute inset-y-0 left-0 flex items-center justify-end pr-2 bg-gradient-to-r from-green-600/80 to-green-500/60 text-[10px] font-bold text-white shadow-sm transition-all duration-500"
+                  style={{ width: `${longPct}%` }}
+                >
+                  {longPct >= 28 && <span>{longPct}% LONG</span>}
+                </div>
+                <div
+                  className="absolute inset-y-0 right-0 flex items-center justify-start pl-2 bg-gradient-to-l from-red-600/80 to-red-500/60 text-[10px] font-bold text-white shadow-sm transition-all duration-500"
+                  style={{ width: `${shortPct}%` }}
+                >
+                  {shortPct >= 28 && <span>{shortPct}% SHORT</span>}
+                </div>
+                {longPct < 28 && shortPct < 28 && (
+                  <div className="absolute inset-0 flex items-center justify-center text-[10px] font-bold text-muted-foreground">
+                    {longPct}% L · {shortPct}% S
+                  </div>
+                )}
+              </div>
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <div className="flex items-center gap-1">
+                    <div className="w-1.5 h-1.5 rounded-full bg-green-500" />
+                    <span className="text-[8px] text-muted-foreground/60">Long</span>
+                  </div>
+                  <div className="flex items-center gap-1">
+                    <div className="w-1.5 h-1.5 rounded-full bg-red-500" />
+                    <span className="text-[8px] text-muted-foreground/60">Short</span>
+                  </div>
+                </div>
+                <div className={`flex items-center gap-1 px-1.5 py-0.5 rounded ${breakoutBgColor}`}>
+                  <Zap className={`h-2.5 w-2.5 ${breakoutColor}`} />
+                  <span className={`text-[9px] font-mono font-bold ${breakoutColor}`}>{breakoutLabel}</span>
+                </div>
+              </div>
             </div>
           </div>
         </div>
