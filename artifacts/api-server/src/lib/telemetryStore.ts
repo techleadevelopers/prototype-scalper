@@ -31,6 +31,14 @@ import readline from "readline";
 import { AdaptiveEngine, type TradeOutcome, type BtcRegime, type PositionSide, type ExitReason, TradeOutcomeSchema } from "./adaptiveEngine";
 import { logger, logMetric, logAlert } from "./logger";
 import { recordKillSwitchOutcome } from "./killSwitch";
+import {
+  getSqliteOutcomeById,
+  initSqliteOutcomeStore,
+  loadSqliteOutcomes,
+  rewriteSqliteOutcomes,
+  sqliteOutcomeStoreEnabled,
+  upsertSqliteOutcome,
+} from "./sqliteOutcomeStore";
 
 const pipelineAsync = promisify(pipeline);
 
@@ -55,6 +63,7 @@ let totalRecords = 0;
 let lastBackupSize = 0;
 let rewriteInFlight = false;
 const recordedOutcomeIds = new Set<string>();
+const recordedOutcomeById = new Map<string, TradeOutcome>();
 
 // ========== WRITE LOCK ==========
 // Serializes all updateTradeOutcome calls — prevents race conditions during
@@ -371,10 +380,19 @@ function rewriteTelemetryFile(outcomes: TradeOutcome[]): void {
     fs.writeFileSync(TELEMETRY_FILE, content ? `${content}\n` : "", "utf-8");
     totalRecords = outcomes.length;
     recordedOutcomeIds.clear();
-    for (const outcome of outcomes) recordedOutcomeIds.add(outcome.id);
+    recordedOutcomeById.clear();
+    for (const outcome of outcomes) {
+      recordedOutcomeIds.add(outcome.id);
+      recordedOutcomeById.set(outcome.id, outcome);
+    }
+    if (sqliteOutcomeStoreEnabled()) rewriteSqliteOutcomes(outcomes);
   } finally {
     rewriteInFlight = false;
   }
+}
+
+function loadFromActiveStore(): TradeOutcome[] {
+  return sqliteOutcomeStoreEnabled() ? loadSqliteOutcomes() : loadFromDisk();
 }
 
 // ========== HEALTH MONITORING ==========
@@ -419,17 +437,35 @@ export function initTelemetryStore(): AdaptiveEngine {
 
   logger.info({ telemetryFile: TELEMETRY_FILE, maxSizeMB: TELEMETRY_MAX_SIZE_MB }, "Initializing telemetry store");
 
-  const historical = loadFromDisk();
+  const sqliteEnabled = initSqliteOutcomeStore();
+  let historical = sqliteEnabled ? loadSqliteOutcomes() : loadFromDisk();
+  if (sqliteEnabled && historical.length === 0 && fs.existsSync(TELEMETRY_FILE)) {
+    const jsonlHistorical = loadFromDisk();
+    if (jsonlHistorical.length > 0) {
+      rewriteSqliteOutcomes(jsonlHistorical);
+      historical = jsonlHistorical;
+      logger.info(
+        { migratedTrades: historical.length, source: TELEMETRY_FILE },
+        "Migrated JSONL telemetry outcomes into SQLite store",
+      );
+    }
+  }
   totalRecords = historical.length;
   recordedOutcomeIds.clear();
-  for (const outcome of historical) recordedOutcomeIds.add(outcome.id);
+  recordedOutcomeById.clear();
+  for (const outcome of historical) {
+    recordedOutcomeIds.add(outcome.id);
+    recordedOutcomeById.set(outcome.id, outcome);
+  }
 
   logger.info({ historicalTrades: totalRecords }, "Loaded historical trades");
 
   engine = new AdaptiveEngine(historical);
 
-  // Open file stream for appending
-  fileStream = fs.createWriteStream(TELEMETRY_FILE, { flags: "a", encoding: "utf-8" });
+  // Open file stream for appending when JSONL is the active store.
+  if (!sqliteEnabled) {
+    fileStream = fs.createWriteStream(TELEMETRY_FILE, { flags: "a", encoding: "utf-8" });
+  }
 
   // Start flush interval
   flushInterval = setInterval(() => {
@@ -499,9 +535,9 @@ export function recordTradeOutcome(raw: Omit<TradeOutcome, "id"> & { id?: string
     hourUtc: raw.hourUtc ?? new Date(raw.entryTime).getUTCHours(),
   };
   if (recordedOutcomeIds.has(outcome.id)) {
-    const existing = loadFromDisk().find((entry) => entry.id === outcome.id);
+    const existing = recordedOutcomeById.get(outcome.id) ?? getSqliteOutcomeById(outcome.id) ?? undefined;
     if (existing) return existing;
-    logger.warn({ id: outcome.id }, "telemetry outcome id was indexed but not found on disk; recording replacement");
+    logger.warn({ id: outcome.id }, "telemetry outcome id was indexed but not found in memory; recording replacement");
   }
 
   // Validate before recording
@@ -511,8 +547,14 @@ export function recordTradeOutcome(raw: Omit<TradeOutcome, "id"> & { id?: string
     throw new Error(`Invalid trade outcome: ${validation.error.issues.map((issue) => issue.message).join(", ")}`);
   }
 
-  appendToDiskAsync(outcome);
+  if (sqliteOutcomeStoreEnabled()) {
+    upsertSqliteOutcome(outcome);
+    totalRecords++;
+  } else {
+    appendToDiskAsync(outcome);
+  }
   recordedOutcomeIds.add(outcome.id);
+  recordedOutcomeById.set(outcome.id, outcome);
   getEngine().recordOutcome(outcome);
   recordKillSwitchOutcome(outcome);
   emitSseTrade(outcome);
@@ -544,7 +586,7 @@ export async function updateTradeOutcome(
   try {
     await flushWriteBuffer();
 
-    const outcomes = loadFromDisk();
+    const outcomes = loadFromActiveStore();
     const index = outcomes.findIndex((outcome) => outcome.id === id);
     if (index < 0) return null;
 
@@ -563,6 +605,8 @@ export async function updateTradeOutcome(
     outcomes[index] = validation.data;
     rewriteTelemetryFile(outcomes);
     getEngine().replaceOutcome(validation.data);
+    recordedOutcomeById.set(id, validation.data);
+    if (sqliteOutcomeStoreEnabled()) upsertSqliteOutcome(validation.data);
 
     logMetric({
       name: "trade.updated",
