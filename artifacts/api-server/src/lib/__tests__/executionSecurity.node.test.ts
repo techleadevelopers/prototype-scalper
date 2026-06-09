@@ -22,7 +22,7 @@ test("demo credentials can only resolve the VST endpoint", () => {
   assert.throws(() => endpointForCredentials(demoCredentials, "live"), /cannot route to live/);
 });
 
-test("real execution requires explicit live configuration and matching account identity", () => {
+test("real execution requires explicit live configuration and optionally enforces account identity", () => {
   const liveCredentials = createExecutionCredentials({
     environment: "live",
     accountId: "approved-live-account",
@@ -34,12 +34,15 @@ test("real execution requires explicit live configuration and matching account i
     EXECUTION_ENV: "live",
     REAL_EXECUTION_ENABLED: "true",
     REAL_EXECUTION_CONFIRMATION: "I_ACKNOWLEDGE_REAL_MONEY",
-    LIVE_ACCOUNT_ID: "approved-live-account",
-    ADMIN_API_TOKEN: "admin-token-with-at-least-32-characters",
   };
   assert.doesNotThrow(() => assertLiveExecutionAllowed(liveCredentials, env));
+  const accountLockedEnv = {
+    ...env,
+    LIVE_ACCOUNT_ID: "approved-live-account",
+  };
+  assert.doesNotThrow(() => assertLiveExecutionAllowed(liveCredentials, accountLockedEnv));
   assert.throws(
-    () => assertLiveExecutionAllowed({ ...liveCredentials, accountId: "other-account" }, env),
+    () => assertLiveExecutionAllowed({ ...liveCredentials, accountId: "other-account" }, accountLockedEnv),
     /does not match LIVE_ACCOUNT_ID/,
   );
 });
@@ -58,7 +61,6 @@ test("startup refuses environment and credential disagreement", () => {
       EXECUTION_ENV: "live",
       REAL_EXECUTION_ENABLED: "true",
       REAL_EXECUTION_CONFIRMATION: "I_ACKNOWLEDGE_REAL_MONEY",
-      LIVE_ACCOUNT_ID: "approved-live-account",
       ADMIN_API_TOKEN: "short",
     }),
     /ADMIN_API_TOKEN must be at least 32 characters/,
