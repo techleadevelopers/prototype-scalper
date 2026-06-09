@@ -48,7 +48,11 @@ const INTELLIGENCE_EDGE_CACHE_TTL_MS = Math.max(
 );
 const INTELLIGENCE_SIDECAR_TIMEOUT_MS = Math.max(
   500,
-  Number(process.env["QUANT_BRAIN_INTELLIGENCE_SIDECAR_TIMEOUT_MS"] ?? 900),
+  Number(process.env["QUANT_BRAIN_INTELLIGENCE_SIDECAR_TIMEOUT_MS"] ?? 2_000),
+);
+const INTELLIGENCE_HEALTH_TIMEOUT_MS = Math.max(
+  1_000,
+  Number(process.env["QUANT_BRAIN_INTELLIGENCE_HEALTH_TIMEOUT_MS"] ?? 1_500),
 );
 const INTELLIGENCE_SIDECAR_CACHE_TTL_MS = Math.max(
   5_000,
@@ -1042,10 +1046,10 @@ export async function getQuantBrainIntelligence(
   
   const [edge, health, model, signalEdge, newsContext] = await Promise.all([
     getCachedIntelligenceEdge(input),
-    getCachedJson<unknown>("health/live", "/health/live", 600),
+    getCachedJson<unknown>("health/live", "/health/live", INTELLIGENCE_HEALTH_TIMEOUT_MS),
     getCachedJson<unknown>("models/sniper/status", "/models/sniper/status", INTELLIGENCE_SIDECAR_TIMEOUT_MS),
     getCachedJson<unknown>(`signals/edge/${symbol}:${side}`, `/signals/edge/${symbol}?side=${side}`, INTELLIGENCE_SIDECAR_TIMEOUT_MS),
-    getCachedJson<unknown>(`news/context/${symbol}`, `/news/context/${symbol}`, 600),
+    getCachedJson<unknown>(`news/context/${symbol}`, `/news/context/${symbol}`, INTELLIGENCE_HEALTH_TIMEOUT_MS),
   ]);
 
   const errors: Record<string, string> = {};
