@@ -1036,12 +1036,15 @@ export default function AnalysisPage() {
                 {/* Hour profile from adaptive engine */}
                 {telemetry.hourProfile.length > 0 && (
                   <Card className="border-border/50 bg-card/30">
-                    <CardHeader className="px-4 pt-4 pb-2">
-                      <CardTitle className="text-[10px] font-medium text-muted-foreground uppercase tracking-wider flex items-center gap-1.5">
-                        <Clock className="w-3 h-3" /> Adaptive Hour Profile (UTC) — EWMA-weighted across all sessions
-                      </CardTitle>
+                    <CardHeader className="px-3 pt-3 pb-1.5">
+                      <div className="flex items-center justify-between">
+                        <CardTitle className="text-[10px] font-medium text-muted-foreground uppercase tracking-wider flex items-center gap-1.5">
+                          <Clock className="w-3 h-3" /> Performance por Hora (UTC)
+                        </CardTitle>
+                        <span className="text-[9px] text-muted-foreground/50 font-mono">passe o mouse para detalhes</span>
+                      </div>
                     </CardHeader>
-                    <CardContent className="px-4 pb-4">
+                    <CardContent className="px-3 pb-3">
                       <div className="grid grid-cols-12 gap-1">
                         {Array.from({ length: 24 }, (_, h) => {
                           const hp = telemetry.hourProfile.find((x) => x.hour === h);
@@ -1051,8 +1054,8 @@ export default function AnalysisPage() {
                           const maxAbs = Math.max(...telemetry.hourProfile.map((x) => Math.abs(x.pnl)), 0.001);
                           const heightPct = samples > 0 ? Math.min(100, Math.abs(pnl) / maxAbs * 100) : 5;
                           return (
-                            <div key={h} className="flex flex-col items-center gap-1" title={`${String(h).padStart(2, "0")}:00 UTC | PnL: ${pnl >= 0 ? "+" : ""}${pnl.toFixed(3)} | WR: ${(wr * 100).toFixed(0)}% | ${samples} trades`}>
-                              <div className="w-full flex flex-col-reverse" style={{ height: 40 }}>
+                            <div key={h} className="flex flex-col items-center gap-0.5" title={`${String(h).padStart(2, "0")}:00 UTC · PnL: ${pnl >= 0 ? "+" : ""}${pnl.toFixed(3)} USDT · Taxa acerto: ${(wr * 100).toFixed(0)}% · ${samples} op.`}>
+                              <div className="w-full flex flex-col-reverse" style={{ height: 36 }}>
                                 {samples > 0 && (
                                   <div
                                     className={`w-full rounded-sm transition-all ${pnl >= 0 ? "bg-green-500/50" : "bg-red-500/50"}`}
@@ -1060,14 +1063,16 @@ export default function AnalysisPage() {
                                   />
                                 )}
                               </div>
-                              <span className="text-[8px] font-mono text-muted-foreground">{String(h).padStart(2, "0")}</span>
+                              <span className="text-[8px] font-mono text-muted-foreground/60">{String(h).padStart(2, "0")}</span>
                             </div>
                           );
                         })}
                       </div>
-                      <p className="text-[9px] text-muted-foreground mt-2">
-                        Green = positive PnL hours · Red = negative · Height = relative magnitude · Hover for details
-                      </p>
+                      <div className="flex items-center gap-3 mt-1.5">
+                        <span className="flex items-center gap-1 text-[9px] text-muted-foreground/60"><span className="w-2 h-2 rounded-sm bg-green-500/50 inline-block" />lucro</span>
+                        <span className="flex items-center gap-1 text-[9px] text-muted-foreground/60"><span className="w-2 h-2 rounded-sm bg-red-500/50 inline-block" />perda</span>
+                        <span className="text-[9px] text-muted-foreground/40 ml-auto">altura = magnitude relativa</span>
+                      </div>
                     </CardContent>
                   </Card>
                 )}
@@ -1076,20 +1081,23 @@ export default function AnalysisPage() {
 
             {/* Rolling trade stream */}
             <Card className="border-border/50 bg-card/30">
-              <CardHeader className="px-4 pt-4 pb-3">
-                <CardTitle className="text-sm font-semibold flex items-center gap-2">
-                  <ChevronRight className="w-4 h-4 text-primary" /> Trade Stream — Last {Math.min(window, stats.windowed.length)} Closed
-                </CardTitle>
-                <p className="text-[10px] text-muted-foreground">Sequence of realized outcomes — spot edge drift early</p>
+              <CardHeader className="px-4 pt-3 pb-2">
+                <div className="flex items-center justify-between">
+                  <CardTitle className="text-[11px] font-semibold flex items-center gap-1.5 text-foreground/80">
+                    <ChevronRight className="w-3.5 h-3.5 text-primary" /> Últimas {Math.min(window, stats.windowed.length)} Operações Fechadas
+                  </CardTitle>
+                  <span className="text-[9px] text-muted-foreground/50 font-mono uppercase tracking-wide">fonte: {analysisSource}</span>
+                </div>
+                <p className="text-[9px] text-muted-foreground/60 mt-0.5">Sequência de resultados realizados — W = ganho · L = perda</p>
               </CardHeader>
-              <CardContent className="px-4 pb-4">
+              <CardContent className="px-4 pb-3">
                 <div className="flex flex-wrap gap-1.5">
                   {stats.windowed.map((o, i) => {
                     const p = parseFloat(o.profit!);
                     return (
                       <div
                         key={i}
-                        title={`${o.symbol} ${o.positionSide} | ${p >= 0 ? "+" : ""}${p.toFixed(4)} USDT`}
+                        title={`${o.symbol} ${o.positionSide} · ${p >= 0 ? "+" : ""}${p.toFixed(4)} USDT`}
                         className={`w-5 h-5 rounded-sm flex items-center justify-center text-[8px] font-bold transition-opacity hover:opacity-80 cursor-default ${p > 0 ? "bg-green-500/30 text-green-400" : "bg-red-500/30 text-red-400"}`}
                       >
                         {p > 0 ? "W" : "L"}
@@ -1097,12 +1105,11 @@ export default function AnalysisPage() {
                     );
                   })}
                 </div>
-                <div className="flex gap-6 mt-3 pt-3 border-t border-border/20 text-xs text-muted-foreground">
-                  <span>Long fills: <span className="text-foreground font-mono">{stats.longs.length}</span></span>
-                  <span>Short fills: <span className="text-foreground font-mono">{stats.shorts.length}</span></span>
-                  <span>Fonte: <span className="text-primary font-mono">{analysisSource}</span></span>
+                <div className="flex gap-5 mt-2.5 pt-2.5 border-t border-border/20 text-[10px] text-muted-foreground">
+                  <span>Longs: <span className="text-foreground font-mono">{stats.longs.length}</span></span>
+                  <span>Shorts: <span className="text-foreground font-mono">{stats.shorts.length}</span></span>
                   <span className="ml-auto">
-                    Net after fees: <span className={`font-mono font-bold ${stats.netPnl >= 0 ? "text-green-400" : "text-red-400"}`}>{stats.netPnl >= 0 ? "+" : ""}{stats.netPnl.toFixed(4)}</span>
+                    Resultado líquido: <span className={`font-mono font-bold ${stats.netPnl >= 0 ? "text-green-400" : "text-red-400"}`}>{stats.netPnl >= 0 ? "+" : ""}{stats.netPnl.toFixed(4)} USDT</span>
                   </span>
                 </div>
               </CardContent>
