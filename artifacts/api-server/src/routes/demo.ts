@@ -10,9 +10,11 @@ import { buildTelemetryState } from "./telemetry";
 import { computeCandleEdge, computeAllCandleEdges } from "../lib/candleEdge";
 import {
   getTriggerConfig,
+  setTriggerConfig,
   updateCurrentPrice,
   checkAndFireTriggers,
   isTriggerEnabled,
+  snapshotReferencePrice,
   type TriggerSignal,
 } from "../lib/triggerStrategy";
 import type { ClusterKey } from "../lib/adaptiveEngine";
@@ -1873,30 +1875,150 @@ async function executeTriggerSignal(
   signal: TriggerSignal,
   creds: { apiKey: string; secretKey: string },
 ): Promise<void> {
-  const botConfig = getBotConfig();
   const { symbol, direction, referencePrice, entryPrice: currentPrice, tpPct, slPct, triggerDropRisePct } = signal;
-
   const side: "BUY" | "SELL" = direction === "LONG" ? "BUY" : "SELL";
   const positionSide = direction;
+  const hourUtc = new Date().getUTCHours();
 
   if (!currentPrice || currentPrice <= 0) return;
 
-  const qty = Math.floor(((botConfig.marginPerTrade * botConfig.leverage) / currentPrice) * 1000) / 1000;
-  if (!qty || qty <= 0) return;
+  // ── Gate 1: service state ─────────────────────────────────────────────────
+  const svcState = getServiceState();
+  if (svcState.state === "PAUSED") {
+    console.info(`[trigger] skipping ${direction} ${symbol} — service PAUSED`);
+    return;
+  }
 
-  // Build TP/SL using custom tpPct/slPct from trigger strategy
-  const customConfig = { ...botConfig, takeProfitPct: tpPct, stopLossPct: slPct };
-  const protection = buildAttachedProtection(currentPrice, positionSide, customConfig);
+  const botConfig = getBotConfig();
+  const engine = getEngine();
 
+  // ── Gate 2: global position cap ───────────────────────────────────────────
+  const openTrades = getOpenTrades();
+  const globalOpen = openTrades.length;
+  if (globalOpen >= DEMO_SNIPER_GLOBAL_MAX) {
+    console.info(`[trigger] skipping ${direction} ${symbol} — global cap reached (${globalOpen})`);
+    return;
+  }
+
+  // ── Gate 3: hedging guard ─────────────────────────────────────────────────
+  if (botConfig.preventHedgedPositions) {
+    const oppSide = direction === "LONG" ? "SHORT" : "LONG";
+    const hasOpp = openTrades.some(
+      (t) => t.symbol === symbol && t.positionSide === oppSide,
+    );
+    if (hasOpp) {
+      console.info(`[trigger] skipping ${direction} ${symbol} — opposite position open`);
+      return;
+    }
+  }
+
+  // ── Gate 4: toxic symbol check ────────────────────────────────────────────
+  const symProfile = engine.symbolProfile(symbol);
+  if (symProfile?.isToxic) {
+    console.info(`[trigger] skipping ${direction} ${symbol} — symbol is toxic`);
+    return;
+  }
+
+  // ── Compute edge score from deviation magnitude + candle confirmation ─────
+  // Deviation beyond the threshold is the primary signal. Bigger deviation = higher conviction.
+  // Map: deviation at threshold = 0.65, deviation at 2× threshold = 0.85, 3× = 0.95
+  const threshold = direction === "LONG" ? getTriggerConfig().longDropPct : getTriggerConfig().shortRisePct;
+  const deviationRatio = threshold > 0 ? Math.min(triggerDropRisePct / threshold, 3.0) : 1.0;
+  const deviationScore = 0.60 + (deviationRatio - 1.0) * 0.175; // 0.60 at 1×, 0.775 at 2×, 0.95 at 3×
+  const clampedDeviationScore = Math.min(0.95, Math.max(0.60, deviationScore));
+
+  // Blend with candle edge if available (non-blocking — fallback gracefully)
+  let candleScore = clampedDeviationScore;
+  try {
+    const edge = await computeCandleEdge(symbol, "5m");
+    const rawCandleScore = direction === "LONG" ? edge.longScore : edge.shortScore;
+    // Weight: 60% deviation conviction, 40% candle confirmation
+    candleScore = Math.min(0.98, clampedDeviationScore * 0.60 + rawCandleScore * 0.40);
+  } catch { /* use deviation score alone */ }
+
+  const clusterKey: ClusterKey = { symbol, positionSide, hourUtc, btcRegime: "NEUTRAL" };
+  const clusterProfile = engine.clusterProfile(clusterKey);
+  const ev = clusterProfile?.ev ?? symProfile?.ev ?? 0;
+  const combinedScore = engine.combinedEdgeScore(clusterKey, ev, candleScore);
+
+  // Minimum combined score gate (must clear 0.60 tier to be worth firing)
+  if (combinedScore < 0.60) {
+    console.info(`[trigger] skipping ${direction} ${symbol} — combined score too low (${combinedScore.toFixed(3)})`);
+    return;
+  }
+
+  // ── Gate 5: QuantBrain advisory ───────────────────────────────────────────
   const entryNow = Date.now();
   const activeCampaignId = getActiveCampaignId(symbol, positionSide, entryNow);
   const campaignId = activeCampaignId ?? randomUUID();
+  const openCampaignEntries = activeCampaignId
+    ? getOpenTradesBySymbolSide(symbol, positionSide).filter((e) => e.campaignId === activeCampaignId)
+    : [];
+  const campaignSignalId = openCampaignEntries[0]?.signalId ?? `trigger-campaign:${campaignId}`;
+
+  const quantEdge = await evaluateQuantBrainEdge({
+    symbol,
+    side,
+    positionSide,
+    hourUtc,
+    btcChangePct: 0,
+    currentEv: ev,
+    currentWinRate: clusterProfile?.winRate ?? symProfile?.winRate ?? 0,
+    currentProfitFactor: clusterProfile?.profitFactor ?? symProfile?.profitFactor ?? 0,
+    config: botConfig,
+    signalId: campaignSignalId,
+    marketEventId: undefined,
+    featureVersion: "trigger-deviation-v1",
+    observationSourceType: "vst_campaign",
+  });
+
+  if (quantEdge.driftPolicy?.newEntriesAllowed === false) {
+    console.info(`[trigger] skipping ${direction} ${symbol} — QB drift policy blocks new entries`);
+    return;
+  }
+
+  const calibratedProbability = quantEdge.calibratedProbability ?? null;
+  const uncertaintyType = quantEdge.uncertaintyType ?? (quantEdge.error ? "MODEL_UNAVAILABLE" : null);
+
+  // ── Gate 6: stacking policy ───────────────────────────────────────────────
+  const campaignMargin = openCampaignEntries.reduce((s, e) => s + e.marginUsed, 0);
+  const campaignAdverseExcursion = Math.abs(openCampaignEntries.reduce((s, e) => s + Math.min(0, e.mae), 0));
+  const campaignDrawdownPct = campaignMargin > 0 ? (campaignAdverseExcursion / campaignMargin) * 100 : 0;
+  const stateFingerprint = `trigger:${symbol}:${positionSide}:${Math.round(triggerDropRisePct * 100)}`;
+
+  const stackingGate = evaluateStackingInsertion({
+    openEntries: openCampaignEntries,
+    proposedSide: positionSide,
+    edgeScore: combinedScore,
+    calibratedProbability,
+    uncertaintyType,
+    marketEventId: null,
+    stateFingerprint,
+    now: entryNow,
+    cooldownMs: DEMO_STACKING_COOLDOWN_MS,
+    campaignCap: campaignControlCap(campaignId),
+    proposedMargin: botConfig.marginPerTrade,
+    campaignDrawdownPct,
+    maxCampaignDrawdownPct: DEMO_STACKING_MAX_CAMPAIGN_DRAWDOWN_PCT,
+    portfolioCapacityAvailable: globalOpen < DEMO_SNIPER_GLOBAL_MAX,
+  });
+
+  if (!stackingGate.allow) {
+    console.info(`[trigger] stacking rejected ${direction} ${symbol} — ${JSON.stringify(stackingGate.rejects)}`);
+    return;
+  }
+
+  // ── Execute order ─────────────────────────────────────────────────────────
+  const qty = Math.floor(((botConfig.marginPerTrade * botConfig.leverage) / currentPrice) * 1000) / 1000;
+  if (!qty || qty <= 0) return;
+
+  const customConfig = { ...botConfig, takeProfitPct: tpPct, stopLossPct: slPct };
+  const protection = buildAttachedProtection(currentPrice, positionSide, customConfig);
+
   const clientOrderId = createClientOrderId(
     `trigger:${symbol}:${positionSide}`,
     `${Math.round(triggerDropRisePct * 100)}:${entryNow}`,
   );
-  const btcRegime: BtcRegime = "NEUTRAL";
-  const hourUtc = new Date().getUTCHours();
 
   const order = await placeVstOrderIdempotently({
     creds,
@@ -1920,6 +2042,7 @@ async function executeTriggerSignal(
 
   const orderId = String(order.orderId);
   const entryPrice = parseFloat(String(order.avgPrice ?? "")) || currentPrice;
+  const btcRegime: BtcRegime = "NEUTRAL";
 
   sniperOpenTrades.set(orderId, {
     orderId,
@@ -1939,7 +2062,7 @@ async function executeTriggerSignal(
 
   await persistOpenTrade({
     campaignId,
-    signalId: `trigger:${campaignId}`,
+    signalId: campaignSignalId,
     orderId,
     clientOrderId,
     symbol,
@@ -1956,19 +2079,19 @@ async function executeTriggerSignal(
     slPct,
     btcRegime,
     hourUtc,
-    edgeScore: 0.85,
-    stackingDepth: 1,
-    controlMaxEntries: 1,
-    edgeAtInsertion: 0.85,
-    calibratedProbability: null,
-    uncertaintyType: null,
+    edgeScore: combinedScore,
+    stackingDepth: stackingGate.depth,
+    controlMaxEntries: campaignControlCap(campaignId),
+    edgeAtInsertion: combinedScore,
+    calibratedProbability,
+    uncertaintyType,
     marketEventId: null,
-    predictionId: null,
-    featureVersion: "trigger-v1",
-    stateFingerprint: `trigger:${symbol}:${positionSide}:${Math.round(triggerDropRisePct * 100)}`,
+    predictionId: quantEdge.predictionId ?? null,
+    featureVersion: quantEdge.featureVersion ?? "trigger-deviation-v1",
+    stateFingerprint,
     correlationAdjustedExposure: entryPrice * qty,
-    modelVersion: "trigger-v1",
-    fallbackMode: false,
+    modelVersion: quantEdge.modelVersion ?? "trigger-v1",
+    fallbackMode: !quantEdge.available,
     mfe: 0,
     mae: 0,
     mfeAt: null,
@@ -1981,8 +2104,8 @@ async function executeTriggerSignal(
   console.info(
     `[trigger] FIRED ${direction} ${symbol}` +
     ` @ ${currentPrice.toFixed(4)} ref=${referencePrice.toFixed(4)}` +
-    ` dev=${triggerDropRisePct.toFixed(2)}% tp=${tpPct.toFixed(2)}% sl=${slPct.toFixed(2)}%` +
-    ` qty=${qty} orderId=${orderId}`,
+    ` dev=${triggerDropRisePct.toFixed(2)}% score=${combinedScore.toFixed(3)}` +
+    ` tp=${tpPct.toFixed(2)}% sl=${slPct.toFixed(2)}% qty=${qty} orderId=${orderId}`,
   );
 }
 
@@ -2751,6 +2874,8 @@ function stopDemoSniper(reason: string): void {
   demoSniper.running = false;
   demoSniper.creds = null;
   demoSniper.stopReason = reason;
+  // Auto-disable trigger when demo stops
+  setTriggerConfig({ enabled: false });
 }
 
 function getSniperStatus() {
@@ -2802,7 +2927,32 @@ router.post("/demo/sniper/start", (req: Request, res: Response) => {
   demoSniper.placeHandle = setInterval(() => { runDemoSniperCycleLocked().catch(() => {}); }, DEMO_SNIPER_CYCLE_MS);
   demoSniper.monitorHandle = setInterval(() => { runDemoSniperMonitorLocked().catch(() => {}); }, DEMO_SNIPER_MONITOR_MS);
 
-  // Start trigger cycle (runs independently; fires only when trigger is enabled)
+  // ── Auto-activate trigger engine using SCALP_SYMBOLS as targets ───────────
+  // The trigger fires when price deviates significantly from reference, feeding
+  // signals through the full pipeline (QB, stacking, gates) — no manual enable needed.
+  {
+    const sniperConfig = getBotConfig();
+    setTriggerConfig({
+      enabled: true,
+      symbols: [],                      // empty → runtime fallback to allowedSymbols
+      autoResetAfterFireMs: 10 * 60 * 1000, // auto-reset reference 10 min after fire
+    });
+    // Snapshot reference prices fire-and-forget (non-blocking)
+    void (async () => {
+      for (const sym of sniperConfig.allowedSymbols) {
+        try {
+          const price = await fetchDemoLastPrice(sym);
+          if (price && price > 0) snapshotReferencePrice(sym, price);
+        } catch { /* skip — trigger cycle will retry on next iteration */ }
+      }
+      req.log.info(
+        { symbols: sniperConfig.allowedSymbols },
+        "[demo-sniper] trigger engine auto-activated with SCALP_SYMBOLS",
+      );
+    })();
+  }
+
+  // Start trigger cycle (runs independently; feeds signals into full pipeline)
   if (!triggerCycleHandle) {
     triggerCycleHandle = setInterval(() => {
       if (!triggerCycleFiring) {
