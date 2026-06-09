@@ -122,12 +122,12 @@ class TestResponseSchema:
 
     def test_prediction_timestamp_is_recent(self):
         from core.edge_gate import evaluate_edge_gate
-        before = time.time()
+        before = int(time.time() * 1000)
         result = _run(evaluate_edge_gate(_make_minimal_payload()))
-        after = time.time()
+        after = int(time.time() * 1000)
         ts = result.get("predictionTimestamp", 0)
         assert ts >= before, f"predictionTimestamp {ts} < request start {before}"
-        assert ts <= after + 1, f"predictionTimestamp {ts} > request end {after}"
+        assert ts <= after + 1000, f"predictionTimestamp {ts} > request end {after}"
 
 
 # ── Side consistency tests ──────────────────────────────────────────────────────
@@ -211,6 +211,32 @@ class TestSignalExpiry:
 
 
 # ── Contract provenance fields ──────────────────────────────────────────────────
+
+class TestRiskGeometry:
+    def test_inverted_tp_sl_is_rejected(self):
+        from core.edge_gate import evaluate_edge_gate
+        result = _run(evaluate_edge_gate(_make_minimal_payload(
+            config={
+                "takeProfitPct": 0.22,
+                "stopLossPct": 1.55,
+                "takerFeeBps": 5,
+                "slippageBpsPerSide": 2,
+                "minRewardRiskRatio": 0.75,
+            }
+        )))
+        rejects = result["gateRejects"]
+        assert any("RISK_REWARD_REJECT" in r for r in rejects), rejects
+        assert result["allow"] is False
+
+    def test_risk_geometry_is_reported(self):
+        from core.edge_gate import evaluate_edge_gate
+        result = _run(evaluate_edge_gate(_make_minimal_payload(
+            config={"takeProfitPct": 0.45, "stopLossPct": 0.25}
+        )))
+        geometry = result.get("economics", {}).get("riskGeometry", {})
+        assert "netRewardRisk" in geometry
+        assert "breakevenProbability" in geometry
+
 
 class TestProvenanceFields:
     def test_signal_id_echoed_in_response(self):
