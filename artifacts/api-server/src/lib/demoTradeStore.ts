@@ -30,7 +30,13 @@ import { logger } from "./logger";
 
 // DATA_DIR can be overridden for testing via setDataDir(); all path accessors
 // use the getter so test isolation works without module re-import.
-let _dataDir = path.join(process.cwd(), "data");
+// In cloud, point DEMO_TRADE_DATA_DIR or RUNTIME_DATA_DIR at a persistent volume.
+function resolveDefaultDataDir(): string {
+  const configured = process.env["DEMO_TRADE_DATA_DIR"] || process.env["RUNTIME_DATA_DIR"];
+  return configured ? path.resolve(configured) : path.join(process.cwd(), "data");
+}
+
+let _dataDir = resolveDefaultDataDir();
 function DATA_DIR()   { return _dataDir; }
 function OPEN_FILE()  { return path.join(_dataDir, "demo-open.jsonl"); }
 function CLOSED_FILE(){ return path.join(_dataDir, "demo-closed.jsonl"); }
