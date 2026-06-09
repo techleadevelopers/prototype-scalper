@@ -646,6 +646,7 @@ class FeatureEngine:
                         await cb(res)
                     except Exception:
                         pass
+                await asyncio.sleep(0)
         return snaps
 
     def get_snapshot(self, symbol: str) -> Optional[MarketSnapshot]:
