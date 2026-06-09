@@ -253,22 +253,18 @@ def _movement_state(
     volume_confirmed = volume_trend == "rising" or volume_ratio >= 1.4
     flow_confirmed = abs(tick_imbalance) > 0.2 or abs(book_pressure) > 0.15
 
-    # Impulso com qualidade
+    # Impulso com qualidade.
+    # BTC BULL/BEAR is telemetry context only; do not let the tag veto or force
+    # direction. Direction must come from the current movement/candle evidence.
     if change_pct > 0.25 and acceleration > 0 and volume_confirmed and oi_change_pct >= 0:
-        if btc_regime != "BEAR" and flow_confirmed:
+        if flow_confirmed:
             return "IMPULSE_UP_HIGH_QUALITY"
-        elif btc_regime != "BEAR":
-            return "IMPULSE_UP"
-        else:
-            return "BTC_CONFLICT"
+        return "IMPULSE_UP"
 
     if change_pct < -0.25 and acceleration < 0 and volume_confirmed and oi_change_pct >= 0:
-        if btc_regime != "BULL" and flow_confirmed:
+        if flow_confirmed:
             return "IMPULSE_DOWN_HIGH_QUALITY"
-        elif btc_regime != "BULL":
-            return "IMPULSE_DOWN"
-        else:
-            return "BTC_CONFLICT"
+        return "IMPULSE_DOWN"
 
     # Fake move: volume baixo com movimento grande
     if abs_change >= 0.6 and volume_ratio < 1.2:
