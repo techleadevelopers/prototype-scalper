@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import math
 import time
 from typing import Any
 
+from core.async_utils import run_blocking
 from core.feature_engine import FeatureEngine
 
 
@@ -129,18 +131,27 @@ def _combine(symbol: str, f1h: dict, f4h: dict, f1d: dict) -> dict[str, Any]:
 
 
 async def analyze_macro_candle_regime(engine: FeatureEngine, symbols: list[str]) -> dict[str, Any]:
-    results: dict[str, Any] = {}
-    for symbol in symbols:
+    async def fetch_symbol(symbol: str) -> tuple[str, dict[str, Any]]:
         sym = symbol if symbol.endswith("-USDT") else f"{symbol}-USDT"
-        candles_1h = await engine.fetch_klines(sym, "1h", 80)
-        candles_4h = await engine.fetch_klines(sym, "4h", 80)
-        candles_1d = await engine.fetch_klines(sym, "1d", 60)
-        results[sym] = _combine(
-            sym,
-            _frame_features(candles_1h, 24),
-            _frame_features(candles_4h, 30),
-            _frame_features(candles_1d, 30),
+        candles_1h, candles_4h, candles_1d = await asyncio.gather(
+            engine.fetch_klines(sym, "1h", 80),
+            engine.fetch_klines(sym, "4h", 80),
+            engine.fetch_klines(sym, "1d", 60),
         )
+        f1h, f4h, f1d = await asyncio.gather(
+            run_blocking(_frame_features, candles_1h, 24),
+            run_blocking(_frame_features, candles_4h, 30),
+            run_blocking(_frame_features, candles_1d, 30),
+        )
+        return sym, _combine(
+            sym,
+            f1h,
+            f4h,
+            f1d,
+        )
+
+    pairs = await asyncio.gather(*[fetch_symbol(symbol) for symbol in symbols])
+    results = dict(pairs)
 
     _state.update({
         "lastRunAt": time.time(),
