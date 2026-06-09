@@ -329,7 +329,7 @@ const QuantBrainEdgeResponseSchema = z.object({
   }).optional(),
   sniper: z.unknown().optional(),
   realizedEdge: z.unknown().optional(),
-});
+}).passthrough();
 
 const OutcomeAckSchema = z.object({
   ok: z.literal(true),
@@ -907,6 +907,7 @@ export interface QuantBrainEdgeInput {
   marketDataSource?: "bingx";
   referencePrice?: number;
   observationSourceType?: "hypothetical" | "vst_campaign" | "shadow_sampler";
+  intelligenceOnly?: boolean;
   requestTimestamp?: number;
   contractVersion?: string;
 }
@@ -957,7 +958,22 @@ export function validateQuantBrainEdgeResponse(
     || result.side !== request.side
     || result.positionSide !== request.positionSide
   ) {
-    throw new Error("prediction provenance mismatch");
+    throw new Error(`prediction provenance mismatch: ${JSON.stringify({
+      expected: {
+        signalId: request.signalId,
+        marketEventId: request.marketEventId,
+        symbol: normalizeMarketSymbol(request.symbol),
+        side: request.side,
+        positionSide: request.positionSide,
+      },
+      received: {
+        signalId: result.signalId,
+        marketEventId: result.marketEventId,
+        symbol: normalizeMarketSymbol(result.symbol),
+        side: result.side,
+        positionSide: result.positionSide,
+      },
+    })}`);
   }
   if (request.candleIsComplete === false) {
     throw new Error("incomplete candle rejected");
@@ -1045,7 +1061,7 @@ export async function getQuantBrainIntelligence(
   const side = encodeURIComponent(input.positionSide);
   
   const [edge, health, model, signalEdge, newsContext] = await Promise.all([
-    getCachedIntelligenceEdge(input),
+    getCachedIntelligenceEdge({ ...input, intelligenceOnly: true }),
     getCachedJson<unknown>("health/live", "/health/live", INTELLIGENCE_HEALTH_TIMEOUT_MS),
     getCachedJson<unknown>("models/sniper/status", "/models/sniper/status", INTELLIGENCE_SIDECAR_TIMEOUT_MS),
     getCachedJson<unknown>(`signals/edge/${symbol}:${side}`, `/signals/edge/${symbol}?side=${side}`, INTELLIGENCE_SIDECAR_TIMEOUT_MS),
