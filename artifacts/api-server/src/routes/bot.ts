@@ -151,6 +151,31 @@ function liveEntryPolicyProvenance() {
   };
 }
 
+let readinessCache: {
+  key: string;
+  expiresAt: number;
+  status: LiveReadinessStatus;
+} | null = null;
+
+async function getCachedLiveReadinessStatus(config: ReturnType<typeof getBotConfig>): Promise<LiveReadinessStatus> {
+  const key = getPolicyStatus().currentConfigHash;
+  const now = Date.now();
+  if (readinessCache && readinessCache.key === key && readinessCache.expiresAt > now) {
+    return readinessCache.status;
+  }
+  const status = buildLiveReadinessStatus({
+    outcomes: exportAllOutcomes(),
+    closedDemoTrades: await loadClosedTrades(5_000),
+    config,
+  });
+  readinessCache = {
+    key,
+    expiresAt: now + Math.max(1_000, Number(process.env["LIVE_READINESS_CACHE_TTL_MS"] ?? 5_000)),
+    status,
+  };
+  return status;
+}
+
 function evaluateLiveKillSwitch(input: {
   config: ReturnType<typeof getBotConfig>;
   btcRegime?: BtcRegime | "HIGH_VOLATILITY_CHAOS" | "LOW_LIQUIDITY" | "NEUTRAL";
@@ -1337,11 +1362,7 @@ router.post("/bot/order", async (req: Request, res: Response) => {
         : btcChangePct <= -config.btcRegimeThresholdPct
           ? "BEAR"
           : "NEUTRAL";
-    const readinessStatus = buildLiveReadinessStatus({
-      outcomes: exportAllOutcomes(),
-      closedDemoTrades: await loadClosedTrades(5_000),
-      config,
-    });
+    const readinessStatus = await getCachedLiveReadinessStatus(config);
     const readiness = evaluateLiveReadinessForOrder({
       status: readinessStatus,
       order: {
@@ -2495,11 +2516,7 @@ async function executeSingleOrder(
   // ── QB gate — hard 600ms cap so sniper is never held hostage ──────────────
   if (config.allowExecution) {
     const sameSideOpen = ctx?.countsBySide.get(symbol.toUpperCase())?.[positionSide] ?? 0;
-    const readinessStatus = executionCtx.readinessStatus ?? buildLiveReadinessStatus({
-      outcomes: exportAllOutcomes(),
-      closedDemoTrades: await loadClosedTrades(5_000),
-      config,
-    });
+    const readinessStatus = executionCtx.readinessStatus ?? await getCachedLiveReadinessStatus(config);
     const btcRegimeForReadiness: BtcRegime | null = btcChangePct === undefined
       ? null
       : btcChangePct >= config.btcRegimeThresholdPct
@@ -3093,11 +3110,7 @@ router.post("/bot/sniper/mass", requireAdminAuthorization, async (req: Request, 
   const dataQualityStatus = getMarketDataQualityStatus();
   const dataQualityDegraded = dataQualityStatus.incidents.some((incident) => Date.now() - incident.occurredAt < 10 * 60_000);
   const readinessStatus = aggressiveConfig.allowExecution
-    ? buildLiveReadinessStatus({
-        outcomes: recentOutcomes,
-        closedDemoTrades: await loadClosedTrades(5_000),
-        config: aggressiveConfig,
-      })
+    ? await getCachedLiveReadinessStatus(aggressiveConfig)
     : undefined;
 
   for (let i = 0; i < toFire.length; i++) {
