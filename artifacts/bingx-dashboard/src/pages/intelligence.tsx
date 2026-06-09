@@ -30,7 +30,7 @@ import { apiUrl } from "@/lib/api-url";
 import { fetchDemoAnalysisState } from "@/lib/demo-live";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -81,122 +81,69 @@ function SentimentPanel({ symbol }: { symbol: string }) {
   });
 
   if (isLoading && !data) {
-    return (
-      <section className="border border-border/50 bg-card/25 p-4">
-        <div className="flex items-center gap-2 mb-4">
-          <BarChart2 className="h-4 w-4 text-primary" />
-          <h2 className="text-sm font-semibold">Sentimento 24h · Viés Direcional</h2>
-        </div>
-        <Skeleton className="h-20 w-full" />
-      </section>
-    );
+    return <Skeleton className="h-10 w-full rounded-xl" />;
   }
-
   if (!data) return null;
 
-  const { direction, confidence, biasRatio, entryBias, indicators, error } = data;
+  const { direction, confidence, entryBias, indicators } = data;
   const dirColor = direction === "BULL" ? "text-green-400" : direction === "BEAR" ? "text-red-400" : "text-amber-400";
-  const dirBg = direction === "BULL" ? "bg-green-500/10 border-green-500/30" : direction === "BEAR" ? "bg-red-500/10 border-red-500/30" : "bg-amber-500/10 border-amber-500/30";
+  const dirBorder = direction === "BULL" ? "border-green-500/25 bg-green-500/5" : direction === "BEAR" ? "border-red-500/25 bg-red-500/5" : "border-amber-500/25 bg-amber-500/5";
   const longPct = Math.round(entryBias.longWeight * 100);
   const shortPct = 100 - longPct;
 
-  const bars: { label: string; value: number; unit: string; bullish: boolean }[] = [
-    { label: "Desvio VWAP", value: indicators.vwapDeviation, unit: "%", bullish: indicators.vwapDeviation >= 0 },
-    { label: "Delta vol", value: indicators.volumeDelta * 100, unit: "%", bullish: indicators.volumeDelta >= 0 },
-    { label: "Mom 4h", value: indicators.momentum4h, unit: "%", bullish: indicators.momentum4h >= 0 },
-    { label: "Mom 24h", value: indicators.momentum24h, unit: "%", bullish: indicators.momentum24h >= 0 },
-    { label: "Bias body", value: indicators.bodyBias * 100, unit: "%", bullish: indicators.bodyBias >= 0 },
+  const chips: { label: string; value: number; unit: string }[] = [
+    { label: "VWAP", value: indicators.vwapDeviation, unit: "%" },
+    { label: "ΔVol", value: indicators.volumeDelta * 100, unit: "%" },
+    { label: "M4h", value: indicators.momentum4h, unit: "%" },
+    { label: "M24h", value: indicators.momentum24h, unit: "%" },
+    { label: "Body", value: indicators.bodyBias * 100, unit: "%" },
   ];
 
+  const breakoutLabel =
+    indicators.highLowBreak === "BREAKOUT_UP" ? "↑ BRK UP" :
+    indicators.highLowBreak === "BREAKOUT_DOWN" ? "↓ BRK DN" : "RANGE";
+  const breakoutColor =
+    indicators.highLowBreak === "BREAKOUT_UP" ? "text-green-400" :
+    indicators.highLowBreak === "BREAKOUT_DOWN" ? "text-red-400" : "text-muted-foreground";
+
   return (
-    <section className={`border p-4 ${dirBg}`}>
-      <div className="flex flex-wrap items-center gap-2 mb-4">
-        <BarChart2 className="h-4 w-4 text-primary" />
-        <h2 className="text-sm font-semibold">Sentimento 24h · Viés Direcional</h2>
-        <Badge variant="outline" className={`font-mono font-bold ${dirColor}`}>{direction}</Badge>
-        <span className="text-xs text-muted-foreground ml-1">confiança {(confidence * 100).toFixed(0)}%</span>
-        {error && <span className="text-[9px] text-amber-400 ml-auto font-mono">⚠ {error}</span>}
-      </div>
+    <section className={`flex flex-wrap items-center gap-2 rounded-xl border px-3 py-2 shadow-lg shadow-black/30 ${dirBorder}`}>
+      <BarChart2 className="h-3 w-3 text-primary/60 shrink-0" />
+      <span className="text-[11px] font-semibold text-muted-foreground">24h</span>
+      <Badge variant="outline" className={`px-1.5 py-0 text-[10px] font-mono font-bold leading-4 ${dirColor}`}>
+        {direction}
+      </Badge>
+      <span className="text-[10px] text-muted-foreground">{(confidence * 100).toFixed(0)}%</span>
 
-      <div className="grid gap-5 sm:grid-cols-[1fr_1.2fr]">
-        {/* Bias distribution bar */}
-        <div>
-          <p className="text-[10px] uppercase tracking-wider text-muted-foreground mb-2">Distribuição de entradas recomendada</p>
-          <div className="flex h-8 w-full overflow-hidden rounded-md border border-border/40">
-            <div
-              className="flex items-center justify-center bg-green-500/25 text-[11px] font-bold text-green-400 transition-all"
-              style={{ width: `${longPct}%` }}
-            >
-              {longPct >= 20 ? `${longPct}% L` : ""}
-            </div>
-            <div
-              className="flex items-center justify-center bg-red-500/25 text-[11px] font-bold text-red-400 transition-all"
-              style={{ width: `${shortPct}%` }}
-            >
-              {shortPct >= 20 ? `${shortPct}% S` : ""}
-            </div>
-          </div>
-          <div className="flex justify-between mt-1.5">
-            <span className="font-mono text-[10px] text-green-400">{longPct}% LONG</span>
-            <span className="font-mono text-[10px] text-red-400">{shortPct}% SHORT</span>
-          </div>
-          <div className="mt-3 grid grid-cols-3 gap-2 text-center">
-            <div className="border border-border/30 rounded p-2">
-              <p className="text-[8px] uppercase text-muted-foreground">EMA 12/24</p>
-              <p className={`font-mono text-xs font-bold ${indicators.ema12vs24 === "BULL" ? "text-green-400" : indicators.ema12vs24 === "BEAR" ? "text-red-400" : "text-muted-foreground"}`}>
-                {indicators.ema12vs24}
-              </p>
-            </div>
-            <div className="border border-border/30 rounded p-2">
-              <p className="text-[8px] uppercase text-muted-foreground">Posição</p>
-              <p className="font-mono text-xs font-bold">{(indicators.rangePosition * 100).toFixed(0)}%</p>
-              <p className="text-[7px] text-muted-foreground">{indicators.rangePosition > 0.65 ? "topo" : indicators.rangePosition < 0.35 ? "fundo" : "meio"}</p>
-            </div>
-            <div className="border border-border/30 rounded p-2">
-              <p className="text-[8px] uppercase text-muted-foreground">Vol trend</p>
-              <p className={`font-mono text-xs font-bold ${indicators.volumeTrend === "RISING" ? "text-green-400" : indicators.volumeTrend === "FALLING" ? "text-red-400" : "text-muted-foreground"}`}>
-                {indicators.volumeTrend === "RISING" ? "↑" : indicators.volumeTrend === "FALLING" ? "↓" : "—"} {indicators.volumeTrend}
-              </p>
-            </div>
-          </div>
+      <div className="flex h-5 w-[140px] shrink-0 overflow-hidden rounded border border-border/30">
+        <div
+          className="flex items-center justify-center bg-green-500/20 text-[9px] font-bold text-green-400"
+          style={{ width: `${longPct}%` }}
+        >
+          {longPct}%L
         </div>
-
-        {/* Indicator bars */}
-        <div className="space-y-2">
-          {bars.map((bar) => {
-            const absVal = Math.abs(bar.value);
-            const pct = Math.min(100, absVal * 5);
-            return (
-              <div key={bar.label}>
-                <div className="flex justify-between mb-0.5">
-                  <span className="text-[10px] text-muted-foreground">{bar.label}</span>
-                  <span className={`font-mono text-[10px] font-bold ${bar.bullish ? "text-green-400" : "text-red-400"}`}>
-                    {bar.value >= 0 ? "+" : ""}{bar.value.toFixed(3)}{bar.unit}
-                  </span>
-                </div>
-                <div className="flex h-1.5 w-full overflow-hidden rounded-full bg-muted/30">
-                  <div
-                    className={`h-full rounded-full ${bar.bullish ? "bg-green-500/60" : "bg-red-500/60"}`}
-                    style={{ width: `${pct}%`, marginLeft: bar.bullish ? "50%" : `${50 - pct / 2}%`, maxWidth: "50%" }}
-                  />
-                </div>
-              </div>
-            );
-          })}
-          <div className="mt-1">
-            <div className="flex justify-between mb-0.5">
-              <span className="text-[10px] text-muted-foreground">Breakout</span>
-              <span className={`font-mono text-[10px] font-bold ${indicators.highLowBreak === "BREAKOUT_UP" ? "text-green-400" : indicators.highLowBreak === "BREAKOUT_DOWN" ? "text-red-400" : "text-muted-foreground"}`}>
-                {indicators.highLowBreak === "BREAKOUT_UP" ? "↑ BREAKOUT UP" : indicators.highLowBreak === "BREAKOUT_DOWN" ? "↓ BREAKOUT DOWN" : "RANGE BOUND"}
-              </span>
-            </div>
-          </div>
+        <div
+          className="flex items-center justify-center bg-red-500/20 text-[9px] font-bold text-red-400"
+          style={{ width: `${shortPct}%` }}
+        >
+          {shortPct}%S
         </div>
       </div>
 
-      <p className="mt-3 text-[9px] text-muted-foreground">
-        Baseado em {data.candles24h} candles 1h · {data.fetchedAt ? new Date(data.fetchedAt).toLocaleTimeString() : "--"} · Cache 5min
-      </p>
+      <span className="mx-0.5 h-3 w-px bg-border/40" />
+
+      {chips.map((c) => (
+        <span key={c.label} className={`font-mono text-[10px] ${c.value >= 0 ? "text-green-400" : "text-red-400"}`}>
+          <span className="text-muted-foreground">{c.label} </span>
+          {c.value >= 0 ? "+" : ""}{c.value.toFixed(2)}{c.unit}
+        </span>
+      ))}
+
+      <span className={`font-mono text-[10px] ${breakoutColor}`}>{breakoutLabel}</span>
+
+      <span className="ml-auto text-[9px] font-mono text-muted-foreground">
+        EMA:{indicators.ema12vs24} · Pos:{(indicators.rangePosition * 100).toFixed(0)}% · Vol:{indicators.volumeTrend}
+      </span>
     </section>
   );
 }
@@ -240,15 +187,8 @@ interface DemoAnalysisState {
 }
 
 async function fetchIntelligence(symbol: string, side: Side, btcChangePct: number, source: "all" | "demo" | "live") {
-  const params = new URLSearchParams({
-    symbol,
-    side,
-    btcChangePct: String(btcChangePct),
-    source,
-  });
-  const response = await fetch(apiUrl(`/api/bot/intelligence?${params}`), {
-    credentials: "include",
-  });
+  const params = new URLSearchParams({ symbol, side, btcChangePct: String(btcChangePct), source });
+  const response = await fetch(apiUrl(`/api/bot/intelligence?${params}`), { credentials: "include" });
   if (!response.ok) throw new Error(`Intelligence HTTP ${response.status}`);
   return await response.json() as IntelligenceResponse;
 }
@@ -261,8 +201,6 @@ function pct(value: unknown, digits = 2) {
 function num(value: unknown, digits = 3) {
   return Number(value ?? 0).toFixed(digits);
 }
-
-// ─── Service State Panel ──────────────────────────────────────────────────────
 
 interface ServiceStateSnapshot {
   state: "HEALTHY" | "DEGRADED" | "SHADOW_ONLY" | "PAUSED";
@@ -291,86 +229,42 @@ function ServiceStatePanel() {
   });
 
   const stateColors: Record<string, string> = {
-    HEALTHY: "text-green-400 border-green-500/40 bg-green-500/8",
-    DEGRADED: "text-amber-400 border-amber-500/40 bg-amber-500/8",
-    SHADOW_ONLY: "text-orange-400 border-orange-500/40 bg-orange-500/8",
-    PAUSED: "text-red-400 border-red-500/40 bg-red-500/8",
+    HEALTHY: "text-green-400",
+    DEGRADED: "text-amber-400",
+    SHADOW_ONLY: "text-orange-400",
+    PAUSED: "text-red-400",
   };
   const stateIcon: Record<string, React.ReactNode> = {
-    HEALTHY: <ShieldCheck className="h-3.5 w-3.5" />,
-    DEGRADED: <ShieldAlert className="h-3.5 w-3.5" />,
-    SHADOW_ONLY: <ShieldOff className="h-3.5 w-3.5" />,
-    PAUSED: <Pause className="h-3.5 w-3.5" />,
+    HEALTHY: <ShieldCheck className="h-3.5 w-3.5 text-green-400" />,
+    DEGRADED: <ShieldAlert className="h-3.5 w-3.5 text-amber-400" />,
+    SHADOW_ONLY: <ShieldOff className="h-3.5 w-3.5 text-orange-400" />,
+    PAUSED: <Pause className="h-3.5 w-3.5 text-red-400" />,
   };
 
   const state = data?.state ?? "HEALTHY";
   const colorClass = stateColors[state] ?? stateColors.HEALTHY;
   const icon = stateIcon[state] ?? stateIcon.HEALTHY;
-
   const btcAgeMs = data?.lastBtcPriceAt ? Date.now() - data.lastBtcPriceAt : null;
   const btcStale = btcAgeMs !== null && data?.staleDataThresholdMs ? btcAgeMs > data.staleDataThresholdMs : false;
 
   return (
-    <section className={`border p-4 ${colorClass}`}>
-      <div className="mb-3 flex items-center gap-2">
-        {icon}
-        <h2 className="text-sm font-semibold">Estado do serviço</h2>
-        {isLoading && <RefreshCw className="ml-auto h-3 w-3 animate-spin text-muted-foreground" />}
-        {!isLoading && dataUpdatedAt > 0 && (
-          <span className="ml-auto text-[9px] text-muted-foreground font-mono">
-            {new Date(dataUpdatedAt).toLocaleTimeString()}
-          </span>
-        )}
-      </div>
-
+    <PanelBox icon={<Gauge className="h-3.5 w-3.5 text-primary" />} title="Serviço">
       {!data ? (
         <p className="text-[10px] text-muted-foreground">Carregando...</p>
       ) : (
         <div className="space-y-2">
-          <div className="flex justify-between text-xs">
-            <span className="text-muted-foreground">Estado</span>
-            <span className={`font-mono font-bold ${colorClass.split(" ")[0]}`}>{state}</span>
-          </div>
-          {data.reason && (
-            <div className="flex justify-between text-xs">
-              <span className="text-muted-foreground">Motivo</span>
-              <span className="font-mono uppercase text-[10px]">{data.reason}</span>
-            </div>
-          )}
-          <div className="flex justify-between text-xs">
-            <span className="text-muted-foreground">QB falhas (5min)</span>
-            <span className={`font-mono ${data.qbFailures >= 3 ? "text-amber-400" : ""}`}>{data.qbFailures}</span>
-          </div>
-          <div className="flex justify-between text-xs">
-            <span className="text-muted-foreground">Perdas seguidas</span>
-            <span className={`font-mono ${data.consecutiveLosses >= 4 ? "text-red-400" : ""}`}>{data.consecutiveLosses}</span>
-          </div>
-          <div className="flex justify-between text-xs">
-            <span className="text-muted-foreground">PnL acumulado</span>
-            <span className={`font-mono ${data.rollingLossPnl < 0 ? "text-red-400" : "text-green-400"}`}>
-              {data.rollingLossPnl >= 0 ? "+" : ""}${data.rollingLossPnl.toFixed(2)}
-            </span>
-          </div>
-          <div className="flex justify-between text-xs">
-            <span className="text-muted-foreground">BTC price age</span>
-            <span className={`font-mono ${btcStale ? "text-red-400" : "text-muted-foreground"}`}>
-              {btcAgeMs !== null ? `${(btcAgeMs / 1000).toFixed(0)}s` : "n/a"}
-              {btcStale && " ⚠ STALE"}
-            </span>
-          </div>
+          <Row label="Estado" value={<span className={`font-mono font-bold text-xs flex items-center gap-1`}>{icon}{state}</span>} />
+          {data.reason && <Row label="Motivo" value={<span className="font-mono text-[10px] uppercase">{data.reason}</span>} />}
+          <Row label="QB falhas" value={<span className={`font-mono text-xs ${data.qbFailures >= 3 ? "text-amber-400" : ""}`}>{data.qbFailures}</span>} />
+          <Row label="Losses" value={<span className={`font-mono text-xs ${data.consecutiveLosses >= 4 ? "text-red-400" : ""}`}>{data.consecutiveLosses}</span>} />
+          <Row label="PnL acum." value={<span className={`font-mono text-xs ${data.rollingLossPnl < 0 ? "text-red-400" : "text-green-400"}`}>{data.rollingLossPnl >= 0 ? "+" : ""}${data.rollingLossPnl.toFixed(2)}</span>} />
+          {btcStale && <div className="rounded border border-amber-500/30 bg-amber-500/5 px-2 py-1 text-[9px] text-amber-400">⚠ BTC price stale</div>}
           {(state === "SHADOW_ONLY" || state === "PAUSED") && (
-            <div className="mt-2 rounded border border-red-500/30 bg-red-500/5 p-2 text-[10px] text-red-400">
-              ⛔ Novas entradas bloqueadas — use POST /api/service-state/reset para recuperar
-            </div>
-          )}
-          {state === "DEGRADED" && (
-            <div className="mt-2 rounded border border-amber-500/30 bg-amber-500/5 p-2 text-[10px] text-amber-400">
-              ⚠ Execução degradada — monitorando falhas
-            </div>
+            <div className="rounded border border-red-500/30 bg-red-500/5 px-2 py-1 text-[9px] text-red-400">⛔ Entradas bloqueadas</div>
           )}
         </div>
       )}
-    </section>
+    </PanelBox>
   );
 }
 
@@ -378,11 +272,11 @@ function StatusBadge({ ok, on, off }: { ok: boolean; on: string; off: string }) 
   return (
     <Badge
       variant="outline"
-      className={ok
+      className={`text-[10px] ${ok
         ? "border-green-500/40 bg-green-500/10 text-green-400"
-        : "border-red-500/40 bg-red-500/10 text-red-400"}
+        : "border-red-500/40 bg-red-500/10 text-red-400"}`}
     >
-      {ok ? <CheckCircle2 className="mr-1 h-3 w-3" /> : <XCircle className="mr-1 h-3 w-3" />}
+      {ok ? <CheckCircle2 className="mr-1 h-2.5 w-2.5" /> : <XCircle className="mr-1 h-2.5 w-2.5" />}
       {ok ? on : off}
     </Badge>
   );
@@ -399,43 +293,54 @@ function Metric({
   detail?: string;
   tone?: "default" | "good" | "bad" | "warn";
 }) {
-  const color = tone === "good"
-    ? "text-green-400"
-    : tone === "bad"
-      ? "text-red-400"
-      : tone === "warn"
-        ? "text-amber-400"
-        : "text-foreground";
+  const color = tone === "good" ? "text-green-400" : tone === "bad" ? "text-red-400" : tone === "warn" ? "text-amber-400" : "text-foreground";
   return (
-    <Card className="rounded-lg border-border/50 bg-card/40">
-      <CardContent className="p-4">
-        <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">{label}</p>
-        <p className={`mt-1 font-mono text-xl font-bold ${color}`}>{value}</p>
-        {detail && <p className="mt-1 text-[10px] text-muted-foreground">{detail}</p>}
-      </CardContent>
-    </Card>
+    <div className="rounded-xl border border-border/40 bg-card/50 px-3 py-2.5 shadow shadow-black/20">
+      <p className="text-[9px] font-semibold uppercase tracking-wider text-muted-foreground">{label}</p>
+      <p className={`mt-0.5 font-mono text-base font-bold leading-tight ${color}`}>{value}</p>
+      {detail && <p className="mt-0.5 text-[9px] text-muted-foreground">{detail}</p>}
+    </div>
+  );
+}
+
+function Row({ label, value }: { label: string; value: React.ReactNode }) {
+  return (
+    <div className="flex justify-between items-center">
+      <span className="text-[10px] text-muted-foreground">{label}</span>
+      {typeof value === "string"
+        ? <span className="font-mono text-xs">{value}</span>
+        : value}
+    </div>
+  );
+}
+
+function PanelBox({ icon, title, badge, children }: { icon?: React.ReactNode; title: string; badge?: React.ReactNode; children: React.ReactNode }) {
+  return (
+    <section className="rounded-xl border border-border/40 bg-card/40 shadow-md shadow-black/20 overflow-hidden">
+      <div className="flex items-center gap-1.5 border-b border-border/30 px-3 py-2.5">
+        {icon}
+        <h2 className="text-xs font-semibold">{title}</h2>
+        {badge && <div className="ml-auto">{badge}</div>}
+      </div>
+      <div className="p-3 space-y-2">
+        {children}
+      </div>
+    </section>
   );
 }
 
 function FrameRow({ name, frame }: { name: string; frame: AnyRecord }) {
   const quality = String(frame?.quality ?? "NO_DATA");
   const healthy = quality === "GOOD";
+  const changePct = Number(frame?.changePct ?? 0);
   return (
-    <div className="grid grid-cols-[52px_1fr_1fr_1fr_90px] items-center gap-3 border-b border-border/30 py-3 last:border-0">
-      <span className="font-mono text-xs font-bold">{name}</span>
-      <span className={`font-mono text-xs ${Number(frame?.changePct ?? 0) >= 0 ? "text-green-400" : "text-red-400"}`}>
+    <div className="grid grid-cols-[36px_1fr_1fr_70px] items-center gap-2 border-b border-border/20 py-2 last:border-0">
+      <span className="font-mono text-[11px] font-bold text-muted-foreground">{name}</span>
+      <span className={`font-mono text-[11px] ${changePct >= 0 ? "text-green-400" : "text-red-400"}`}>
         {pct(frame?.changePct)}
       </span>
-      <span className="font-mono text-xs">{num(frame?.volumeRatioAvg, 2)}x vol</span>
-      <span className="truncate text-xs text-muted-foreground">{frame?.breakoutState ?? "NO_DATA"}</span>
-      <Badge
-        variant="outline"
-        className={healthy
-          ? "justify-center border-green-500/30 text-green-400"
-          : "justify-center border-amber-500/30 text-amber-400"}
-      >
-        {quality}
-      </Badge>
+      <span className="font-mono text-[11px] text-muted-foreground">{num(frame?.volumeRatioAvg, 2)}x vol</span>
+      <span className={`text-[10px] text-right ${healthy ? "text-green-400" : "text-amber-400"}`}>{quality}</span>
     </div>
   );
 }
@@ -531,33 +436,26 @@ export default function IntelligencePage() {
     if (!quant?.checkedAt) return "--";
     return new Date(quant.checkedAt).toLocaleTimeString();
   }, [quant?.checkedAt]);
-  const serviceError = quant?.errors.health
-    ?? quant?.errors.edge
-    ?? (!quant?.enabled ? "disabled" : null);
+  const serviceError = quant?.errors.health ?? quant?.errors.edge ?? (!quant?.enabled ? "disabled" : null);
 
   return (
     <AppShell>
-      <div className="mx-auto max-w-[1500px] space-y-5 p-4 md:p-6">
-        <header className="flex flex-col gap-4 border-b border-border/40 pb-5 xl:flex-row xl:items-end xl:justify-between">
-          <div>
-            <div className="flex items-center gap-2">
-              <BrainCircuit className="h-5 w-5 text-primary" />
-              <h1 className="text-xl font-bold">IA Sniper</h1>
-              <StatusBadge
-                ok={Boolean(quant?.connected)}
-                on="Quant online"
-                off={query.isFetching && !data ? "Conectando" : serviceError?.includes("aborted") ? "Quant timeout" : "Quant offline"}
-              />
-              <Badge variant="outline" className="font-mono uppercase">{quant?.gateMode ?? "unknown"}</Badge>
-            </div>
-            <p className="mt-1 text-xs text-muted-foreground">
-              Decisão operacional, economia líquida, memória pós-sinal e qualidade multiframe
-            </p>
+      <div className="mx-auto max-w-[1500px] space-y-4 p-4 md:p-5">
+        {/* ── Header ── */}
+        <header className="flex flex-wrap items-center gap-3 border-b border-border/30 pb-4">
+          <div className="flex items-center gap-2 flex-1">
+            <BrainCircuit className="h-4 w-4 text-primary" />
+            <h1 className="text-base font-bold">IA Sniper</h1>
+            <StatusBadge
+              ok={Boolean(quant?.connected)}
+              on="QB online"
+              off={query.isFetching && !data ? "Conectando" : serviceError?.includes("aborted") ? "QB timeout" : "QB offline"}
+            />
+            <Badge variant="outline" className="font-mono text-[10px] uppercase">{quant?.gateMode ?? "—"}</Badge>
           </div>
-
-          <div className="flex flex-wrap items-center gap-2">
+          <div className="flex items-center gap-2">
             <Select value={symbol} onValueChange={setSymbol}>
-              <SelectTrigger className="h-9 w-[160px]">
+              <SelectTrigger className="h-8 w-[140px] text-xs">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
@@ -566,13 +464,13 @@ export default function IntelligencePage() {
                 ))}
               </SelectContent>
             </Select>
-            <div className="flex h-9 overflow-hidden rounded-lg border border-border/60">
+            <div className="flex h-8 overflow-hidden rounded-lg border border-border/60">
               {(["LONG", "SHORT"] as Side[]).map((item) => (
                 <button
                   key={item}
                   type="button"
                   onClick={() => setSide(item)}
-                  className={`px-4 text-xs font-bold transition-colors ${
+                  className={`px-3 text-[11px] font-bold transition-colors ${
                     side === item
                       ? item === "LONG" ? "bg-green-500/15 text-green-400" : "bg-red-500/15 text-red-400"
                       : "text-muted-foreground hover:bg-muted/40"
@@ -582,358 +480,240 @@ export default function IntelligencePage() {
                 </button>
               ))}
             </div>
-            <Button variant="outline" size="icon" onClick={() => query.refetch()} disabled={query.isFetching} title="Atualizar">
-              <RefreshCw className={`h-4 w-4 ${query.isFetching ? "animate-spin" : ""}`} />
+            <Button variant="outline" size="icon" className="h-8 w-8" onClick={() => query.refetch()} disabled={query.isFetching}>
+              <RefreshCw className={`h-3.5 w-3.5 ${query.isFetching ? "animate-spin" : ""}`} />
             </Button>
-            <span className="font-mono text-[10px] text-muted-foreground">{lastUpdated}</span>
+            <span className="font-mono text-[9px] text-muted-foreground">{lastUpdated}</span>
           </div>
         </header>
 
+        {/* ── Sentiment strip ── */}
         <SentimentPanel symbol={symbol} />
 
+        {/* ── Demo banner ── */}
         {demoAnalysis?.connected && (
-          <section className="grid grid-cols-1 gap-3 border border-blue-500/25 bg-blue-500/5 p-4 sm:grid-cols-3">
-            <div>
-              <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Operação</p>
-              <p className="mt-1 font-mono text-sm font-bold text-blue-400">VST DEMO ATIVA</p>
-            </div>
-            <div>
-              <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">PnL aberto</p>
-              <p className={`mt-1 font-mono text-sm font-bold ${openDemoPnl >= 0 ? "text-green-400" : "text-red-400"}`}>
-                {openDemoPnl >= 0 ? "+" : ""}{openDemoPnl.toFixed(4)} VST
-              </p>
-            </div>
-            <div>
-              <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Posições</p>
-              <p className="mt-1 font-mono text-sm font-bold">{demoAnalysis.positions?.length ?? 0} abertas</p>
-            </div>
-          </section>
+          <div className="flex flex-wrap items-center gap-4 rounded-xl border border-blue-500/25 bg-blue-500/5 px-4 py-2.5 shadow shadow-black/20">
+            <span className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Operação</span>
+            <span className="font-mono text-sm font-bold text-blue-400">VST DEMO</span>
+            <span className="mx-1 h-3 w-px bg-border/40" />
+            <span className="text-[10px] text-muted-foreground">PnL aberto</span>
+            <span className={`font-mono text-sm font-bold ${openDemoPnl >= 0 ? "text-green-400" : "text-red-400"}`}>
+              {openDemoPnl >= 0 ? "+" : ""}{openDemoPnl.toFixed(4)} VST
+            </span>
+            <span className="mx-1 h-3 w-px bg-border/40" />
+            <span className="text-[10px] text-muted-foreground">Posições</span>
+            <span className="font-mono text-sm font-bold">{demoAnalysis.positions?.length ?? 0}</span>
+          </div>
         )}
 
         {query.isPending && !data ? (
-          <div className="grid gap-4 md:grid-cols-4">
-            {Array.from({ length: 8 }).map((_, index) => <Skeleton key={index} className="h-24 rounded-lg" />)}
+          <div className="grid gap-3 md:grid-cols-4">
+            {Array.from({ length: 8 }).map((_, i) => <Skeleton key={i} className="h-16 rounded-xl" />)}
           </div>
         ) : query.isError ? (
-          <div className="border border-red-500/30 bg-red-500/5 p-5 text-sm text-red-400">
-            Não foi possível consultar a central IA: {query.error.message}
+          <div className="rounded-xl border border-red-500/30 bg-red-500/5 p-4 text-sm text-red-400">
+            Erro: {query.error.message}
           </div>
         ) : (
           <>
-            <section className={`border-l-4 px-5 py-4 ${
-              allowed ? "border-green-500 bg-green-500/5" : "border-red-500 bg-red-500/5"
+            {/* ── Decision bar ── */}
+            <section className={`rounded-xl border-l-4 px-4 py-3 shadow-md shadow-black/25 ${
+              allowed
+                ? "border-green-500 bg-green-500/5"
+                : "border-red-500 bg-red-500/5"
             }`}>
-              <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
-                <div className="flex items-center gap-4">
-                  <div className={`flex h-12 w-12 items-center justify-center rounded-lg ${
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                <div className="flex items-center gap-3">
+                  <div className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-lg ${
                     allowed ? "bg-green-500/15 text-green-400" : "bg-red-500/15 text-red-400"
                   }`}>
-                    {allowed ? <Target className="h-6 w-6" /> : <ShieldAlert className="h-6 w-6" />}
+                    {allowed ? <Target className="h-5 w-5" /> : <ShieldAlert className="h-5 w-5" />}
                   </div>
                   <div>
-                    <p className="text-[10px] font-semibold uppercase tracking-widest text-muted-foreground">Decisão autoritativa</p>
-                    <p className={`font-mono text-2xl font-black ${allowed ? "text-green-400" : "text-red-400"}`}>
+                    <p className="text-[9px] font-semibold uppercase tracking-widest text-muted-foreground">Decisão</p>
+                    <p className={`font-mono text-xl font-black leading-tight ${allowed ? "text-green-400" : "text-red-400"}`}>
                       {decision}
                     </p>
-                    <p className="text-xs text-muted-foreground">{data?.symbol} · {data?.positionSide} · BTC {data?.btcRegime}</p>
+                    <p className="text-[10px] text-muted-foreground">{data?.symbol} · {data?.positionSide} · BTC {data?.btcRegime}</p>
                   </div>
                 </div>
-                <div className="grid grid-cols-3 gap-5 text-right">
-                  <div><p className="text-[9px] uppercase text-muted-foreground">Score</p><p className="font-mono text-lg font-bold">{(score * 100).toFixed(1)}</p></div>
-                  <div><p className="text-[9px] uppercase text-muted-foreground">Gate</p><p className="font-mono text-lg font-bold">{quant?.gateMode}</p></div>
-                  <div><p className="text-[9px] uppercase text-muted-foreground">Execução</p><p className={`font-mono text-lg font-bold ${data?.executionEnabled ? "text-green-400" : "text-amber-400"}`}>{data?.executionEnabled ? "LIVE" : "OFF"}</p></div>
+                <div className="flex gap-5 text-right">
+                  <div><p className="text-[9px] uppercase text-muted-foreground">Score</p><p className="font-mono text-base font-bold">{(score * 100).toFixed(1)}</p></div>
+                  <div><p className="text-[9px] uppercase text-muted-foreground">Gate</p><p className="font-mono text-base font-bold">{quant?.gateMode}</p></div>
+                  <div><p className="text-[9px] uppercase text-muted-foreground">Exec</p><p className={`font-mono text-base font-bold ${data?.executionEnabled ? "text-green-400" : "text-amber-400"}`}>{data?.executionEnabled ? "LIVE" : "OFF"}</p></div>
                 </div>
               </div>
             </section>
 
-            <section className="grid grid-cols-2 gap-3 lg:grid-cols-4 xl:grid-cols-8">
+            {/* ── Metrics row ── */}
+            <section className="grid grid-cols-2 gap-2 lg:grid-cols-4 xl:grid-cols-8">
               <Metric label="P(hit)" value={`${(Number(economics.hitProbability ?? targetHit) * 100).toFixed(1)}%`} detail={`${signalSamples} amostras`} />
-              <Metric label="EV líquido" value={`${num(economics.netEvUsdt, 4)} USDT`} tone={Number(economics.netEvUsdt) > 0 ? "good" : "bad"} />
-              <Metric label="Alvo líquido" value={`${num(economics.estimatedNetTargetUsdt, 4)} USDT`} />
-              <Metric label="Perda estimada" value={`${num(economics.estimatedLossUsdt, 4)} USDT`} tone="bad" />
+              <Metric label="EV líquido" value={`${num(economics.netEvUsdt, 4)}`} detail="USDT" tone={Number(economics.netEvUsdt) > 0 ? "good" : "bad"} />
+              <Metric label="Alvo líq." value={`${num(economics.estimatedNetTargetUsdt, 4)}`} detail="USDT" />
+              <Metric label="Perda est." value={`${num(economics.estimatedLossUsdt, 4)}`} detail="USDT" tone="bad" />
               <Metric label="Custos" value={pct(economics.estimatedCostPct, 3)} />
               <Metric label="Win rate" value={`${(Number(data?.telemetry.winRate ?? 0) * 100).toFixed(1)}%`} />
-              <Metric label="Profit factor" value={`${num(data?.telemetry.profitFactor, 2)}x`} />
-              <Metric label="PnL realizado" value={`${num(data?.telemetry.netPnl, 4)} USDT`} tone={Number(data?.telemetry.netPnl) >= 0 ? "good" : "bad"} />
+              <Metric label="Prof. factor" value={`${num(data?.telemetry.profitFactor, 2)}x`} />
+              <Metric label="PnL real." value={`${num(data?.telemetry.netPnl, 4)}`} detail="USDT" tone={Number(data?.telemetry.netPnl) >= 0 ? "good" : "bad"} />
             </section>
 
-            <div className="grid gap-5 xl:grid-cols-[1.2fr_0.8fr]">
-              <section className="border border-border/50 bg-card/25">
-                <div className="flex items-center justify-between border-b border-border/40 px-4 py-3">
-                  <div className="flex items-center gap-2">
-                    <Activity className="h-4 w-4 text-primary" />
-                    <h2 className="text-sm font-semibold">Contexto multiframe</h2>
-                  </div>
-                  <span className="text-[10px] text-muted-foreground">movimento · volume · breakout · qualidade</span>
-                </div>
-                <div className="px-4">
-                  <FrameRow name="1m" frame={frames["1m"] ?? {}} />
-                  <FrameRow name="5m" frame={frames["5m"] ?? {}} />
-                  <FrameRow name="15m" frame={frames["15m"] ?? {}} />
-                </div>
-                <div className="grid gap-3 border-t border-border/40 p-4 sm:grid-cols-3">
+            {/* ── Multiframe + Gate reasons ── */}
+            <div className="grid gap-4 xl:grid-cols-[1.3fr_0.7fr]">
+              <PanelBox
+                icon={<Activity className="h-3.5 w-3.5 text-primary" />}
+                title="Multiframe"
+                badge={<span className="text-[9px] text-muted-foreground">mov · vol · breakout · qual</span>}
+              >
+                <FrameRow name="1m" frame={frames["1m"] ?? {}} />
+                <FrameRow name="5m" frame={frames["5m"] ?? {}} />
+                <FrameRow name="15m" frame={frames["15m"] ?? {}} />
+                <div className="mt-1 grid grid-cols-3 gap-2 border-t border-border/20 pt-2 text-center">
                   <div>
-                    <p className="text-[9px] uppercase text-muted-foreground">Movimento ALT</p>
-                    <p className="mt-1 font-mono text-sm font-bold">{pct(sniper.altFeatures?.price_change_pct)}</p>
+                    <p className="text-[9px] text-muted-foreground">Mov ALT</p>
+                    <p className="font-mono text-xs font-bold">{pct(sniper.altFeatures?.price_change_pct)}</p>
                   </div>
                   <div>
-                    <p className="text-[9px] uppercase text-muted-foreground">Momentum</p>
-                    <p className="mt-1 font-mono text-sm font-bold uppercase">{sniper.altFeatures?.momentum_quality ?? "--"}</p>
+                    <p className="text-[9px] text-muted-foreground">Momentum</p>
+                    <p className="font-mono text-xs font-bold uppercase">{sniper.altFeatures?.momentum_quality ?? "--"}</p>
                   </div>
                   <div>
-                    <p className="text-[9px] uppercase text-muted-foreground">Toxicidade micro</p>
-                    <p className="mt-1 font-mono text-sm font-bold">{num(sniper.altFeatures?.microstructure_toxicity, 3)}</p>
+                    <p className="text-[9px] text-muted-foreground">Toxicidade</p>
+                    <p className="font-mono text-xs font-bold">{num(sniper.altFeatures?.microstructure_toxicity, 3)}</p>
                   </div>
                 </div>
-              </section>
+              </PanelBox>
 
-              <section className="border border-border/50 bg-card/25">
-                <div className="flex items-center gap-2 border-b border-border/40 px-4 py-3">
-                  <AlertTriangle className="h-4 w-4 text-amber-400" />
-                  <h2 className="text-sm font-semibold">Motivos do gate</h2>
-                  <Badge variant="outline" className="ml-auto font-mono">{rejects.length}</Badge>
-                </div>
-                <div className="max-h-[280px] overflow-auto p-3">
+              <PanelBox
+                icon={<AlertTriangle className="h-3.5 w-3.5 text-amber-400" />}
+                title="Motivos do gate"
+                badge={<Badge variant="outline" className="font-mono text-[10px]">{rejects.length}</Badge>}
+              >
+                <div className="max-h-[180px] overflow-auto custom-scrollbar">
                   {(rejects.length ? rejects : reasons).length === 0 ? (
-                    <div className="flex items-center gap-2 p-3 text-xs text-green-400">
-                      <CheckCircle2 className="h-4 w-4" /> Nenhuma rejeição ativa
+                    <div className="flex items-center gap-1.5 py-1 text-[11px] text-green-400">
+                      <CheckCircle2 className="h-3.5 w-3.5" /> Nenhuma rejeição
                     </div>
-                  ) : (rejects.length ? rejects : reasons).map((reason, index) => (
-                    <div key={`${reason}-${index}`} className="flex gap-2 border-b border-border/30 px-2 py-2.5 last:border-0">
-                      <XCircle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-red-400" />
-                      <span className="break-words font-mono text-[10px] leading-relaxed">{reason}</span>
+                  ) : (rejects.length ? rejects : reasons).map((reason, i) => (
+                    <div key={`${reason}-${i}`} className="flex gap-1.5 border-b border-border/20 py-1.5 last:border-0">
+                      <XCircle className="mt-0.5 h-3 w-3 shrink-0 text-red-400" />
+                      <span className="break-words font-mono text-[9px] leading-relaxed">{reason}</span>
                     </div>
                   ))}
                 </div>
-              </section>
+              </PanelBox>
             </div>
 
-            <section className="border border-border/50 bg-card/25">
-              <div className="flex flex-wrap items-center gap-2 border-b border-border/40 px-4 py-3">
-                <BrainCircuit className="h-4 w-4 text-primary" />
-                <h2 className="text-sm font-semibold">Aprendizado shadow 24h</h2>
-                <StatusBadge
-                  ok={Boolean(sampler.running)}
-                  on="Sampler ativo"
-                  off={sampler.enabled === false ? "Sampler off" : "Sem ciclo"}
-                />
-                <Badge variant="outline" className="ml-auto font-mono">
-                  {shadowSamplerSource?.observed ?? 0} observados
-                </Badge>
-              </div>
-              <div className="grid gap-4 p-4 lg:grid-cols-[0.9fr_1.1fr]">
-                <div className="grid grid-cols-2 gap-3 sm:grid-cols-4 lg:grid-cols-2 xl:grid-cols-4">
-                  <Metric label="Ciclos" value={`${sampler.cycles ?? 0}`} detail={`a cada ${sampler.intervalSeconds ?? "--"}s`} />
-                  <Metric label="Registrados" value={`${sampler.recorded ?? 0}`} detail={`${sampler.attempted ?? 0} tentativas`} />
-                  <Metric label="Pendentes" value={`${shadowSamplerSource?.pending ?? 0}`} detail={`${shadowSamplerSource?.finalized ?? 0} finalizados`} />
-                  <Metric
-                    label="Hit sampler"
-                    value={`${shadowSamplerSource?.finalized ? ((Number(shadowSamplerSource.hits ?? 0) / Number(shadowSamplerSource.finalized)) * 100).toFixed(1) : "0.0"}%`}
-                    detail={`${shadowSamplerSource?.hits ?? 0} hit · ${shadowSamplerSource?.misses ?? 0} miss`}
-                  />
-                </div>
-                <div className="border border-border/40 p-3">
-                  <div className="mb-3 flex items-center justify-between gap-2">
-                    <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Última análise capturada</p>
-                    <span className="font-mono text-[10px] text-muted-foreground">
-                      {lastSamplerAnalysis.capturedAt ? new Date(Number(lastSamplerAnalysis.capturedAt) * 1000).toLocaleTimeString() : "--"}
-                    </span>
-                  </div>
-                  <div className="grid gap-3 sm:grid-cols-4">
-                    <div>
-                      <p className="text-[9px] uppercase text-muted-foreground">Símbolo</p>
-                      <p className="mt-1 font-mono text-sm font-bold">{lastSamplerAnalysis.symbol ?? "--"} {lastSamplerAnalysis.fallbackSide ?? ""}</p>
-                    </div>
-                    <div>
-                      <p className="text-[9px] uppercase text-muted-foreground">Decisão</p>
-                      <p className="mt-1 font-mono text-sm font-bold uppercase">{lastSamplerAnalysis.decision ?? "--"}</p>
-                    </div>
-                    <div>
-                      <p className="text-[9px] uppercase text-muted-foreground">Score</p>
-                      <p className="mt-1 font-mono text-sm font-bold">{num(lastSamplerAnalysis.score, 3)}</p>
-                    </div>
-                    <div>
-                      <p className="text-[9px] uppercase text-muted-foreground">Momentum</p>
-                      <p className="mt-1 font-mono text-sm font-bold uppercase">{lastSamplerAnalysis.momentumQuality ?? "--"}</p>
-                    </div>
-                  </div>
-                  <div className="mt-3 border-t border-border/30 pt-3">
-                    <p className="line-clamp-2 font-mono text-[10px] text-muted-foreground">
-                      {(Array.isArray(lastSamplerAnalysis.reasons) ? lastSamplerAnalysis.reasons : []).join(" · ") || "Sem análise shadow capturada ainda"}
-                    </p>
-                  </div>
-                </div>
-              </div>
-            </section>
-
-            <div className="grid gap-5 lg:grid-cols-2 xl:grid-cols-4">
-              <section className="border border-border/50 p-4">
-                <div className="mb-4 flex items-center gap-2">
-                  <Cpu className="h-4 w-4 text-primary" />
-                  <h2 className="text-sm font-semibold">Shadow ML</h2>
+            {/* ── Shadow learning + 4 panels ── */}
+            <PanelBox
+              icon={<BrainCircuit className="h-3.5 w-3.5 text-primary" />}
+              title="Shadow ML"
+              badge={
+                <div className="flex items-center gap-1.5">
                   <StatusBadge
-                    ok={Boolean(shadow.available)}
-                    on={shadow.quality === "excellent" ? "Excelente" : shadow.quality === "good" ? "Bom" : "Disponível"}
-                    off={trainingSamples < minimumTrainingSamples ? "Coletando" : "Sem modelo"}
+                    ok={Boolean(sampler.running)}
+                    on="Ativo"
+                    off={sampler.enabled === false ? "Off" : "Sem ciclo"}
                   />
+                  <span className="font-mono text-[10px] text-muted-foreground">{shadowSamplerSource?.observed ?? 0} obs</span>
                 </div>
-                <div className="space-y-3">
+              }
+            >
+              <div className="grid gap-3 sm:grid-cols-[1fr_1.4fr]">
+                <div className="space-y-2">
                   {/* Progress bar */}
                   <div>
-                    <div className="mb-1 flex justify-between text-xs">
+                    <div className="mb-1 flex justify-between text-[10px]">
                       <span className="text-muted-foreground">Amostras</span>
                       <span className="font-mono">{trainingSamples}/{minimumTrainingSamples}</span>
                     </div>
-                    <Progress value={shadow.available ? Math.min(100, modelProbability * 100) : trainingProgress} />
+                    <Progress value={shadow.available ? Math.min(100, modelProbability * 100) : trainingProgress} className="h-1.5" />
                   </div>
-
-                  {/* Pipeline: pending → finalized → treináveis */}
-                  <div className="grid grid-cols-3 gap-1 rounded bg-muted/20 p-2 text-center">
+                  {/* Pipeline */}
+                  <div className="grid grid-cols-3 gap-1 rounded-lg bg-muted/20 p-2 text-center">
                     <div>
                       <div className="font-mono text-xs font-semibold">{shadow.signalPipeline?.pending ?? 0}</div>
-                      <div className="text-[9px] text-muted-foreground">Pendentes</div>
+                      <div className="text-[9px] text-muted-foreground">Pend.</div>
                     </div>
                     <div>
                       <div className="font-mono text-xs font-semibold">{shadow.signalPipeline?.finalized ?? 0}</div>
-                      <div className="text-[9px] text-muted-foreground">Finalizados</div>
+                      <div className="text-[9px] text-muted-foreground">Final.</div>
                     </div>
                     <div>
                       <div className="font-mono text-xs font-semibold">{trainingSamples}</div>
-                      <div className="text-[9px] text-muted-foreground">Treináveis</div>
+                      <div className="text-[9px] text-muted-foreground">Train.</div>
                     </div>
                   </div>
-
-                  {/* Pre-training: velocity + ETA */}
                   {!shadow.available && (
-                    <>
-                      <div className="flex justify-between text-xs">
-                        <span className="text-muted-foreground">Velocidade</span>
-                        <span className="font-mono">{samplesPerHour > 0 ? `${samplesPerHour}/h` : "--"}</span>
-                      </div>
-                      {etaLabel && (
-                        <div className="flex justify-between text-xs">
-                          <span className="text-muted-foreground">ETA treino</span>
-                          <span className="font-mono text-amber-400">{etaLabel}</span>
-                        </div>
-                      )}
-                      <div className="flex justify-between text-xs">
-                        <span className="text-muted-foreground">Classes</span>
-                        <span className="font-mono">{shadow.hits ?? 0} hit · {shadow.misses ?? 0} miss</span>
-                      </div>
-                    </>
+                    <div className="space-y-1.5">
+                      <Row label="Velocidade" value={samplesPerHour > 0 ? `${samplesPerHour}/h` : "--"} />
+                      {etaLabel && <Row label="ETA" value={<span className="font-mono text-xs text-amber-400">{etaLabel}</span>} />}
+                      <Row label="Classes" value={`${shadow.hits ?? 0}h · ${shadow.misses ?? 0}m`} />
+                    </div>
                   )}
-
-                  {/* Post-training: profitability metrics */}
                   {shadow.available && (
-                    <>
-                      <div className="flex justify-between text-xs">
-                        <span className="text-muted-foreground">AUC ROC</span>
-                        <span className="font-mono">{num(shadow.rocAuc, 3)}</span>
-                      </div>
-                      <div className="flex justify-between text-xs">
-                        <span className="text-muted-foreground">Threshold ótimo</span>
-                        <span className="font-mono">{optimalThreshold > 0 ? `${(optimalThreshold * 100).toFixed(0)}%` : "--"}</span>
-                      </div>
-                      <div className="flex justify-between text-xs">
-                        <span className="text-muted-foreground">EV simulado</span>
-                        <span className={`font-mono ${expectedValuePct > 0 ? "text-green-400" : expectedValuePct < 0 ? "text-red-400" : "text-muted-foreground"}`}>
-                          {optimalThreshold > 0 ? `${expectedValuePct >= 0 ? "+" : ""}${(expectedValuePct * 100).toFixed(3)}%` : "--"}
-                        </span>
-                      </div>
-                      <div className="flex justify-between text-xs">
-                        <span className="text-muted-foreground">Win rate / breakeven</span>
-                        <span className="font-mono">
-                          {simulatedWinRate > 0
-                            ? `${(simulatedWinRate * 100).toFixed(1)}% / ${(breakevenWinRate * 100).toFixed(1)}%`
-                            : "--"}
-                        </span>
-                      </div>
-                      <div className="flex justify-between text-xs">
-                        <span className="text-muted-foreground">Edge lucrativo</span>
-                        <span className={profitabilityVerified ? "font-semibold text-green-400" : "text-amber-400"}>
-                          {profitabilityVerified ? "✓ VERIFICADO" : "NÃO VERIFICADO"}
-                        </span>
-                      </div>
-                      <div className="flex justify-between text-xs">
-                        <span className="text-muted-foreground">Baseline</span>
-                        <span className={shadow.improvesBaseline ? "text-green-400" : "text-amber-400"}>
-                          {shadow.improvesBaseline ? "SUPERADO" : "PENDENTE"}
-                        </span>
-                      </div>
-                    </>
-                  )}
-
-                  {/* Data quality (always shown when > 0) */}
-                  {dataQualityScore > 0 && (
-                    <div className="flex items-center justify-between text-xs">
-                      <span className="text-muted-foreground">Qualidade dados</span>
-                      <div className="flex items-center gap-1.5">
-                        <div className="h-1.5 w-16 rounded-full bg-muted/40">
-                          <div
-                            className={`h-full rounded-full ${dataQualityScore >= 70 ? "bg-green-500" : dataQualityScore >= 40 ? "bg-amber-500" : "bg-red-500"}`}
-                            style={{ width: `${dataQualityScore}%` }}
-                          />
-                        </div>
-                        <span className="font-mono">{dataQualityScore}/100</span>
-                      </div>
+                    <div className="space-y-1.5">
+                      <Row label="AUC ROC" value={num(shadow.rocAuc, 3)} />
+                      <Row label="Threshold" value={optimalThreshold > 0 ? `${(optimalThreshold * 100).toFixed(0)}%` : "--"} />
+                      <Row label="EV sim." value={<span className={`font-mono text-xs ${expectedValuePct > 0 ? "text-green-400" : "text-red-400"}`}>{optimalThreshold > 0 ? `${expectedValuePct >= 0 ? "+" : ""}${(expectedValuePct * 100).toFixed(3)}%` : "--"}</span>} />
+                      <Row label="Edge" value={<span className={`text-xs font-semibold ${profitabilityVerified ? "text-green-400" : "text-amber-400"}`}>{profitabilityVerified ? "✓ VERIFICADO" : "PENDENTE"}</span>} />
                     </div>
                   )}
                 </div>
-              </section>
 
-              <section className="border border-border/50 p-4">
-                <div className="mb-4 flex items-center gap-2">
-                  <Target className="h-4 w-4 text-primary" />
-                  <h2 className="text-sm font-semibold">Memória de sinais</h2>
+                {/* Last capture */}
+                <div className="rounded-lg border border-border/30 bg-muted/10 p-2.5">
+                  <div className="mb-2 flex items-center justify-between">
+                    <p className="text-[9px] font-semibold uppercase text-muted-foreground">Última captura</p>
+                    <span className="font-mono text-[9px] text-muted-foreground">
+                      {lastSamplerAnalysis.capturedAt ? new Date(Number(lastSamplerAnalysis.capturedAt) * 1000).toLocaleTimeString() : "--"}
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-2 gap-x-3 gap-y-1.5">
+                    <Row label="Símbolo" value={<span className="font-mono text-xs font-bold">{lastSamplerAnalysis.symbol ?? "--"}</span>} />
+                    <Row label="Decisão" value={<span className="font-mono text-xs font-bold uppercase">{lastSamplerAnalysis.decision ?? "--"}</span>} />
+                    <Row label="Score" value={num(lastSamplerAnalysis.score, 3)} />
+                    <Row label="Momentum" value={<span className="font-mono text-xs uppercase">{lastSamplerAnalysis.momentumQuality ?? "--"}</span>} />
+                  </div>
+                  <p className="mt-2 line-clamp-2 border-t border-border/20 pt-2 font-mono text-[9px] text-muted-foreground">
+                    {(Array.isArray(lastSamplerAnalysis.reasons) ? lastSamplerAnalysis.reasons : []).join(" · ") || "Sem análise shadow capturada"}
+                  </p>
                 </div>
-                <div className="space-y-3">
-                  <div className="flex justify-between text-xs"><span className="text-muted-foreground">Contexto</span><span className="font-mono">{signalSamples}</span></div>
-                  <div className="flex justify-between text-xs"><span className="text-muted-foreground">Target hit</span><span className="font-mono">{(targetHit * 100).toFixed(1)}%</span></div>
-                  <div className="flex justify-between text-xs"><span className="text-muted-foreground">Score</span><span className="font-mono">{num(signalEdge.score, 3)}</span></div>
-                  <div className="flex justify-between text-xs"><span className="text-muted-foreground">Veredito</span><span className="font-mono uppercase">{signalEdge.verdict ?? "--"}</span></div>
-                </div>
-              </section>
+              </div>
+            </PanelBox>
 
-              <section className="border border-border/50 p-4">
-                <div className="mb-4 flex items-center gap-2">
-                  <ShieldAlert className="h-4 w-4 text-primary" />
-                  <h2 className="text-sm font-semibold">Risco operacional</h2>
-                </div>
-                <div className="space-y-3">
-                  <div className="flex justify-between text-xs"><span className="text-muted-foreground">PnL 24h</span><span className="font-mono">{pct(operationalRisk.netPnlPct)}</span></div>
-                  <div className="flex justify-between text-xs"><span className="text-muted-foreground">Drawdown</span><span className="font-mono text-red-400">{pct(operationalRisk.maxDrawdownPct)}</span></div>
-                  <div className="flex justify-between text-xs"><span className="text-muted-foreground">Loss streak</span><span className="font-mono">{operationalRisk.consecutiveLosses ?? 0}</span></div>
-                  <div className="flex justify-between text-xs"><span className="text-muted-foreground">Trades</span><span className="font-mono">{operationalRisk.trades ?? 0}</span></div>
-                </div>
-              </section>
+            {/* ── Bottom 4 panels ── */}
+            <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+              <PanelBox icon={<Target className="h-3.5 w-3.5 text-primary" />} title="Memória sinais">
+                <Row label="Contexto" value={String(signalSamples)} />
+                <Row label="Target hit" value={`${(targetHit * 100).toFixed(1)}%`} />
+                <Row label="Score" value={num(signalEdge.score, 3)} />
+                <Row label="Veredito" value={<span className="font-mono text-xs uppercase">{signalEdge.verdict ?? "--"}</span>} />
+              </PanelBox>
 
-              <section className="border border-border/50 p-4">
-                <div className="mb-4 flex items-center gap-2">
-                  <Gauge className="h-4 w-4 text-primary" />
-                  <h2 className="text-sm font-semibold">Serviço e notícias</h2>
-                </div>
-                <div className="space-y-3">
-                  <div className="flex justify-between text-xs"><span className="text-muted-foreground">API</span><span className="flex items-center gap-1">{quant?.connected ? <Wifi className="h-3 w-3 text-green-400" /> : <WifiOff className="h-3 w-3 text-red-400" />}{quant?.connected ? "ONLINE" : "OFFLINE"}</span></div>
-                  <div className="flex justify-between text-xs"><span className="text-muted-foreground">News action</span><span className="font-mono uppercase">{news.action ?? "none"}</span></div>
-                  <div className="flex justify-between text-xs"><span className="text-muted-foreground">Risk level</span><span className="font-mono uppercase">{news.riskLevel ?? news.risk_level ?? "LOW"}</span></div>
-                  <div className="flex justify-between text-xs"><span className="text-muted-foreground">Hora UTC</span><span className="flex items-center gap-1 font-mono"><Clock3 className="h-3 w-3" />{data?.hourUtc}:00</span></div>
-                </div>
-              </section>
+              <PanelBox icon={<ShieldAlert className="h-3.5 w-3.5 text-primary" />} title="Risco operacional">
+                <Row label="PnL 24h" value={pct(operationalRisk.netPnlPct)} />
+                <Row label="Drawdown" value={<span className="font-mono text-xs text-red-400">{pct(operationalRisk.maxDrawdownPct)}</span>} />
+                <Row label="Loss streak" value={String(operationalRisk.consecutiveLosses ?? 0)} />
+                <Row label="Trades" value={String(operationalRisk.trades ?? 0)} />
+              </PanelBox>
+
+              <PanelBox icon={<Gauge className="h-3.5 w-3.5 text-primary" />} title="Notícias / API">
+                <Row label="QB" value={<span className={`flex items-center gap-1 text-xs ${quant?.connected ? "text-green-400" : "text-red-400"}`}>{quant?.connected ? <Wifi className="h-3 w-3" /> : <WifiOff className="h-3 w-3" />}{quant?.connected ? "ONLINE" : "OFFLINE"}</span>} />
+                <Row label="News" value={<span className="font-mono text-xs uppercase">{news.action ?? "none"}</span>} />
+                <Row label="Risk" value={<span className="font-mono text-xs uppercase">{news.riskLevel ?? news.risk_level ?? "LOW"}</span>} />
+                <Row label="UTC" value={<span className="flex items-center gap-1 font-mono text-xs"><Clock3 className="h-2.5 w-2.5" />{data?.hourUtc}:00</span>} />
+              </PanelBox>
 
               <ServiceStatePanel />
             </div>
 
+            {/* ── Errors ── */}
             {quant && Object.keys(quant.errors).length > 0 && (
-              <section className="border border-amber-500/30 bg-amber-500/5 p-4">
-                <div className="flex items-start gap-3">
-                  <AlertTriangle className="mt-0.5 h-4 w-4 text-amber-400" />
-                  <div>
-                    <p className="text-xs font-semibold text-amber-400">Dados parcialmente indisponíveis</p>
-                    <p className="mt-1 font-mono text-[10px] text-muted-foreground">
-                      {Object.entries(quant.errors).map(([key, value]) => `${key}: ${value}`).join(" · ")}
-                    </p>
-                  </div>
-                </div>
+              <section className="flex items-start gap-2 rounded-xl border border-amber-500/25 bg-amber-500/5 px-3 py-2.5">
+                <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-400" />
+                <p className="font-mono text-[10px] text-muted-foreground">
+                  {Object.entries(quant.errors).map(([k, v]) => `${k}: ${v}`).join(" · ")}
+                </p>
               </section>
             )}
           </>
