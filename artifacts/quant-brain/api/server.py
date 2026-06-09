@@ -35,6 +35,7 @@ from core.movement_sniper import evaluate_sniper_window, build_movement_features
 from core.signal_learning import finalize_due_signal_outcomes, score_signal_context
 from core.shadow_model import restore_shadow_model, shadow_model_status, train_shadow_model
 from core.shadow_sampler import reconcile_shadow_sampler_status, shadow_sampler_status, sample_shadow_signals_once
+from core.training_serving_skew import skew_status
 from core.exit_intelligence import evaluate_exit
 from core.exit_learning import record_exit_outcome as _record_exit_outcome, record_exit_evaluation, get_exit_stats
 from core.experiment_engine import experiment_status, infer_assignment_for_outcome
@@ -1756,6 +1757,11 @@ async def run_shadow_sampler_once_endpoint():
         "sampler": shadow_sampler_status(),
         **result,
     }
+
+
+@app.get("/audit/training-serving-skew")
+async def training_serving_skew_status_endpoint(limit: int = Query(20, ge=1, le=200)):
+    return await skew_status(limit=limit)
 
 
 @app.get("/signals/edge/{symbol}")
