@@ -2316,10 +2316,13 @@ router.get("/bot/intelligence", async (req: Request, res: Response) => {
   const symbolProfile = engine.symbolProfile(symbol);
   const context = engine.contextSignal(clusterKey);
 
-  // Shared 1 400 ms deadline — neither QB intelligence nor telemetry state
-  // may block the endpoint longer than this, so a slow/aborting QB never freezes the UI.
+  // Shared QB deadline tracks the real intelligence timeout with a small buffer,
+  // so the route does not mark QB offline before it has a chance to answer.
   const localTelemetryFallback = { recentOutcomes: engine.rawOutcomes() };
-  const QB_DEADLINE_MS = 1_400;
+  const QB_DEADLINE_MS = Math.max(
+    2_000,
+    Number(process.env["QUANT_BRAIN_INTELLIGENCE_TIMEOUT_MS"] ?? 4_000) + 500,
+  );
   const qbDeadline = new Promise<null>((r) => setTimeout(() => r(null), QB_DEADLINE_MS));
 
   // Timeout fallback for QB intelligence (allow = true so trades aren't hard-blocked)
