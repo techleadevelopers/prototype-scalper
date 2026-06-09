@@ -11,6 +11,7 @@ import { getQuantBrainRecentTrades, getQuantBrainTradeSummary, syncQuantBrainOut
 import { AdaptiveEngine } from "../lib/adaptiveEngine";
 import type { BtcRegime, ExitReason, PositionSide, TradeOutcome } from "../lib/adaptiveEngine";
 import { requireAdminAuthorization } from "../lib/executionSecurity";
+import { loadClosedTrades, type DemoClosedTrade } from "../lib/demoTradeStore";
 
 const router = Router();
 
@@ -49,19 +50,89 @@ function mergeOutcomes(primary: TradeOutcome[], secondary: TradeOutcome[]): Trad
   return Array.from(byId.values()).sort((a, b) => b.exitTime - a.exitTime);
 }
 
+function withDeadline<T>(promise: Promise<T>, fallback: T, timeoutMs: number): Promise<T> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(fallback), timeoutMs);
+    promise
+      .then((value) => resolve(value))
+      .catch(() => resolve(fallback))
+      .finally(() => clearTimeout(timer));
+  });
+}
+
+function demoClosedTradeToOutcome(trade: DemoClosedTrade): TradeOutcome {
+  return {
+    id: `demo-ledger:${trade.tradeId}`,
+    isDemo: true,
+    source: "bingx-vst",
+    sourceType: "demo",
+    entryOrderId: trade.orderId,
+    exitOrderId: trade.exitOrderId ?? undefined,
+    symbol: trade.symbol,
+    positionSide: trade.positionSide,
+    side: trade.side,
+    entryTime: trade.entryTime,
+    exitTime: trade.exitTime,
+    hourUtc: trade.hourUtc,
+    btcRegime: trade.btcRegime as BtcRegime,
+    entryPrice: trade.entryPrice,
+    exitPrice: trade.exitPrice,
+    qty: trade.qty,
+    leverage: trade.leverage,
+    marginUsed: trade.marginUsed,
+    grossPnl: trade.grossPnl,
+    fee: trade.fee,
+    realizedPnl: trade.realizedPnl,
+    pnlSource: trade.pnlSource,
+    estimated: trade.estimated,
+    expectedEntryPrice: trade.expectedEntryPrice ?? undefined,
+    expectedExitPrice: trade.expectedExitPrice ?? undefined,
+    entrySlippage: trade.entrySlippage,
+    exitSlippage: trade.exitSlippage,
+    totalSlippage: trade.totalSlippage,
+    slippagePctNotional: trade.slippagePctNotional,
+    exitReason: trade.exitReason,
+    expectedTpProfit: trade.marginUsed * trade.leverage * (trade.tpPct / 100),
+    mfe: trade.mfe,
+    mae: trade.mae,
+    holdDurationMs: trade.holdDurationMs,
+    modelVersion: trade.modelVersion,
+    signalId: trade.signalId,
+    marketEventId: trade.marketEventId ?? undefined,
+    predictionId: trade.predictionId ?? undefined,
+    campaignId: trade.campaignId,
+    clientOrderId: trade.clientOrderId,
+    exchangeOrderId: trade.orderId,
+    featureVersion: trade.featureVersion ?? undefined,
+  };
+}
+
+function isCampaignAggregateAlreadyCovered(outcome: TradeOutcome, ledgerCampaignIds: Set<string>): boolean {
+  const campaignId = outcome.campaignId
+    ?? (outcome.id.startsWith("campaign:") ? outcome.id.slice("campaign:".length) : "");
+  return Boolean(campaignId && ledgerCampaignIds.has(campaignId) && outcome.id.startsWith("campaign:"));
+}
+
 export async function buildTelemetryState(source: TelemetrySourceFilter = "all") {
   const engine = getEngine();
-  const [quantTradeSummary, quantRecentTrades] = await Promise.all([
-    getQuantBrainTradeSummary(),
-    getQuantBrainRecentTrades(source, 500),
+  const qbDeadlineMs = 350;
+  const [quantTradeSummary, quantRecentTrades, closedDemoTrades] = await Promise.all([
+    withDeadline(getQuantBrainTradeSummary(), null, qbDeadlineMs),
+    withDeadline(getQuantBrainRecentTrades(source, 500), [], qbDeadlineMs),
+    source === "live" ? Promise.resolve([]) : loadClosedTrades(2_000),
   ]);
+  const ledgerOutcomes = closedDemoTrades.map(demoClosedTradeToOutcome);
+  const ledgerCampaignIds = new Set(closedDemoTrades.map((trade) => trade.campaignId).filter(Boolean));
   const localOutcomes = engine.rawOutcomes()
     .slice()
     .sort((a, b) => b.exitTime - a.exitTime)
-    .filter((outcome) => outcomeMatchesSource(outcome, source));
+    .filter((outcome) => outcomeMatchesSource(outcome, source))
+    .filter((outcome) => !isCampaignAggregateAlreadyCovered(outcome, ledgerCampaignIds));
   const outcomes = mergeOutcomes(
-    localOutcomes,
-    quantRecentTrades.filter((outcome) => outcomeMatchesSource(outcome, source)),
+    mergeOutcomes(ledgerOutcomes, localOutcomes),
+    quantRecentTrades
+      .filter((outcome) => outcomeMatchesSource(outcome, source))
+      .filter((outcome) => !isCampaignAggregateAlreadyCovered(outcome, ledgerCampaignIds)),
   );
   const recentOutcomes = outcomes.slice(0, 500);
 
@@ -219,11 +290,20 @@ router.get("/telemetry/rank", (req: Request, res: Response) => {
 
 /** GET /api/telemetry/export — raw JSONL export of all outcomes */
 router.get("/telemetry/export", async (_req: Request, res: Response) => {
-  const [localOutcomes, quantRecentTrades] = await Promise.all([
+  const qbDeadlineMs = 500;
+  const [localOutcomes, closedDemoTrades, quantRecentTrades] = await Promise.all([
     Promise.resolve(exportAllOutcomes()),
-    getQuantBrainRecentTrades("all", 2_000),
+    loadClosedTrades(2_000),
+    withDeadline(getQuantBrainRecentTrades("all", 2_000), [], qbDeadlineMs),
   ]);
-  res.json(mergeOutcomes(localOutcomes, quantRecentTrades));
+  const ledgerCampaignIds = new Set(closedDemoTrades.map((trade) => trade.campaignId).filter(Boolean));
+  res.json(mergeOutcomes(
+    mergeOutcomes(
+      closedDemoTrades.map(demoClosedTradeToOutcome),
+      localOutcomes.filter((outcome) => !isCampaignAggregateAlreadyCovered(outcome, ledgerCampaignIds)),
+    ),
+    quantRecentTrades.filter((outcome) => !isCampaignAggregateAlreadyCovered(outcome, ledgerCampaignIds)),
+  ));
 });
 
 /**
