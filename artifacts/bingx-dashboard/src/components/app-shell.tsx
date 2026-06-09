@@ -27,6 +27,7 @@ import {
   FlaskConical,
   BrainCircuit,
   Target,
+  Dna,
 } from "lucide-react";
 
 const NAV = [
@@ -38,6 +39,7 @@ const NAV = [
   { href: "/bot", label: "Bot", icon: Bot },
   { href: "/demo", label: "Demo Lab", icon: FlaskConical, highlight: true },
   { href: "/trigger", label: "Gatilho", icon: Target, highlight: true },
+  { href: "/neural", label: "Neural", icon: Dna, highlight: true },
   { href: "/settings", label: "Settings", icon: Settings },
 ];
 

@@ -13,6 +13,7 @@ import BotPage from "@/pages/bot";
 import DemoPage from "@/pages/demo";
 import IntelligencePage from "@/pages/intelligence";
 import TriggerPage from "@/pages/trigger";
+import NeuralPage from "@/pages/neural";
 
 const queryClient = new QueryClient();
 
@@ -28,6 +29,7 @@ function Router() {
       <Route path="/bot" component={BotPage} />
       <Route path="/demo" component={DemoPage} />
       <Route path="/trigger" component={TriggerPage} />
+      <Route path="/neural" component={NeuralPage} />
       <Route path="/settings" component={SettingsPage} />
       <Route component={NotFound} />
     </Switch>

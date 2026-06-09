@@ -14,6 +14,7 @@ import incidentsRouter from "./incidents";
 import sniperGovernanceRouter from "./sniperGovernance";
 import policyRouter from "./policy";
 import triggerRouter from "./trigger";
+import neuralRouter from "./neural";
 
 const router: IRouter = Router();
 
@@ -32,5 +33,6 @@ router.use(incidentsRouter);
 router.use(sniperGovernanceRouter);
 router.use(policyRouter);
 router.use(triggerRouter);
+router.use(neuralRouter);
 
 export default router;
