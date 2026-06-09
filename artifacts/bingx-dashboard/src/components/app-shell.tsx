@@ -27,13 +27,6 @@ import {
   FlaskConical,
   BrainCircuit,
 } from "lucide-react";
-import {
-  Area,
-  AreaChart,
-  ReferenceLine,
-  ResponsiveContainer,
-  YAxis,
-} from "recharts";
 
 const NAV = [
   { href: "/dashboard", label: "Overview", icon: LayoutDashboard },
@@ -59,50 +52,53 @@ function MiniRiskChart({
   const absChange = Math.max(Math.abs(changePct), 0.2);
   const base = 100;
 
-  const data = [
-    { v: base - direction * absChange * 0.55 },
-    { v: base - direction * absChange * 0.30 },
-    { v: base - direction * absChange * 0.10 },
-    { v: base + direction * absChange * 0.08 },
-    { v: base + direction * absChange * 0.22 },
-    { v: base + direction * absChange * 0.50 },
-    { v: base + direction * absChange * 0.72 },
-    { v: base + direction * absChange * 0.88 },
-    { v: base + direction * absChange },
+  const raw = [
+    base - direction * absChange * 0.55,
+    base - direction * absChange * 0.30,
+    base - direction * absChange * 0.10,
+    base + direction * absChange * 0.08,
+    base + direction * absChange * 0.22,
+    base + direction * absChange * 0.50,
+    base + direction * absChange * 0.72,
+    base + direction * absChange * 0.88,
+    base + direction * absChange,
   ];
 
-  const strokeColor = isToxic
-    ? "#f87171"
-    : isLong
-    ? "#4ade80"
-    : "#fb7185";
+  const minV = Math.min(...raw);
+  const maxV = Math.max(...raw);
+  const range = maxV - minV || 1;
+  const W = 100;
+  const H = 36;
+  const pad = 2;
 
-  const gradId = `grad-${isToxic ? "toxic" : isLong ? "long" : "short"}`;
-  const domainPad = absChange * 1.1;
+  const points = raw
+    .map((v, i) => {
+      const x = pad + (i / (raw.length - 1)) * (W - pad * 2);
+      const y = H - pad - ((v - minV) / range) * (H - pad * 2);
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    })
+    .join(" ");
+
+  const color = isToxic ? "#f87171" : isLong ? "#4ade80" : "#fb7185";
 
   return (
     <div className="relative h-9 flex-1 min-w-0">
-      <ResponsiveContainer width="100%" height="100%">
-        <AreaChart data={data} margin={{ top: 2, right: 1, bottom: 1, left: 1 }}>
-          <defs>
-            <linearGradient id={gradId} x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stopColor={strokeColor} stopOpacity={0.25} />
-              <stop offset="100%" stopColor={strokeColor} stopOpacity={0.02} />
-            </linearGradient>
-          </defs>
-          <YAxis domain={[base - domainPad, base + domainPad]} hide />
-          <ReferenceLine y={base} stroke="rgba(255,255,255,0.08)" strokeDasharray="2 3" />
-          <Area
-            type="monotoneX"
-            dataKey="v"
-            stroke={strokeColor}
-            strokeWidth={1.8}
-            fill={`url(#${gradId})`}
-            dot={false}
-            isAnimationActive={false}
-          />
-        </AreaChart>
-      </ResponsiveContainer>
+      <svg
+        width="100%"
+        height="100%"
+        viewBox={`0 0 ${W} ${H}`}
+        preserveAspectRatio="none"
+        style={{ display: "block" }}
+      >
+        <polyline
+          points={points}
+          fill="none"
+          stroke={color}
+          strokeWidth="2.2"
+          strokeLinejoin="round"
+          strokeLinecap="round"
+        />
+      </svg>
     </div>
   );
 }
