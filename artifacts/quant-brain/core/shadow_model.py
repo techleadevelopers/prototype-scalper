@@ -731,6 +731,13 @@ def predict_shadow(row: dict[str, Any]) -> dict[str, Any]:
                     "simulatedWinRate": simulated_win_rate,
                     "breakevenWinRate": breakeven_win_rate,
                     "profitabilityVerified": profitability_verified,
+                    "samples": int(meta.get("samples", 0) or 0),
+                    "trainSamples": int(meta.get("trainSamples", 0) or 0),
+                    "testSamples": int(meta.get("testSamples", 0) or 0),
+                    "modelBrier": float(meta.get("modelBrier", 1.0)),
+                    "baselineBrier": float(meta.get("baselineBrier", 1.0)),
+                    "rocAuc": float(meta.get("rocAuc", 0.5)),
+                    "kellyFraction": float(meta.get("kellyFraction", 0.0)),
                     "isAboveOptimalThreshold": calibrated >= optimal_threshold,
                     "recommendation": (
                         "ALLOW" if calibrated >= optimal_threshold
