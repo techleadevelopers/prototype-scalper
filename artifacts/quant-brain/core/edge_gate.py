@@ -10,6 +10,7 @@ from typing import Any
 from core.movement_sniper import evaluate_sniper_window
 from core import knowledge_base as kb
 from core.recommendation import recommend_entry
+from core.async_utils import run_blocking
 from core.signal_learning import (
     finalize_due_signal_outcomes,
     record_signal_from_gate,
@@ -492,7 +493,8 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
     alt_history = get_snapshot_history(symbol, 900)
     btc_history = get_snapshot_history("BTC-USDT", 900)
     target_moves_pct = _target_moves(config)
-    sniper = evaluate_sniper_window(
+    sniper = await run_blocking(
+        evaluate_sniper_window,
         symbol, alt_history, btc_history, target_moves_pct=target_moves_pct
     )
     signal_metadata = {
@@ -513,11 +515,11 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
         metadata=signal_metadata,
     )
     signal_id = signal_memory["signalId"]
-    signal_edge = await score_signal_context(
-        symbol, signal_memory["side"], signal_memory["contextKey"]
+    signal_edge, news_context, operational_risk = await asyncio.gather(
+        score_signal_context(symbol, signal_memory["side"], signal_memory["contextKey"]),
+        kb.get_active_news_context(symbol),
+        kb.get_operational_risk_metrics(hours=24),
     )
-    news_context = await kb.get_active_news_context(symbol)
-    operational_risk = await kb.get_operational_risk_metrics(hours=24)
 
     data_quality = {
         "alt1m":  sniper["altTimeframes"]["1m"],
@@ -549,18 +551,21 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
     ev_samples = int(effective_stats.get("samples", 0))
 
     # ── Shadow ML ────────────────────────────────────────────────────────────
-    shadow_ml = predict_shadow({
-        "symbol": symbol,
-        "side": signal_memory["side"],
-        "context_key": signal_memory["contextKey"],
-        "target_configured_move_pct": target_moves_pct["configured"],
-        "estimated_cost_pct": cost_pct,
-        "features": {
-            "alt": sniper["altFeatures"],
-            "btc": sniper["btcFeatures"],
-            "alt_timeframes": sniper["altTimeframes"],
+    shadow_ml = await run_blocking(
+        predict_shadow,
+        {
+            "symbol": symbol,
+            "side": signal_memory["side"],
+            "context_key": signal_memory["contextKey"],
+            "target_configured_move_pct": target_moves_pct["configured"],
+            "estimated_cost_pct": cost_pct,
+            "features": {
+                "alt": sniper["altFeatures"],
+                "btc": sniper["btcFeatures"],
+                "alt_timeframes": sniper["altTimeframes"],
+            },
         },
-    })
+    )
 
     # ── Realized edge recommendation ─────────────────────────────────────────
     recommendation = await recommend_entry({
