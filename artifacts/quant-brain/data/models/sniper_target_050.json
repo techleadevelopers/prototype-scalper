@@ -1,0 +1,100 @@
+{
+  "trainedAt": 1780887191.2125359,
+  "samples": 422,
+  "trainSamples": 337,
+  "testSamples": 85,
+  "modelBrier": 0.130273,
+  "baselineBrier": 0.153786,
+  "modelLogLoss": 0.420887,
+  "rocAuc": 0.80933,
+  "improvesBaseline": true,
+  "authority": "shadow_ensemble",
+  "target": "0.5",
+  "cvResults": {
+    "success": true,
+    "n_folds": 4,
+    "avg_brier": 0.191865,
+    "avg_auc": 0.693185,
+    "results": [
+      {
+        "fold": 0,
+        "train_samples": 84,
+        "test_samples": 84,
+        "brier": 0.265521,
+        "auc": 0.620339
+      },
+      {
+        "fold": 1,
+        "train_samples": 168,
+        "test_samples": 84,
+        "brier": 0.265252,
+        "auc": 0.545085
+      },
+      {
+        "fold": 2,
+        "train_samples": 252,
+        "test_samples": 84,
+        "brier": 0.108233,
+        "auc": 0.828571
+      },
+      {
+        "fold": 3,
+        "train_samples": 336,
+        "test_samples": 84,
+        "brier": 0.128456,
+        "auc": 0.778744
+      }
+    ]
+  },
+  "topFeatures": [
+    "alt_atr_pct",
+    "side=LONG",
+    "alt_price_acceleration",
+    "side=SHORT",
+    "btc_atr_pct",
+    "alt_funding_rate",
+    "alt_oi_change_pct",
+    "alt_1m_emaDistancePct",
+    "alt_1m_wickRatio",
+    "btc_price_acceleration"
+  ],
+  "optimalThreshold": 0.5,
+  "expectedValuePct": -0.228,
+  "profitabilityVerified": false,
+  "simulatedWinRate": 0.6,
+  "baselineEvPct": -0.545059,
+  "breakevenWinRate": 0.8961,
+  "optimalEdgeVsBreakeven": -0.2961,
+  "kellyFraction": 0.0,
+  "optimalCoverage": 11.76,
+  "profitabilityThresholdScan": [
+    {
+      "threshold": 0.5,
+      "nTrades": 10,
+      "winRate": 0.6,
+      "avgEvPct": -0.228,
+      "coveragePct": 11.76,
+      "breakevenWinRate": 0.8961,
+      "edgeVsBreakeven": -0.2961
+    }
+  ],
+  "dataQuality": {
+    "score": 85,
+    "n": 422,
+    "winRate": 0.2133,
+    "contextDiversity": 73,
+    "symbols": 9,
+    "spanHours": 23.68,
+    "regimeCompleteness": 0.0,
+    "notes": []
+  },
+  "datasetFingerprint": "8fd3c3639638e8dab6f37b4803421a869cfec413889c261266f8fee2f55d1409",
+  "featureLabelVersions": {
+    "legacy|price-window-v1": 405,
+    "sniper-v2|price-window-v1": 18
+  },
+  "labelAvailabilityPurged": 1,
+  "validation": "purged_chronological_holdout_with_walk_forward",
+  "governanceCandidateId": "ml-challenger-59046bfddfe9248b",
+  "artifactSha256": "59046bfddfe9248bde8fc966ca12ae83e31532fbd1def7d091bb62f9da957538"
+}
