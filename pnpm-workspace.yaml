@@ -37,6 +37,7 @@ minimumReleaseAgeExclude:
   - stripe-replit-sync
 
 onlyBuiltDependencies:
+  - '@pnpm/exe'
   - '@swc/core'
   - esbuild
   - msw
