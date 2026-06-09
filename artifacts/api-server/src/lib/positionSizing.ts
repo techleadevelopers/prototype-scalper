@@ -30,6 +30,13 @@ export interface PositionSizingInput {
   availableMargin: number;
   aggressiveScore: number;
   calibratedScore?: number;
+  calibratedProbability?: number | null;
+  expectedValuePct?: number | null;
+  optimalThreshold?: number | null;
+  profitabilityVerified?: boolean;
+  kellyFraction?: number | null;
+  mlSizingMultiplier?: number | null;
+  btcRegime?: BtcRegime;
   coachRank?: number;
   rotationState?: SymbolRotationState;
   aggressionState?: "DEFENSIVE" | "NORMAL" | "AGGRESSIVE" | "SNIPER";
@@ -51,6 +58,7 @@ export interface PositionSizingInput {
   baseMarginFallback?: number;
   leverageFallback?: number;
   stopLossPct?: number;
+  takeProfitPct?: number;
   config?: Partial<PositionSizingConfig>;
 }
 
@@ -137,6 +145,15 @@ function initialTier(score: number, rotationState?: SymbolRotationState, slippag
   return score >= 0.62 ? "BASE" : "SCOUT";
 }
 
+function impliedKellyFraction(input: PositionSizingInput, probability: number): number {
+  if (Number.isFinite(input.kellyFraction ?? NaN)) return Math.max(0, input.kellyFraction!);
+  const takeProfitPct = Math.max(0.01, input.takeProfitPct ?? 0.15);
+  const stopLossPct = Math.max(0.01, input.stopLossPct ?? 0.1);
+  const payoffRatio = takeProfitPct / stopLossPct;
+  if (payoffRatio <= 0) return 0;
+  return Math.max(0, (payoffRatio * probability - (1 - probability)) / payoffRatio);
+}
+
 function shiftTier(tier: PositionRiskTier, delta: number): PositionRiskTier {
   const tiers: PositionRiskTier[] = ["MICRO", "SCOUT", "BASE", "BOOST", "AGGRESSIVE", "MAX_SNIPER"];
   return tiers[clamp(tiers.indexOf(tier) + delta, 0, tiers.length - 1)];
@@ -153,6 +170,11 @@ export function calculatePositionSizing(input: PositionSizingInput): PositionSiz
   const gateRejects: string[] = [];
   const reasons: string[] = [];
   const sizingScore = clamp(input.calibratedScore ?? input.aggressiveScore, 0, 1);
+  const mlProbability = input.calibratedProbability === null || input.calibratedProbability === undefined
+    ? null
+    : clamp(input.calibratedProbability, 0, 1);
+  const expectedValuePct = Number.isFinite(input.expectedValuePct ?? NaN) ? input.expectedValuePct! : null;
+  const optimalThreshold = clamp(input.optimalThreshold ?? 0.60, 0, 1);
 
   if (!cfg.enabled) {
     const margin = Math.max(cfg.minMargin, input.baseMarginFallback ?? baseMargin);
@@ -165,6 +187,37 @@ export function calculatePositionSizing(input: PositionSizingInput): PositionSiz
   }
   if (input.calibratedScore !== undefined && Math.abs(input.calibratedScore - input.aggressiveScore) >= 0.03) {
     reasons.push("score_calibrated");
+  }
+  if (mlProbability !== null) {
+    if (expectedValuePct !== null && expectedValuePct <= 0 && input.profitabilityVerified) {
+      return buildDecision("NO_TRADE", 0, 0, leverage, stopLossPct, baseMargin, false, ["ml_negative_ev"], ["ML_EV_REJECT"], equity, openPositions, input);
+    }
+    if (mlProbability < optimalThreshold - 0.04) {
+      tier = shiftTier(tier, -2);
+      reasons.push("ml_probability_below_threshold");
+    } else if (
+      expectedValuePct !== null
+      && expectedValuePct > 0
+      && expectedValuePct < envNum("ML_MICRO_EV_PCT", 0.001)
+    ) {
+      tier = "MICRO";
+      reasons.push("ml_marginal_positive_ev_micro");
+    } else if (
+      input.profitabilityVerified
+      && expectedValuePct !== null
+      && expectedValuePct >= envNum("ML_MAX_SNIPER_EV_PCT", 0.0015)
+      && mlProbability >= optimalThreshold + envNum("ML_MAX_SNIPER_PROB_BUFFER", 0.06)
+    ) {
+      tier = "MAX_SNIPER";
+      reasons.push("ml_verified_kelly_edge");
+    } else if (
+      expectedValuePct !== null
+      && expectedValuePct > 0
+      && mlProbability >= optimalThreshold + envNum("ML_BOOST_PROB_BUFFER", 0.03)
+    ) {
+      tier = shiftTier(tier, 1);
+      reasons.push("ml_positive_edge_boost");
+    }
   }
 
   if (input.rotationState === "HOT") reasons.push("hot_symbol");
@@ -211,6 +264,20 @@ export function calculatePositionSizing(input: PositionSizingInput): PositionSiz
   }
 
   let multiplier = TIER_MULTIPLIER[tier];
+  if (mlProbability !== null) {
+    const kellyCap = envNum("ML_KELLY_FRACTION_CAP", 0.25);
+    const fractionalKelly = clamp(impliedKellyFraction(input, mlProbability), 0, kellyCap);
+    const kellyMultiplier = clamp(0.25 + (fractionalKelly / Math.max(kellyCap, 0.000001)) * 1.75, 0.25, 2.0);
+    const economicMultiplier = clamp(input.mlSizingMultiplier ?? kellyMultiplier, 0.1, 2.0);
+    multiplier = Math.min(multiplier, Math.max(kellyMultiplier, economicMultiplier));
+    if (fractionalKelly <= envNum("ML_MICRO_KELLY_FRACTION", 0.02)) {
+      tier = "MICRO";
+      multiplier = Math.min(multiplier, TIER_MULTIPLIER.MICRO);
+      reasons.push("kelly_micro");
+    } else {
+      reasons.push(`kelly_fraction_${round(fractionalKelly, 4)}`);
+    }
+  }
   let margin = baseMargin * multiplier;
   const previous = input.previousEntryMargin;
   if (depth > 1 && previous !== undefined && (input.campaignPnl ?? 0) <= 0 && margin > previous) {
