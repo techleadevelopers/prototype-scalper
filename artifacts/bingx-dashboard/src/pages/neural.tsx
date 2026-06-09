@@ -32,7 +32,7 @@ async function qbGet(path: string) {
   return res.json();
 }
 
-const SYMBOLS = ["BTC", "ETH", "SOL", "VVV", "TRUMP", "MELANIA", "BEAT", "NEAR", "HYPE", "POL"];
+// SYMBOLS is now driven by SCALP_SYMBOLS env via /api/bot/config
 
 function pct(v: number | undefined | null, digits = 1) {
   if (v == null || isNaN(v)) return "—";
@@ -83,16 +83,33 @@ function QBStatus() {
   );
 }
 
-// ── Shadow ML card ────────────────────────────────────────────────────────────
+// ── Shadow ML + Win Rate consolidado ──────────────────────────────────────────
 
-function ShadowMLCard() {
-  const { data, isLoading } = useQuery({
+function ShadowMLAndWinRate() {
+  // Shadow ML status
+  const { data: shadowData, isLoading: shadowLoading } = useQuery({
     queryKey: ["neural-shadow-status"],
     queryFn: () => qbGet("/api/neural/models/sniper/status"),
     refetchInterval: 60_000,
   });
 
-  const status = (data as any) ?? {};
+  // KB stats (win rate por símbolo)
+  const { data: kbData, isLoading: kbLoading } = useQuery({
+    queryKey: ["neural-kb-stats"],
+    queryFn: () => qbGet("/api/neural/kb/stats"),
+    refetchInterval: 60_000,
+  });
+
+  // SCALP_SYMBOLS via bot config
+  const { data: cfgData } = useQuery({
+    queryKey: ["bot-config-symbols"],
+    queryFn: () => fetch(apiUrl("/api/bot/config"), { credentials: "include" }).then((r) => r.json()),
+    refetchInterval: 120_000,
+    staleTime: 60_000,
+  });
+
+  // ── Shadow ML fields ──
+  const status = (shadowData as any) ?? {};
   const available = status.available ?? status.trained ?? false;
   const samples = status.samples ?? status.n_samples ?? 0;
   const brier = status.modelBrier ?? status.brier ?? null;
@@ -100,12 +117,41 @@ function ShadowMLCard() {
   const lastTrain = status.trained_at ?? status.trainedAt ?? null;
   const topFeatures: string[] = status.topFeatures ?? [];
   const improves = brier != null && brier < baselineBrier;
-
   const brierPct = brier != null ? Math.round((1 - brier / 0.25) * 100) : 0;
 
+  // ── Win Rate rows filtered to SCALP_SYMBOLS ──
+  const rawAllowed: string[] = (cfgData as any)?.allowedSymbols ?? [];
+  const allowedSymbols: string[] =
+    rawAllowed.length > 0
+      ? rawAllowed.map((s) => s.replace("-USDT", "").replace("USDT", ""))
+      : [];
+
+  const stats: any[] = Array.isArray(kbData) ? kbData : [];
+
+  const rows = allowedSymbols
+    .map((sym) => {
+      const entry = stats.find(
+        (s: any) =>
+          (s.symbol ?? "").replace("-USDT", "").replace("USDT", "") === sym
+      );
+      const long = entry?.sides?.LONG ?? entry?.sides?.long ?? {};
+      const short = entry?.sides?.SHORT ?? entry?.sides?.short ?? {};
+      return {
+        sym,
+        longWR: long.win_rate ?? null,
+        longTrades: long.trades ?? 0,
+        shortWR: short.win_rate ?? null,
+        shortTrades: short.trades ?? 0,
+        totalTrades: (long.trades ?? 0) + (short.trades ?? 0),
+      };
+    })
+    .sort((a, b) => b.totalTrades - a.totalTrades);
+
   return (
-    <Card className="border border-violet-500/20 bg-gradient-to-br from-violet-950/40 via-background to-background shadow-lg shadow-violet-900/10">
-      <CardContent className="p-4 space-y-3">
+    <Card className="border border-violet-500/20 bg-gradient-to-br from-violet-950/30 via-background to-background shadow-lg shadow-violet-900/10">
+      <CardContent className="p-4 space-y-4">
+
+        {/* ── Shadow ML header ── */}
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
             <div className="p-1.5 rounded-lg bg-violet-500/15">
@@ -121,105 +167,87 @@ function ShadowMLCard() {
           </Badge>
         </div>
 
-        {isLoading ? (
-          <div className="space-y-2">
-            <Skeleton className="h-4 w-full" />
-            <Skeleton className="h-4 w-3/4" />
+        {/* ── Shadow ML metrics ── */}
+        {shadowLoading ? (
+          <div className="grid grid-cols-3 gap-2">
+            {Array.from({ length: 3 }).map((_, i) => <Skeleton key={i} className="h-14 w-full rounded-lg" />)}
           </div>
         ) : (
-          <>
-            <div className="grid grid-cols-2 gap-3">
-              <div className="rounded-lg bg-muted/20 p-2.5">
-                <p className="text-[10px] text-muted-foreground mb-0.5">Amostras</p>
-                <p className="text-lg font-mono font-bold text-foreground">{samples.toLocaleString()}</p>
-                <p className="text-[9px] text-muted-foreground">mín. 300 p/ treinar</p>
-              </div>
-              <div className="rounded-lg bg-muted/20 p-2.5">
-                <p className="text-[10px] text-muted-foreground mb-0.5">Brier Score</p>
-                <p className={`text-lg font-mono font-bold ${brier != null ? (improves ? "text-green-400" : "text-amber-400") : "text-muted-foreground"}`}>
-                  {brier != null ? brier.toFixed(4) : "—"}
-                </p>
-                <p className="text-[9px] text-muted-foreground">ref. aleat. = 0.25</p>
-              </div>
+          <div className="grid grid-cols-3 gap-2">
+            <div className="rounded-lg bg-muted/20 p-2.5">
+              <p className="text-[9px] text-muted-foreground mb-0.5">Amostras</p>
+              <p className="text-base font-mono font-bold text-foreground">{samples.toLocaleString()}</p>
+              <p className="text-[9px] text-muted-foreground">mín. 300</p>
             </div>
-
-            {brier != null && (
-              <div className="space-y-1">
-                <div className="flex justify-between text-[10px]">
-                  <span className="text-muted-foreground">Melhoria vs aleatório</span>
-                  <span className={improves ? "text-green-400 font-mono" : "text-amber-400 font-mono"}>
-                    {improves ? `+${brierPct}%` : "~0%"}
-                  </span>
-                </div>
-                <Progress value={Math.max(0, Math.min(100, brierPct))} className="h-1.5 bg-muted/30" />
-              </div>
-            )}
-
-            {topFeatures.length > 0 && (
-              <div className="space-y-1.5">
-                <p className="text-[10px] text-muted-foreground uppercase tracking-wider">Top features</p>
-                {topFeatures.slice(0, 5).map((f) => (
-                  <div key={f} className="flex items-center gap-2">
-                    <span className="w-2 h-2 rounded-sm bg-violet-500/40 shrink-0" />
-                    <span className="text-[10px] font-mono text-foreground/70 truncate">{f}</span>
-                  </div>
-                ))}
-              </div>
-            )}
-
-            <p className="text-[10px] text-muted-foreground">
-              Último treino: <span className="text-foreground/60 font-mono">{timeAgo(lastTrain)}</span>
-            </p>
-          </>
-        )}
-      </CardContent>
-    </Card>
-  );
-}
-
-// ── Win Rate matrix ───────────────────────────────────────────────────────────
-
-function WinRateMatrix() {
-  const { data, isLoading } = useQuery({
-    queryKey: ["neural-kb-stats"],
-    queryFn: () => qbGet("/api/neural/kb/stats"),
-    refetchInterval: 60_000,
-  });
-
-  const stats: any[] = Array.isArray(data) ? data : [];
-
-  const rows = SYMBOLS.map((sym) => {
-    const entry = stats.find((s: any) => (s.symbol ?? "").replace("-USDT", "") === sym);
-    const long = entry?.sides?.LONG ?? entry?.sides?.long ?? {};
-    const short = entry?.sides?.SHORT ?? entry?.sides?.short ?? {};
-    return {
-      sym,
-      longWR: long.win_rate ?? null,
-      longTrades: long.trades ?? 0,
-      shortWR: short.win_rate ?? null,
-      shortTrades: short.trades ?? 0,
-      totalTrades: (long.trades ?? 0) + (short.trades ?? 0),
-    };
-  }).sort((a, b) => b.totalTrades - a.totalTrades);
-
-  return (
-    <Card className="border border-border/30 bg-background/60">
-      <CardContent className="p-4">
-        <div className="flex items-center gap-2 mb-4">
-          <div className="p-1.5 rounded-lg bg-blue-500/15">
-            <BarChart2 className="h-4 w-4 text-blue-400" />
+            <div className="rounded-lg bg-muted/20 p-2.5">
+              <p className="text-[9px] text-muted-foreground mb-0.5">Brier Score</p>
+              <p className={`text-base font-mono font-bold ${brier != null ? (improves ? "text-green-400" : "text-amber-400") : "text-muted-foreground"}`}>
+                {brier != null ? brier.toFixed(4) : "—"}
+              </p>
+              <p className="text-[9px] text-muted-foreground">ref. = 0.25</p>
+            </div>
+            <div className="rounded-lg bg-muted/20 p-2.5">
+              <p className="text-[9px] text-muted-foreground mb-0.5">Melhoria</p>
+              <p className={`text-base font-mono font-bold ${improves ? "text-green-400" : "text-muted-foreground"}`}>
+                {brier != null ? (improves ? `+${brierPct}%` : "~0%") : "—"}
+              </p>
+              <p className="text-[9px] text-muted-foreground">{timeAgo(lastTrain)}</p>
+            </div>
           </div>
-          <span className="text-[12px] font-bold text-foreground/80 uppercase tracking-wider">Win Rate por Símbolo</span>
-          <span className="text-[10px] text-muted-foreground ml-auto">últimos 30 dias</span>
+        )}
+
+        {/* Brier progress bar */}
+        {brier != null && (
+          <Progress value={Math.max(0, Math.min(100, brierPct))} className="h-1 bg-muted/30" />
+        )}
+
+        {/* Top features inline */}
+        {topFeatures.length > 0 && (
+          <div className="flex flex-wrap gap-1.5">
+            {topFeatures.slice(0, 6).map((f) => (
+              <span key={f} className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-violet-500/10 text-violet-300/70 border border-violet-500/15">
+                {f}
+              </span>
+            ))}
+          </div>
+        )}
+
+        {/* ── Divider ── */}
+        <div className="flex items-center gap-2">
+          <div className="h-px flex-1 bg-border/20" />
+          <div className="flex items-center gap-1.5">
+            <BarChart2 className="h-3 w-3 text-blue-400" />
+            <span className="text-[10px] font-bold text-foreground/60 uppercase tracking-wider">Win Rate por Símbolo</span>
+            <span className="text-[9px] text-muted-foreground/50">
+              {allowedSymbols.length > 0
+                ? `${allowedSymbols.length} ativos · SCALP_SYMBOLS`
+                : "aguardando config"}
+            </span>
+          </div>
+          <div className="h-px flex-1 bg-border/20" />
         </div>
 
-        {isLoading ? (
-          <div className="space-y-2">{Array.from({ length: 5 }).map((_, i) => <Skeleton key={i} className="h-8 w-full" />)}</div>
+        {/* ── Win Rate rows ── */}
+        {kbLoading || !cfgData ? (
+          <div className="space-y-2">
+            {Array.from({ length: 4 }).map((_, i) => <Skeleton key={i} className="h-8 w-full" />)}
+          </div>
+        ) : allowedSymbols.length === 0 ? (
+          <div className="text-center py-4 text-muted-foreground">
+            <p className="text-[11px]">SCALP_SYMBOLS não configurado</p>
+            <p className="text-[10px] mt-1 opacity-60">Defina a variável de ambiente SCALP_SYMBOLS</p>
+          </div>
         ) : (
           <div className="space-y-2">
             {rows.map(({ sym, longWR, longTrades, shortWR, shortTrades }) => (
-              <div key={sym} className="grid grid-cols-[56px_1fr_1fr] gap-2 items-center">
-                <span className="text-[11px] font-mono font-bold text-foreground/80">{sym}</span>
+              <div key={sym} className="grid grid-cols-[52px_1fr_1fr] gap-2 items-center">
+                <div className="flex items-center gap-1">
+                  <span className="text-[11px] font-mono font-bold text-foreground/80">{sym}</span>
+                  {/* ML dot: violet if model trained and has data */}
+                  {available && (longTrades + shortTrades) > 0 && (
+                    <span className="w-1.5 h-1.5 rounded-full bg-violet-400/60 shrink-0" title="Shadow ML ativo" />
+                  )}
+                </div>
                 {/* LONG */}
                 <div className="space-y-0.5">
                   <div className="flex justify-between text-[9px]">
@@ -254,6 +282,7 @@ function WinRateMatrix() {
             ))}
           </div>
         )}
+
       </CardContent>
     </Card>
   );
@@ -579,11 +608,8 @@ export default function NeuralPage() {
         {/* Learning Metrics */}
         <LearningMetrics key={`metrics-${refreshKey}`} />
 
-        {/* Shadow ML + Win Rate side-by-side */}
-        <div className="grid grid-cols-1 lg:grid-cols-[340px_1fr] gap-4">
-          <ShadowMLCard key={`shadow-${refreshKey}`} />
-          <WinRateMatrix key={`wr-${refreshKey}`} />
-        </div>
+        {/* Shadow ML + Win Rate consolidado */}
+        <ShadowMLAndWinRate key={`shadow-wr-${refreshKey}`} />
 
         {/* Edge Evolution */}
         <EdgeEvolution key={`edge-${refreshKey}`} />
