@@ -80,20 +80,44 @@ function sourceObserved(sources: unknown, sourceType: string) {
   return Number(record?.[sourceType] ?? record?.shadow ?? 0);
 }
 
+const COIN_ICON_URLS: Record<string, string> = {
+  BTC: "https://assets.coingecko.com/coins/images/1/small/bitcoin.png",
+  ETH: "https://assets.coingecko.com/coins/images/279/small/ethereum.png",
+  SOL: "https://assets.coingecko.com/coins/images/4128/small/solana.png",
+};
+
+function CoinSymbol({ sym }: { sym: string }) {
+  const icon = COIN_ICON_URLS[sym];
+  return (
+    <span className="flex min-w-0 items-center gap-1.5">
+      {icon && (
+        <img src={icon} alt={`${sym} logo`} className="h-3.5 w-3.5 shrink-0 rounded-full" loading="lazy" />
+      )}
+      <span className="truncate text-[10px] font-mono font-bold text-foreground/80">{sym}</span>
+    </span>
+  );
+}
+
 // ── QB online badge ───────────────────────────────────────────────────────────
 
 function QBStatus() {
-  const { data, isError } = useQuery({
+  const { data, isError, error, isFetching } = useQuery({
     queryKey: ["neural-health"],
     queryFn: () => qbGet("/api/neural/health"),
     refetchInterval: 30_000,
     retry: 1,
   });
-  const online = !isError && Boolean((data as any)?.online ?? data);
+  const d = (data as any) ?? {};
+  const transient = Boolean(d.analysis) || /timeout|abort|analysis|descanso|rest/i.test(String(d.error ?? d.liveError ?? (error as Error | undefined)?.message ?? ""));
+  const online = !isError && Boolean(d.online ?? data);
+  const analyzing = (!online && transient) || Boolean(d.analysis) || (isFetching && !data);
+  const tone = analyzing ? "text-amber-400" : online ? "text-green-400" : "text-red-400";
+  const dot = analyzing ? "bg-amber-400 animate-pulse" : online ? "bg-green-400 animate-pulse" : "bg-red-500";
+  const label = online ? (analyzing ? "QB ANALYSIS" : "QB ONLINE") : analyzing ? "QB ANALYSIS" : "QB OFFLINE";
   return (
-    <div className={`flex items-center gap-1.5 text-[11px] font-mono ${online ? "text-green-400" : "text-red-400"}`}>
-      <span className={`w-1.5 h-1.5 rounded-full ${online ? "bg-green-400 animate-pulse" : "bg-red-500"}`} />
-      {online ? "QB ONLINE" : "QB OFFLINE"}
+    <div className={`flex items-center gap-1.5 text-[11px] font-mono ${tone}`}>
+      <span className={`w-1.5 h-1.5 rounded-full ${dot}`} />
+      {label}
     </div>
   );
 }
@@ -550,17 +574,17 @@ function ShadowMLAndWinRate() {
 
   return (
     <Card className="border border-violet-500/20 bg-gradient-to-br from-violet-950/30 via-background to-background shadow-lg shadow-violet-900/10">
-      <CardContent className="p-4 space-y-4">
+      <CardContent className="p-3 space-y-2.5">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
-            <div className="p-1.5 rounded-lg bg-violet-500/15">
-              <Brain className="h-4 w-4 text-violet-400" />
+            <div className="p-1 rounded-md bg-violet-500/15">
+              <Brain className="h-3.5 w-3.5 text-violet-400" />
             </div>
-            <span className="text-[12px] font-bold text-foreground/80 uppercase tracking-wider">Shadow ML</span>
+            <span className="text-[11px] font-bold text-foreground/80 uppercase tracking-wider">Shadow ML</span>
           </div>
           <Badge
             variant="outline"
-            className={`text-[10px] font-mono border-0 px-2 ${available ? "bg-green-500/15 text-green-400" : "bg-amber-500/15 text-amber-400"}`}
+            className={`text-[9px] font-mono border-0 px-1.5 py-0.5 ${available ? "bg-green-500/15 text-green-400" : "bg-amber-500/15 text-amber-400"}`}
           >
             {available ? "TREINADO" : "PENDENTE"}
           </Badge>
@@ -568,40 +592,40 @@ function ShadowMLAndWinRate() {
 
         {shadowLoading ? (
           <div className="grid grid-cols-3 gap-2">
-            {Array.from({ length: 3 }).map((_, i) => <Skeleton key={i} className="h-14 w-full rounded-lg" />)}
+            {Array.from({ length: 3 }).map((_, i) => <Skeleton key={i} className="h-9 w-full rounded-md" />)}
           </div>
         ) : (
           <div className="grid grid-cols-3 gap-2">
-            <div className="rounded-lg bg-muted/20 p-2.5">
+            <div className="rounded-md bg-muted/20 px-2 py-1.5">
               <p className="text-[9px] text-muted-foreground mb-0.5">Amostras</p>
-              <p className="text-base font-mono font-bold text-foreground">{samples.toLocaleString()}</p>
-              <p className="text-[9px] text-muted-foreground">mín. 300</p>
+              <p className="text-xs font-mono font-bold text-foreground">{samples.toLocaleString()}</p>
+              <p className="text-[8px] text-muted-foreground">min. 300</p>
             </div>
-            <div className="rounded-lg bg-muted/20 p-2.5">
+            <div className="rounded-md bg-muted/20 px-2 py-1.5">
               <p className="text-[9px] text-muted-foreground mb-0.5">Brier Score</p>
-              <p className={`text-base font-mono font-bold ${brier != null ? (improves ? "text-green-400" : "text-amber-400") : "text-muted-foreground"}`}>
+              <p className={`text-xs font-mono font-bold ${brier != null ? (improves ? "text-green-400" : "text-amber-400") : "text-muted-foreground"}`}>
                 {brier != null ? brier.toFixed(4) : "—"}
               </p>
-              <p className="text-[9px] text-muted-foreground">ref. = 0.25</p>
+              <p className="text-[8px] text-muted-foreground">ref. = 0.25</p>
             </div>
-            <div className="rounded-lg bg-muted/20 p-2.5">
+            <div className="rounded-md bg-muted/20 px-2 py-1.5">
               <p className="text-[9px] text-muted-foreground mb-0.5">Melhoria</p>
-              <p className={`text-base font-mono font-bold ${improves ? "text-green-400" : "text-muted-foreground"}`}>
+              <p className={`text-xs font-mono font-bold ${improves ? "text-green-400" : "text-muted-foreground"}`}>
                 {brier != null ? (improves ? `+${brierPct}%` : "~0%") : "—"}
               </p>
-              <p className="text-[9px] text-muted-foreground">{timeAgo(lastTrain)} atrás</p>
+              <p className="text-[8px] text-muted-foreground">{timeAgo(lastTrain)} atras</p>
             </div>
           </div>
         )}
 
         {brier != null && (
-          <Progress value={Math.max(0, Math.min(100, brierPct))} className="h-1 bg-muted/30" />
+          <Progress value={Math.max(0, Math.min(100, brierPct))} className="h-0.5 bg-muted/30" />
         )}
 
         {topFeatures.length > 0 && (
-          <div className="flex flex-wrap gap-1.5">
+          <div className="flex flex-wrap gap-1">
             {topFeatures.slice(0, 6).map((f) => (
-              <span key={f} className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-violet-500/10 text-violet-300/70 border border-violet-500/15">
+              <span key={f} className="text-[8px] font-mono px-1.5 py-0.5 rounded bg-violet-500/10 text-violet-300/70 border border-violet-500/15">
                 {f}
               </span>
             ))}
@@ -613,7 +637,7 @@ function ShadowMLAndWinRate() {
           <div className="h-px flex-1 bg-border/20" />
           <div className="flex items-center gap-1.5">
             <BarChart2 className="h-3 w-3 text-blue-400" />
-            <span className="text-[10px] font-bold text-foreground/60 uppercase tracking-wider">Win Rate por Símbolo</span>
+            <span className="text-[9px] font-bold text-foreground/60 uppercase tracking-wider">Win Rate por Simbolo</span>
             <span className="text-[9px] text-muted-foreground/50">
               {allowedSymbols.length > 0
                 ? `${allowedSymbols.length} ativos · SCALP_SYMBOLS`
@@ -624,25 +648,25 @@ function ShadowMLAndWinRate() {
         </div>
 
         {kbLoading || !cfgData ? (
-          <div className="space-y-2">
-            {Array.from({ length: 4 }).map((_, i) => <Skeleton key={i} className="h-8 w-full" />)}
+          <div className="space-y-1.5">
+            {Array.from({ length: 4 }).map((_, i) => <Skeleton key={i} className="h-5 w-full" />)}
           </div>
         ) : allowedSymbols.length === 0 ? (
-          <div className="text-center py-4 text-muted-foreground">
+          <div className="text-center py-2 text-muted-foreground">
             <p className="text-[11px]">SCALP_SYMBOLS não configurado</p>
             <p className="text-[10px] mt-1 opacity-60">Defina a variável de ambiente SCALP_SYMBOLS</p>
           </div>
         ) : (
-          <div className="space-y-2">
+          <div className="max-h-[250px] overflow-y-auto pr-1.5 custom-scrollbar space-y-1.5">
             {rows.map(({ sym, longWR, longTrades, shortWR, shortTrades }) => (
-              <div key={sym} className="grid grid-cols-[52px_1fr_1fr] gap-2 items-center">
-                <div className="flex items-center gap-1">
-                  <span className="text-[11px] font-mono font-bold text-foreground/80">{sym}</span>
+              <div key={sym} className="grid grid-cols-[54px_1fr_1fr] gap-2 items-center">
+                <div className="flex min-w-0 items-center gap-1">
+                  <CoinSymbol sym={sym} />
                   {available && (longTrades + shortTrades) > 0 && (
                     <span className="w-1.5 h-1.5 rounded-full bg-violet-400/60 shrink-0" title="Shadow ML ativo" />
                   )}
                 </div>
-                <div className="space-y-0.5">
+                <div className="space-y-0.5 min-w-0">
                   <div className="flex justify-between text-[9px]">
                     <span className="text-green-400/70">LONG</span>
                     <span className={`font-mono ${longWR != null ? wrColor(longWR) : "text-muted-foreground"}`}>
@@ -653,7 +677,7 @@ function ShadowMLAndWinRate() {
                     <div className={`h-full rounded-full transition-all ${longWR != null ? wrBarColor(longWR) : "bg-muted/20"}`} style={{ width: `${longWR ?? 0}%` }} />
                   </div>
                 </div>
-                <div className="space-y-0.5">
+                <div className="space-y-0.5 min-w-0">
                   <div className="flex justify-between text-[9px]">
                     <span className="text-red-400/70">SHORT</span>
                     <span className={`font-mono ${shortWR != null ? wrColor(shortWR) : "text-muted-foreground"}`}>
