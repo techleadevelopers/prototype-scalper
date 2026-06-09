@@ -17,6 +17,7 @@ import {
   getQuantBrainQueueStats,
   quantBrainGateMode,
   type QuantBrainEdgeInput,
+  type QuantBrainEdgeResult,
   type QuantBrainIntelligence,
 } from "../lib/quantBrainClient";
 import { recordPredictionExecutionAge } from "../lib/runtimeMetrics";
@@ -1079,24 +1080,7 @@ router.post("/bot/order", async (req: Request, res: Response) => {
     gateRejects.push(`HOUR_REJECT: UTC hour ${currentHour} is blacklisted`);
   }
 
-  // Gate 4: BTC regime gate
-  if (config.btcRegimeRequired && btcChangePct !== undefined) {
-    const absChange = Math.abs(btcChangePct);
-    if (absChange < config.btcRegimeThresholdPct) {
-      gateRejects.push(
-        `REGIME_REJECT: BTC change ${btcChangePct.toFixed(2)}% < threshold ±${config.btcRegimeThresholdPct}%`,
-      );
-    } else {
-      // Ensure direction agreement
-      const btcBull = btcChangePct > 0;
-      const wantLong = positionSide === "LONG";
-      if (!config.allowCounterRegimeScalp && btcBull !== wantLong) {
-        gateRejects.push(
-          `REGIME_DIRECTION: BTC ${btcBull ? "BULL" : "BEAR"} but entry is ${positionSide}`,
-        );
-      }
-    }
-  }
+  // BTC regime is telemetry only. Entry direction is enforced by candle/edge gates.
 
   // Gate 5: EV gate
   if (config.evMinThreshold > 0 && currentEv !== undefined) {
@@ -1136,6 +1120,7 @@ router.post("/bot/order", async (req: Request, res: Response) => {
   let openPositions: Record<string, unknown>[] = [];
   let capitalCtx: CapitalContext | null = null;
   let qbShadowRejects: string[] = [];
+  let qbOrderResult: QuantBrainEdgeResult | null = null;
   let sizingDecision: PositionSizingDecision | null = null;
   let sizingWarning: string | undefined;
 
@@ -1202,6 +1187,7 @@ router.post("/bot/order", async (req: Request, res: Response) => {
         setTimeout(() => reject(new Error("QB_ORDER_TIMEOUT")), QB_ORDER_TIMEOUT_MS),
       ),
     ]);
+    qbOrderResult = qbResult;
     if (qbMode === "enforce" && !qbResult.allow) {
       // Enforce mode: QB rejects block the trade
       gateRejects.push(...qbResult.gateRejects.map((r) => `QB_${r}`));
@@ -1276,6 +1262,22 @@ router.post("/bot/order", async (req: Request, res: Response) => {
         accountEquity: capitalCtx?.equity ?? config.marginPerTrade / 0.005,
         availableMargin: capitalCtx?.availableMargin ?? Number.POSITIVE_INFINITY,
         aggressiveScore: Math.max(0, Math.min(1, currentEv ?? 0.62)),
+        calibratedScore: qbOrderResult?.calibratedScore ?? qbOrderResult?.score ?? undefined,
+        calibratedProbability: qbOrderResult?.calibratedProbability ?? null,
+        expectedValuePct: qbOrderResult?.economics?.mlEconomicGate?.expectedValuePct ?? null,
+        optimalThreshold: qbOrderResult?.economics?.mlEconomicGate?.optimalThreshold ?? null,
+        profitabilityVerified: qbOrderResult?.economics?.mlEconomicGate?.profitabilityVerified ?? undefined,
+        kellyFraction: qbOrderResult?.economics?.kellyFraction ?? null,
+        mlSizingMultiplier: qbOrderResult?.economics?.mlEconomicGate?.sizingMultiplier
+          ?? qbOrderResult?.economics?.mlEconomicSizeMultiplier
+          ?? null,
+        btcRegime: btcChangePct === undefined
+          ? undefined
+          : btcChangePct >= config.btcRegimeThresholdPct
+            ? "BULL"
+            : btcChangePct <= -config.btcRegimeThresholdPct
+              ? "BEAR"
+              : "NEUTRAL",
         recentPnl: sizingStats.recentPnl,
         recentWinRate: sizingStats.recentWinRate,
         profitFactor: sizingStats.profitFactor,
@@ -1289,6 +1291,7 @@ router.post("/bot/order", async (req: Request, res: Response) => {
         baseMarginFallback: config.marginPerTrade,
         leverageFallback: config.leverage,
         stopLossPct: config.stopLossPct,
+        takeProfitPct: config.takeProfitPct,
       });
       if (sizingDecision.approved) {
         orderMargin = sizingDecision.recommendedMargin;
@@ -2007,18 +2010,7 @@ router.get("/bot/scan", async (req: Request, res: Response) => {
         gateRejects.push(`HOUR_REJECT: UTC hour ${currentHourUtc} is blacklisted`);
       }
 
-      // Gate: BTC regime required
-      if (config.btcRegimeRequired && btcRegime === "NEUTRAL") {
-        gateRejects.push(`REGIME_REJECT: BTC regime is NEUTRAL (${btcChangePct.toFixed(2)}% < ±${config.btcRegimeThresholdPct}%)`);
-      }
-
-      // Gate: regime direction agreement
-      if (config.btcRegimeRequired && !config.allowCounterRegimeScalp && btcRegime !== "NEUTRAL") {
-        const want = side === "LONG" ? "BULL" : "BEAR";
-        if (btcRegime !== want) {
-          gateRejects.push(`REGIME_DIRECTION: BTC ${btcRegime} but setup is ${side}`);
-        }
-      }
+      // BTC regime is telemetry only. Do not reject LONG/SHORT by BULL/BEAR tag.
 
       // Get adaptive context
       const clusterKey: ClusterKey = { symbol: sym, positionSide: side, hourUtc: currentHourUtc, btcRegime };
@@ -2064,17 +2056,11 @@ router.get("/bot/scan", async (req: Request, res: Response) => {
       const sentimentBiasRatio = sentiment?.biasRatio ?? 0.5;
       const sentimentConfidence = sentiment?.confidence ?? 0;
 
-      // Sentiment-aware ranking boost: if this side aligns with dominant sentiment, boost rank
       const sentimentAligned =
         (side === "LONG" && sentimentDirection === "BULL") ||
         (side === "SHORT" && sentimentDirection === "BEAR");
-      const sentimentBoost = sentimentAligned && sentimentConfidence > 0.3
-        ? sentimentConfidence * 0.15
-        : !sentimentAligned && sentimentConfidence > 0.4
-          ? -sentimentConfidence * 0.10
-          : 0;
       const sentimentAdjustedRank = gatePass
-        ? Math.max(0, engine.rankingScore(clusterKey, Math.max(0, ev)) + sentimentBoost)
+        ? Math.max(0, engine.rankingScore(clusterKey, Math.max(0, ev)))
         : 0;
 
       scanSymbols.push({
@@ -2322,7 +2308,7 @@ router.get("/bot/intelligence", async (req: Request, res: Response) => {
   const localTelemetryFallback = { recentOutcomes: engine.rawOutcomes() };
   const QB_DEADLINE_MS = Math.max(
     2_000,
-    Number(process.env["QUANT_BRAIN_INTELLIGENCE_TIMEOUT_MS"] ?? 4_000) + 500,
+    Math.min(5_000, Number(process.env["QUANT_BRAIN_INTELLIGENCE_TIMEOUT_MS"] ?? 4_000)) + 500,
   );
   const qbDeadline = new Promise<null>((r) => setTimeout(() => r(null), QB_DEADLINE_MS));
 
@@ -2592,19 +2578,7 @@ async function executeSingleOrder(
   if (config.hourBlacklist.includes(currentHour)) {
     gateRejects.push(`HOUR_REJECT: UTC hour ${currentHour} is blacklisted`);
   }
-  // Gate: BTC regime
-  if (config.btcRegimeRequired && btcChangePct !== undefined) {
-    const abs = Math.abs(btcChangePct);
-    if (abs < config.btcRegimeThresholdPct) {
-      gateRejects.push(`REGIME_REJECT: BTC ${btcChangePct.toFixed(2)}% < ±${config.btcRegimeThresholdPct}%`);
-    } else {
-      const btcBull = btcChangePct > 0;
-      const wantLong = positionSide === "LONG";
-      if (!config.allowCounterRegimeScalp && btcBull !== wantLong) {
-        gateRejects.push(`REGIME_DIRECTION: BTC ${btcBull ? "BULL" : "BEAR"} but entry is ${positionSide}`);
-      }
-    }
-  }
+  // BTC regime is telemetry only. Entry direction is enforced by candle/edge gates.
 
   const feeDragReject = feeDragRejectReason(item.currentEv, orderMargin, { ...config, marginPerTrade: orderMargin, leverage: orderLeverage });
   if (feeDragReject) gateRejects.push(feeDragReject);
@@ -3111,6 +3085,13 @@ router.post("/bot/sniper/mass", requireAdminAuthorization, async (req: Request, 
       positionSide: "LONG" | "SHORT";
       combinedScore?: number;
       aggressiveScore?: number;
+      calibratedScore?: number;
+      calibratedProbability?: number | null;
+      expectedValuePct?: number;
+      optimalThreshold?: number;
+      profitabilityVerified?: boolean;
+      kellyFraction?: number;
+      mlSizingMultiplier?: number;
       currentEv?: number;
       btcChangePct?: number;
     }>;
@@ -3178,12 +3159,20 @@ router.post("/bot/sniper/mass", requireAdminAuthorization, async (req: Request, 
   const scored = candidates.map((candidate) => {
     const rank = rotationBySymbol.get(candidate.symbol.toUpperCase());
     const baseScore = candidate.aggressiveScore ?? candidate.combinedScore ?? 1;
+    const mlProbability = typeof candidate.calibratedProbability === "number"
+      ? Math.max(0, Math.min(1, candidate.calibratedProbability))
+      : undefined;
+    const mlWeight = mlProbability === undefined
+      ? 0
+      : Math.max(0, Math.min(0.30, Number(process.env["SNIPER_ML_SCORE_WEIGHT"] ?? 0.25)));
+    const mlScore = candidate.calibratedScore ?? mlProbability;
+    const authorityScore = mlScore === undefined ? baseScore : baseScore * (1 - mlWeight) + mlScore * mlWeight;
     const sideFactor =
       !rank || rank.sideBias === "NEUTRAL" || rank.sideBias === candidate.positionSide ? 1 : 0.72;
     return {
       ...candidate,
       rotationRank: rank,
-      effectiveScore: baseScore * (rank?.rotationScore ?? 0.5) * sideFactor,
+      effectiveScore: authorityScore * (rank?.rotationScore ?? 0.5) * sideFactor,
     };
   });
   const btcRegime: BtcRegime = initialBtcRegime;
@@ -3266,6 +3255,14 @@ router.post("/bot/sniper/mass", requireAdminAuthorization, async (req: Request, 
       accountEquity: capitalCtx?.equity ?? aggressiveConfig.marginPerTrade / 0.005,
       availableMargin: capitalCtx?.availableMargin ?? Number.POSITIVE_INFINITY,
       aggressiveScore: Math.max(0, Math.min(1, c.aggressiveScore ?? c.combinedScore ?? c.effectiveScore ?? 0)),
+      calibratedScore: c.calibratedScore,
+      calibratedProbability: c.calibratedProbability ?? null,
+      expectedValuePct: c.expectedValuePct ?? null,
+      optimalThreshold: c.optimalThreshold ?? null,
+      profitabilityVerified: c.profitabilityVerified,
+      kellyFraction: c.kellyFraction ?? null,
+      mlSizingMultiplier: c.mlSizingMultiplier ?? null,
+      btcRegime,
       coachRank: i + 1,
       rotationState: rank?.state,
       aggressionState: aggression.aggressionState === "DEFENSIVE" ? "DEFENSIVE" : getActiveModeId() === "aggressive" ? "AGGRESSIVE" : "NORMAL",
@@ -3287,6 +3284,7 @@ router.post("/bot/sniper/mass", requireAdminAuthorization, async (req: Request, 
       baseMarginFallback: aggressiveConfig.marginPerTrade,
       leverageFallback: aggressiveConfig.leverage,
       stopLossPct: aggressiveConfig.stopLossPct,
+      takeProfitPct: aggressiveConfig.takeProfitPct,
     });
     if (!sizing.approved) {
       results.push({
