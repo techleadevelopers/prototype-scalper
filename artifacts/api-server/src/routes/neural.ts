@@ -60,6 +60,11 @@ async function qbCached(path: string, timeoutMs = TIMEOUT_MS, ttlMs = 15_000): P
   }
 }
 
+function isQbTimeout(error: unknown): boolean {
+  const message = error instanceof Error ? `${error.name} ${error.message}` : String(error);
+  return /abort|timeout|timed?\s*out/i.test(message);
+}
+
 // ── Knowledge Base ────────────────────────────────────────────────────────────
 
 router.get("/neural/kb/stats", async (_req: Request, res: Response) => {
@@ -171,6 +176,18 @@ router.get("/neural/health", async (_req: Request, res: Response) => {
       const health = await qbFetch("/health", 5000) as Record<string, unknown>;
       res.json({ ...health, online: true, qbUrlConfigured: Boolean(process.env["QUANT_BRAIN_URL"]?.trim()) });
     } catch (healthError) {
+      if (isQbTimeout(liveError) || isQbTimeout(healthError)) {
+        res.json({
+          online: true,
+          status: "analysis",
+          analysis: true,
+          qbUrlConfigured: Boolean(process.env["QUANT_BRAIN_URL"]?.trim()),
+          message: "QB analysis in progress or edge loop resting",
+          error: String(healthError),
+          liveError: String(liveError),
+        });
+        return;
+      }
       res.status(503).json({
         online: false,
         qbUrlConfigured: Boolean(process.env["QUANT_BRAIN_URL"]?.trim()),
