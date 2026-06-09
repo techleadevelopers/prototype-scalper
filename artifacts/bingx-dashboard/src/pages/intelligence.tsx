@@ -420,16 +420,21 @@ function ServiceStatePanel() {
   );
 }
 
-function StatusBadge({ ok, on, off }: { ok: boolean; on: string; off: string }) {
+function StatusBadge({ ok, on, off, tone = ok ? "ok" : "bad" }: { ok: boolean; on: string; off: string; tone?: "ok" | "warn" | "bad" }) {
+  const toneClass = tone === "ok"
+    ? "border-green-500/40 bg-green-500/10 text-green-400"
+    : tone === "warn"
+      ? "border-amber-500/40 bg-amber-500/10 text-amber-400"
+      : "border-red-500/40 bg-red-500/10 text-red-400";
   return (
     <Badge
       variant="outline"
-      className={`text-[10px] ${ok
-        ? "border-green-500/40 bg-green-500/10 text-green-400"
-        : "border-red-500/40 bg-red-500/10 text-red-400"}`}
+      className={`text-[10px] ${toneClass}`}
     >
-      {ok ? <CheckCircle2 className="mr-1 h-2.5 w-2.5" /> : <XCircle className="mr-1 h-2.5 w-2.5" />}
-      {ok ? on : off}
+      {tone === "warn"
+        ? <Clock className="mr-1 h-2.5 w-2.5" />
+        : ok ? <CheckCircle2 className="mr-1 h-2.5 w-2.5" /> : <XCircle className="mr-1 h-2.5 w-2.5" />}
+      {tone === "warn" ? off : ok ? on : off}
     </Badge>
   );
 }
@@ -527,7 +532,7 @@ export default function IntelligencePage() {
   const query = useQuery({
     queryKey: ["bot-intelligence", symbol, side, intelligenceSource],
     queryFn: () => fetchIntelligence(symbol, side, btcChangePct, intelligenceSource),
-    refetchInterval: demoAnalysis?.connected ? 12_000 : 20_000,
+    refetchInterval: demoAnalysis?.connected ? 60_000 : 90_000,
     placeholderData: (previousData) => previousData,
     retry: 1,
   });
@@ -593,7 +598,10 @@ export default function IntelligencePage() {
     if (!quant?.checkedAt) return "--";
     return new Date(quant.checkedAt).toLocaleTimeString();
   }, [quant?.checkedAt]);
-  const serviceError = quant?.errors.health ?? quant?.errors.edge ?? (!quant?.enabled ? "disabled" : null);
+  const serviceError = quant?.errors.health ?? quant?.errors.edge ?? quant?.errors.service ?? (!quant?.enabled ? "disabled" : null);
+  const qbSlow = /timeout|aborted|intelligence/i.test(String(serviceError ?? ""));
+  const qbAnalysis = qbSlow && quant?.enabled !== false;
+  const qbReachable = Boolean(quant?.connected) || qbAnalysis;
 
   return (
     <AppShell>
@@ -604,9 +612,10 @@ export default function IntelligencePage() {
             <BrainCircuit className="h-4 w-4 text-primary" />
             <h1 className="text-base font-bold">IA Sniper</h1>
             <StatusBadge
-              ok={Boolean(quant?.connected)}
+              ok={qbReachable}
               on="QB online"
-              off={query.isFetching && !data ? "Conectando" : serviceError?.includes("aborted") ? "QB timeout" : "QB offline"}
+              off={query.isFetching && !data ? "Conectando" : qbAnalysis ? "QB analysis" : "QB offline"}
+              tone={qbAnalysis ? "warn" : qbReachable ? "ok" : "bad"}
             />
             <Badge variant="outline" className="font-mono text-[10px] uppercase">{quant?.gateMode ?? "—"}</Badge>
             {demoAnalysis?.connected && (
@@ -816,7 +825,8 @@ export default function IntelligencePage() {
               </PanelBox>
 
               <PanelBox icon={<Gauge className="h-3.5 w-3.5 text-primary" />} title="Status QB / Notícias">
-                <Row label="Quant Brain" value={<span className={`flex items-center gap-1 text-xs ${quant?.connected ? "text-green-400" : "text-red-400"}`}>{quant?.connected ? <Wifi className="h-3 w-3" /> : <WifiOff className="h-3 w-3" />}{quant?.connected ? "ONLINE" : "OFFLINE"}</span>} />
+                <Row label="Quant Brain" value={<span className={`flex items-center gap-1 text-xs ${quant?.connected ? "text-green-400" : qbAnalysis ? "text-amber-400" : "text-red-400"}`}>{quant?.connected ? <Wifi className="h-3 w-3" /> : qbAnalysis ? <Clock className="h-3 w-3" /> : <WifiOff className="h-3 w-3" />}{quant?.connected ? "ONLINE" : qbAnalysis ? "ANALYSIS" : "OFFLINE"}</span>} />
+                {serviceError && <Row label="Detalhe" value={<span className={`max-w-[140px] truncate font-mono text-[10px] ${qbAnalysis ? "text-amber-400" : "text-red-400"}`}>{qbAnalysis ? "edge em analise/descanso" : serviceError}</span>} />}
                 <Row label="Notícias" value={<span className="font-mono text-xs uppercase">{news.action ?? "none"}</span>} />
                 <Row label="Risco notícia" value={<span className="font-mono text-xs uppercase">{news.riskLevel ?? news.risk_level ?? "LOW"}</span>} />
                 <Row label="Hora UTC" value={<span className="flex items-center gap-1 font-mono text-xs"><Clock className="h-2.5 w-2.5" />{data?.hourUtc}:00</span>} />
