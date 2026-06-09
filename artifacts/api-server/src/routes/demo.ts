@@ -3,7 +3,7 @@ import { createHmac, randomUUID } from "crypto";
 import type { Request, Response } from "express";
 import { getBotConfig } from "../lib/botConfig";
 import { exportAllOutcomes, getEngine, recordTradeOutcome, updateTradeOutcome } from "../lib/telemetryStore";
-import { evaluateQuantBrainEdge, quantBrainGateMode, syncQuantBrainOutcome } from "../lib/quantBrainClient";
+import { evaluateQuantBrainEdge, getQuantBrainRecentTrades, quantBrainGateMode, syncQuantBrainOutcome } from "../lib/quantBrainClient";
 import type { BtcRegime, TradeOutcome } from "../lib/adaptiveEngine";
 import { feeDragRejectReason, getCorrelation } from "../lib/executionRisk";
 import { buildTelemetryState } from "./telemetry";
@@ -89,6 +89,16 @@ import { assertCampaignAccounting, assertExposureInvariant } from "../lib/vstAcc
 
 function isDemoOutcome(outcome: TradeOutcome): boolean {
   return outcome.isDemo === true || outcome.source === "bingx-vst";
+}
+
+function withDeadline<T>(promise: Promise<T>, fallback: T, timeoutMs: number): Promise<T> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(fallback), timeoutMs);
+    promise
+      .then((value) => resolve(value))
+      .catch(() => resolve(fallback))
+      .finally(() => clearTimeout(timer));
+  });
 }
 
 // Initialise persistent demo trade store on module load, then restore runtime state
@@ -2995,9 +3005,74 @@ router.get("/demo/sniper/status", (_req: Request, res: Response) => {
 });
 
 /** GET /api/demo/campaign — dual-view: per-entry + per-symbol aggregate */
-router.get("/demo/campaign", (_req: Request, res: Response) => {
-  const outcomes = getEngine().rawOutcomes()
-    .filter((o) => o.isDemo === true || o.source === "bingx-vst")
+router.get("/demo/campaign", async (_req: Request, res: Response) => {
+  type CampaignReportOutcome = Pick<
+    TradeOutcome,
+    | "id"
+    | "symbol"
+    | "positionSide"
+    | "entryTime"
+    | "exitTime"
+    | "entryPrice"
+    | "exitPrice"
+    | "realizedPnl"
+    | "fee"
+    | "grossPnl"
+    | "exitReason"
+    | "btcRegime"
+    | "estimated"
+    | "campaignId"
+    | "entryCount"
+  >;
+
+  const [ledgerTrades, quantBrainDemoOutcomes] = await Promise.all([
+    loadClosedTrades(10_000),
+    withDeadline(getQuantBrainRecentTrades("demo", 2_000), [], 500),
+  ]);
+  const ledgerCampaignIds = new Set(ledgerTrades.map((trade) => trade.campaignId).filter(Boolean));
+  const localCampaignIds = new Set<string>();
+  const outcomesById = new Map<string, CampaignReportOutcome>();
+
+  for (const trade of ledgerTrades) {
+    if (trade.campaignId) localCampaignIds.add(trade.campaignId);
+    outcomesById.set(`ledger:${trade.tradeId}`, {
+      id: trade.tradeId,
+      symbol: trade.symbol,
+      positionSide: trade.positionSide,
+      entryTime: trade.entryTime,
+      exitTime: trade.exitTime,
+      entryPrice: trade.entryPrice,
+      exitPrice: trade.exitPrice,
+      realizedPnl: trade.realizedPnl,
+      fee: trade.fee,
+      grossPnl: trade.grossPnl,
+      exitReason: trade.exitReason,
+      btcRegime: trade.btcRegime as BtcRegime,
+      estimated: trade.estimated,
+      campaignId: trade.campaignId,
+      entryCount: 1,
+    });
+  }
+
+  for (const outcome of getEngine().rawOutcomes()) {
+    if (!isDemoOutcome(outcome)) continue;
+    if (outcome.campaignId && ledgerCampaignIds.has(outcome.campaignId)) {
+      continue;
+    }
+    if (outcome.campaignId) localCampaignIds.add(outcome.campaignId);
+    outcomesById.set(`outcome:${outcome.id}`, outcome);
+  }
+
+  for (const outcome of quantBrainDemoOutcomes) {
+    const campaignId = outcome.campaignId
+      ?? (outcome.id.startsWith("campaign:") ? outcome.id.slice("campaign:".length) : undefined);
+    if (!isDemoOutcome(outcome) && !campaignId) continue;
+    if (campaignId && localCampaignIds.has(campaignId)) continue;
+    outcomesById.set(`quant:${outcome.id}`, outcome);
+    if (campaignId) localCampaignIds.add(campaignId);
+  }
+
+  const outcomes = Array.from(outcomesById.values())
     .sort((a, b) => (a.entryTime ?? 0) - (b.entryTime ?? 0));
 
   type SymbolCampaign = {
@@ -3046,9 +3121,10 @@ router.get("/demo/campaign", (_req: Request, res: Response) => {
     const s = symbolMap.get(o.symbol)!;
     const isWin = (o.realizedPnl ?? 0) > 0;
     const holdMs = (o.exitTime ?? 0) - (o.entryTime ?? 0);
+    const tradeWeight = Math.max(1, Math.trunc(Number(o.entryCount ?? 1)));
 
-    s.trades++;
-    if (isWin) s.wins++;
+    s.trades += tradeWeight;
+    if (isWin) s.wins += tradeWeight;
     s.totalPnl += o.realizedPnl ?? 0;
     s.totalFees += o.fee ?? 0;
     s.totalGrossPnl += o.grossPnl ?? 0;
@@ -3119,6 +3195,8 @@ router.get("/demo/campaign", (_req: Request, res: Response) => {
       worstSymbol: symbols[symbols.length - 1]?.symbol ?? null,
       sniperRunning: demoSniper.running,
       sniperOpenTrades: sniperOpenTrades.size,
+      ledgerTrades: ledgerTrades.length,
+      quantBrainTrades: quantBrainDemoOutcomes.length,
     },
     symbols,
   });
@@ -3132,7 +3210,10 @@ router.get("/demo/campaign", (_req: Request, res: Response) => {
  */
 router.get("/demo/campaign/summary", async (_req: Request, res: Response) => {
   try {
-    const recent = await loadClosedTrades(2000);
+    const [recent, quantBrainDemoOutcomes] = await Promise.all([
+      loadClosedTrades(2000),
+      withDeadline(getQuantBrainRecentTrades("demo", 2_000), [], 500),
+    ]);
 
     // Group by campaignId — dedup at campaign level
     const campaignMap = new Map<string, typeof recent>();
@@ -3146,6 +3227,51 @@ router.get("/demo/campaign/summary", async (_req: Request, res: Response) => {
       .map(([, trades]) => buildCampaignOutcome(trades))
       .filter((co): co is NonNullable<typeof co> => co !== null)
       .sort((a, b) => b.closedAt - a.closedAt);
+    const localCampaignIds = new Set(campaigns.map((campaign) => campaign.campaignId));
+
+    for (const outcome of quantBrainDemoOutcomes) {
+      const campaignId = outcome.campaignId
+        ?? (outcome.id.startsWith("campaign:") ? outcome.id.slice("campaign:".length) : "");
+      if (!campaignId || localCampaignIds.has(campaignId)) continue;
+      if (!isDemoOutcome(outcome) && !outcome.id.startsWith("campaign:")) continue;
+
+      campaigns.push({
+        campaignId,
+        signalId: outcome.signalId ?? campaignId,
+        marketEventId: outcome.marketEventId ?? null,
+        predictionId: outcome.predictionId ?? null,
+        clientOrderId: outcome.clientOrderId ?? null,
+        exchangeOrderId: outcome.exchangeOrderId ?? outcome.entryOrderId ?? outcome.id,
+        featureVersion: outcome.featureVersion ?? null,
+        symbol: outcome.symbol,
+        positionSide: outcome.positionSide,
+        side: outcome.side,
+        entryCount: Math.max(1, Math.trunc(Number(outcome.entryCount ?? 1))),
+        openedAt: outcome.entryTime,
+        closedAt: outcome.exitTime,
+        holdDurationMs: Math.max(0, outcome.holdDurationMs ?? (outcome.exitTime - outcome.entryTime)),
+        totalQty: outcome.qty,
+        totalNotional: outcome.notional ?? outcome.entryPrice * outcome.qty,
+        totalMarginUsed: outcome.marginUsed,
+        avgEntryPrice: outcome.entryPrice,
+        avgExitPrice: outcome.exitPrice,
+        grossPnl: outcome.grossPnl,
+        totalFee: outcome.fee,
+        realizedPnl: outcome.realizedPnl,
+        mfe: outcome.mfe ?? 0,
+        mae: outcome.mae ?? 0,
+        exitReasons: { [outcome.exitReason ?? "MANUAL"]: 1 },
+        btcRegime: outcome.btcRegime,
+        hourUtc: outcome.hourUtc,
+        fallbackMode: false,
+        modelVersion: outcome.modelVersion ?? null,
+        pnlSource: outcome.pnlSource ?? "balance_delta",
+        estimated: outcome.estimated ?? false,
+      });
+      localCampaignIds.add(campaignId);
+    }
+
+    campaigns.sort((a, b) => b.closedAt - a.closedAt);
 
     const totalRealizedPnl = campaigns.reduce((s, c) => s + c.realizedPnl, 0);
     const totalFees = campaigns.reduce((s, c) => s + c.totalFee, 0);
@@ -3162,6 +3288,8 @@ router.get("/demo/campaign/summary", async (_req: Request, res: Response) => {
       totalFees: parseFloat(totalFees.toFixed(4)),
       estimatedCount,
       exchangeReportedCount,
+      ledgerTrades: recent.length,
+      quantBrainTrades: quantBrainDemoOutcomes.length,
       campaigns: campaigns.slice(0, 200).map((co) => ({
         campaignId: co.campaignId,
         symbol: co.symbol,
