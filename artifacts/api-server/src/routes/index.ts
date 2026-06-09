@@ -13,6 +13,7 @@ import scoreCalibrationRouter from "./scoreCalibration";
 import incidentsRouter from "./incidents";
 import sniperGovernanceRouter from "./sniperGovernance";
 import policyRouter from "./policy";
+import triggerRouter from "./trigger";
 
 const router: IRouter = Router();
 
@@ -30,5 +31,6 @@ router.use(scoreCalibrationRouter);
 router.use(incidentsRouter);
 router.use(sniperGovernanceRouter);
 router.use(policyRouter);
+router.use(triggerRouter);
 
 export default router;

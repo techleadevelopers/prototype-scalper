@@ -8,6 +8,13 @@ import type { BtcRegime, TradeOutcome } from "../lib/adaptiveEngine";
 import { feeDragRejectReason, getCorrelation } from "../lib/executionRisk";
 import { buildTelemetryState } from "./telemetry";
 import { computeCandleEdge, computeAllCandleEdges } from "../lib/candleEdge";
+import {
+  getTriggerConfig,
+  updateCurrentPrice,
+  checkAndFireTriggers,
+  isTriggerEnabled,
+  type TriggerSignal,
+} from "../lib/triggerStrategy";
 import type { ClusterKey } from "../lib/adaptiveEngine";
 import {
   buildAttachedProtection,
@@ -1792,6 +1799,11 @@ let demoMonitorInFlight = false;
 let demoSkippedPlacementOverlaps = 0;
 let demoSkippedMonitorOverlaps = 0;
 
+// ── Trigger/Gatilho cycle ────────────────────────────────────────────────────
+const TRIGGER_CYCLE_MS = parseInt(process.env["TRIGGER_CYCLE_MS"] ?? "15000", 10);
+let triggerCycleHandle: NodeJS.Timeout | null = null;
+let triggerCycleFiring = false;
+
 async function runDemoSniperCycleLocked(): Promise<void> {
   if (demoPlacementInFlight) {
     demoSkippedPlacementOverlaps++;
@@ -1816,6 +1828,162 @@ async function runDemoSniperMonitorLocked(): Promise<void> {
   } finally {
     demoMonitorInFlight = false;
   }
+}
+
+// ── Trigger/Gatilho cycle ────────────────────────────────────────────────────
+
+async function runTriggerCycle(): Promise<void> {
+  if (!isTriggerEnabled()) return;
+  if (!demoSniper.creds) return;
+
+  const { apiKey, secretKey } = demoSniper.creds;
+  const botConfig = getBotConfig();
+  const triggerConfig = getTriggerConfig();
+  const targetSymbols = triggerConfig.symbols.length > 0
+    ? triggerConfig.symbols
+    : botConfig.allowedSymbols;
+  if (targetSymbols.length === 0) return;
+
+  // 1. Update prices from VST ticker (rate-limited, fire in parallel with throttle)
+  await Promise.allSettled(
+    targetSymbols.map(async (sym) => {
+      const price = await fetchDemoLastPrice(sym).catch(() => null);
+      if (price && price > 0) updateCurrentPrice(sym, price);
+    }),
+  );
+
+  // 2. Check for triggered signals
+  const signals = checkAndFireTriggers();
+  if (signals.length === 0) return;
+
+  // 3. Place orders for each signal
+  for (const signal of signals) {
+    try {
+      await executeTriggerSignal(signal, { apiKey, secretKey });
+    } catch (err) {
+      console.error(
+        `[trigger] failed to place ${signal.direction} ${signal.symbol}:`,
+        err instanceof Error ? err.message : String(err),
+      );
+    }
+  }
+}
+
+async function executeTriggerSignal(
+  signal: TriggerSignal,
+  creds: { apiKey: string; secretKey: string },
+): Promise<void> {
+  const botConfig = getBotConfig();
+  const { symbol, direction, referencePrice, entryPrice: currentPrice, tpPct, slPct, triggerDropRisePct } = signal;
+
+  const side: "BUY" | "SELL" = direction === "LONG" ? "BUY" : "SELL";
+  const positionSide = direction;
+
+  if (!currentPrice || currentPrice <= 0) return;
+
+  const qty = Math.floor(((botConfig.marginPerTrade * botConfig.leverage) / currentPrice) * 1000) / 1000;
+  if (!qty || qty <= 0) return;
+
+  // Build TP/SL using custom tpPct/slPct from trigger strategy
+  const customConfig = { ...botConfig, takeProfitPct: tpPct, stopLossPct: slPct };
+  const protection = buildAttachedProtection(currentPrice, positionSide, customConfig);
+
+  const entryNow = Date.now();
+  const activeCampaignId = getActiveCampaignId(symbol, positionSide, entryNow);
+  const campaignId = activeCampaignId ?? randomUUID();
+  const clientOrderId = createClientOrderId(
+    `trigger:${symbol}:${positionSide}`,
+    `${Math.round(triggerDropRisePct * 100)}:${entryNow}`,
+  );
+  const btcRegime: BtcRegime = "NEUTRAL";
+  const hourUtc = new Date().getUTCHours();
+
+  const order = await placeVstOrderIdempotently({
+    creds,
+    clientOrderId,
+    campaignId,
+    symbol,
+    side,
+    positionSide,
+    quantity: qty,
+    params: {
+      symbol,
+      side,
+      positionSide,
+      type: botConfig.orderType,
+      quantity: qty,
+      leverage: botConfig.leverage,
+      stopLoss: protection?.stopLoss,
+      takeProfit: protection?.takeProfit,
+    },
+  });
+
+  const orderId = String(order.orderId);
+  const entryPrice = parseFloat(String(order.avgPrice ?? "")) || currentPrice;
+
+  sniperOpenTrades.set(orderId, {
+    orderId,
+    symbol,
+    side,
+    positionSide,
+    quantity: qty,
+    entryPrice,
+    expectedEntryPrice: currentPrice,
+    entryTime: entryNow,
+    hourUtc,
+    btcRegime,
+    leverage: botConfig.leverage,
+    marginUsed: botConfig.marginPerTrade,
+    expectedTpProfit: botConfig.marginPerTrade * botConfig.leverage * (tpPct / 100),
+  });
+
+  await persistOpenTrade({
+    campaignId,
+    signalId: `trigger:${campaignId}`,
+    orderId,
+    clientOrderId,
+    symbol,
+    side,
+    positionSide,
+    entryTime: entryNow,
+    entryPrice,
+    expectedEntryPrice: currentPrice,
+    qty,
+    leverage: botConfig.leverage,
+    marginUsed: botConfig.marginPerTrade,
+    notional: entryPrice * qty,
+    tpPct,
+    slPct,
+    btcRegime,
+    hourUtc,
+    edgeScore: 0.85,
+    stackingDepth: 1,
+    controlMaxEntries: 1,
+    edgeAtInsertion: 0.85,
+    calibratedProbability: null,
+    uncertaintyType: null,
+    marketEventId: null,
+    predictionId: null,
+    featureVersion: "trigger-v1",
+    stateFingerprint: `trigger:${symbol}:${positionSide}:${Math.round(triggerDropRisePct * 100)}`,
+    correlationAdjustedExposure: entryPrice * qty,
+    modelVersion: "trigger-v1",
+    fallbackMode: false,
+    mfe: 0,
+    mae: 0,
+    mfeAt: null,
+    maeAt: null,
+    lastMarkPrice: null,
+    lastCheckedAt: null,
+    closedAt: null,
+  });
+
+  console.info(
+    `[trigger] FIRED ${direction} ${symbol}` +
+    ` @ ${currentPrice.toFixed(4)} ref=${referencePrice.toFixed(4)}` +
+    ` dev=${triggerDropRisePct.toFixed(2)}% tp=${tpPct.toFixed(2)}% sl=${slPct.toFixed(2)}%` +
+    ` qty=${qty} orderId=${orderId}`,
+  );
 }
 
 /**
@@ -2579,6 +2747,7 @@ async function runDemoSniperMonitor(): Promise<void> {
 function stopDemoSniper(reason: string): void {
   if (demoSniper.placeHandle) { clearInterval(demoSniper.placeHandle); demoSniper.placeHandle = null; }
   if (demoSniper.monitorHandle) { clearInterval(demoSniper.monitorHandle); demoSniper.monitorHandle = null; }
+  if (triggerCycleHandle) { clearInterval(triggerCycleHandle); triggerCycleHandle = null; }
   demoSniper.running = false;
   demoSniper.creds = null;
   demoSniper.stopReason = reason;
@@ -2632,6 +2801,16 @@ router.post("/demo/sniper/start", (req: Request, res: Response) => {
   runDemoSniperCycleLocked().catch(() => {});
   demoSniper.placeHandle = setInterval(() => { runDemoSniperCycleLocked().catch(() => {}); }, DEMO_SNIPER_CYCLE_MS);
   demoSniper.monitorHandle = setInterval(() => { runDemoSniperMonitorLocked().catch(() => {}); }, DEMO_SNIPER_MONITOR_MS);
+
+  // Start trigger cycle (runs independently; fires only when trigger is enabled)
+  if (!triggerCycleHandle) {
+    triggerCycleHandle = setInterval(() => {
+      if (!triggerCycleFiring) {
+        triggerCycleFiring = true;
+        runTriggerCycle().finally(() => { triggerCycleFiring = false; });
+      }
+    }, TRIGGER_CYCLE_MS);
+  }
 
   req.log.info({ cycleMs: DEMO_SNIPER_CYCLE_MS, globalMax: DEMO_SNIPER_GLOBAL_MAX }, "[demo-sniper] started");
   res.json({ started: true, ...getSniperStatus() });

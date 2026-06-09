@@ -119,7 +119,7 @@ function clamp(value: number, min: number, max: number): number {
 }
 
 function finite(value: number | null | undefined, fallback = 0): number {
-  return Number.isFinite(value) ? value : fallback;
+  return Number.isFinite(value) ? (value as number) : fallback;
 }
 
 function maxDrawdown(pnls: number[]): number {

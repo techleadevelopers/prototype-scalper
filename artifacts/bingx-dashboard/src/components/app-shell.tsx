@@ -26,6 +26,7 @@ import {
   Radio,
   FlaskConical,
   BrainCircuit,
+  Target,
 } from "lucide-react";
 
 const NAV = [
@@ -36,6 +37,7 @@ const NAV = [
   { href: "/intelligence", label: "IA Sniper", icon: BrainCircuit },
   { href: "/bot", label: "Bot", icon: Bot },
   { href: "/demo", label: "Demo Lab", icon: FlaskConical, highlight: true },
+  { href: "/trigger", label: "Gatilho", icon: Target, highlight: true },
   { href: "/settings", label: "Settings", icon: Settings },
 ];
 
