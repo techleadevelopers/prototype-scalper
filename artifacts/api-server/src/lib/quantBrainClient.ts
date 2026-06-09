@@ -988,16 +988,11 @@ export async function getQuantBrainIntelligence(
     getCachedJson<unknown>(`news/context/${symbol}`, `/news/context/${symbol}`, 600),
   ]);
 
-  // Only surface errors that are real failures, not transient timeout/abort retries
-  // where stale cached data is still being served successfully.
-  const isTransientAbort = (e: string | undefined, s: boolean | undefined) =>
-    !!s && !!e && /aborted|timeout|abort/i.test(e);
-
   const errors: Record<string, string> = {};
-  if (health.error && !isTransientAbort(health.error, health.stale)) errors.health = health.stale ? `stale: ${health.error}` : health.error;
-  if (model.error && !isTransientAbort(model.error, model.stale)) errors.model = model.stale ? `stale: ${model.error}` : model.error;
-  if (signalEdge.error && !isTransientAbort(signalEdge.error, signalEdge.stale)) errors.signalEdge = signalEdge.stale ? `stale: ${signalEdge.error}` : signalEdge.error;
-  if (newsContext.error && !isTransientAbort(newsContext.error, newsContext.stale)) errors.newsContext = newsContext.stale ? `stale: ${newsContext.error}` : newsContext.error;
+  if (health.error) errors.health = health.stale ? `stale: ${health.error}` : health.error;
+  if (model.error) errors.model = model.stale ? `stale: ${model.error}` : model.error;
+  if (signalEdge.error) errors.signalEdge = signalEdge.stale ? `stale: ${signalEdge.error}` : signalEdge.error;
+  if (newsContext.error) errors.newsContext = newsContext.stale ? `stale: ${newsContext.error}` : newsContext.error;
 
   return {
     connected: health.value !== null,
