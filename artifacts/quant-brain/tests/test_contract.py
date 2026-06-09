@@ -312,6 +312,64 @@ class TestUncertaintyType:
 
 # ── KB trade endpoint contract ──────────────────────────────────────────────────
 
+class TestMlEconomicGate:
+    def test_ml_economic_gate_blocks_below_effective_threshold(self):
+        from core.edge_gate import _ml_economic_gate
+
+        blocks, gate = _ml_economic_gate(
+            config={},
+            shadow_ml={
+                "available": True,
+                "calibratedProbability": 0.61,
+                "optimalThreshold": 0.62,
+                "expectedValuePct": 0.001,
+                "profitabilityVerified": True,
+            },
+            risk_geometry={"requiredProbability": 0.66},
+            current_profit_factor=1.4,
+            drift_policy={
+                "mlEnforcementAllowed": True,
+                "stackingMultiplier": 1.0,
+                "newEntriesAllowed": True,
+            },
+            correlation_penalty=1.0,
+            regime_confidence=0.8,
+        )
+
+        assert gate["approved"] is False
+        assert gate["riskTier"] == "NO_TRADE"
+        assert gate["sizingMultiplier"] == 0.0
+        assert any("ML_THRESHOLD_REJECT" in reason for reason in blocks)
+
+    def test_ml_economic_gate_boosts_verified_positive_edge(self):
+        from core.edge_gate import _ml_economic_gate
+
+        blocks, gate = _ml_economic_gate(
+            config={},
+            shadow_ml={
+                "available": True,
+                "calibratedProbability": 0.75,
+                "optimalThreshold": 0.62,
+                "expectedValuePct": 0.002,
+                "profitabilityVerified": True,
+            },
+            risk_geometry={"requiredProbability": 0.64},
+            current_profit_factor=1.3,
+            drift_policy={
+                "mlEnforcementAllowed": True,
+                "stackingMultiplier": 1.0,
+                "newEntriesAllowed": True,
+            },
+            correlation_penalty=1.0,
+            regime_confidence=0.8,
+        )
+
+        assert blocks == []
+        assert gate["approved"] is True
+        assert gate["riskTier"] == "BOOST"
+        assert gate["sizingMultiplier"] > 1.0
+
+
 class TestKbTradeContract:
     def test_outcome_payload_must_have_symbol(self):
         payload = {
