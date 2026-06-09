@@ -13,7 +13,7 @@ import {
   getGetBingXTickerQueryKey,
   getGetBotConfigQueryKey,
   getGetBotEdgeQueryKey,
-  getGetBotScanQueryKey,
+  getGetBotScanQueryKey,  
   getGetDemoStatusQueryKey,
 } from "@/api-client";
 import AppShell from "@/components/app-shell";
@@ -29,7 +29,7 @@ import {
   Zap, Radio, CheckCircle2, XCircle, ArrowRight, Loader2,
   TrendingUp, TrendingDown, DollarSign, LogOut, Play, Square,
   Clock, Target, AlertTriangle, RefreshCw, Shield,
-  BarChart3, Crosshair, ChevronDown, ChevronUp, Award, Layers,
+  BarChart3, Crosshair, ChevronDown, ChevronUp, Award, Layers, ArrowUp, ArrowDown,
 } from "lucide-react";
 
 interface LogEntry {
@@ -836,8 +836,22 @@ export default function DemoPage() {
   const scanSymbols = scan?.symbols ?? [];
   const candidates = scanSymbols.filter(s => s.isCandidate);
 
+  // Get BTC price formatted for standalone display
+  const btcPrice = btcTicker?.lastPrice 
+    ? `$${parseFloat(btcTicker.lastPrice).toLocaleString("en-US", { minimumFractionDigits: 0, maximumFractionDigits: 0 })}`
+    : "—";
+
   return (
     <AppShell>
+      {/* BTC Price - Standalone outside any card div */}
+      <div className="fixed top-4 right-6 z-50 bg-black/60 backdrop-blur-md rounded-full px-4 py-1.5 border border-orange-500/30 shadow-lg">
+        <div className="flex items-center gap-2">
+          <span className="text-orange-400 text-xs font-mono font-bold">BTC/USDT</span>
+          <span className="text-white text-sm font-mono font-bold tracking-tight">{btcPrice}</span>
+          <span className="text-red-400 text-[10px] font-mono font-bold ml-1">SHORT</span>
+        </div>
+      </div>
+
       <div className="p-6 space-y-6 max-w-[1400px] mx-auto">
         {/* Header */}
         <div className="space-y-3">
@@ -1000,7 +1014,7 @@ export default function DemoPage() {
           </div>
         </div>
 
-        <div className="grid grid-cols-1 xl:grid-cols-[380px_1fr_320px] gap-5 items-start">
+        <div className="grid grid-cols-1 xl:grid-cols-[380px_minmax(450px,1fr)_320px] gap-5 items-start">
           {/* ── LEFT PANEL ── */}
           <div className="space-y-4">
             {/* Connect form */}
@@ -1080,7 +1094,7 @@ export default function DemoPage() {
 
           </div>
 
-       {/* ── CENTER PANEL — scanner ── */}
+{/* ── CENTER PANEL — scanner ── */}
 <Card className="bg-card/30 border-border/40 flex flex-col h-[320px]">
   <CardHeader className="px-5 pt-5 pb-3 border-b border-border/15 shrink-0">
     <div className="flex items-center justify-between">
@@ -1148,90 +1162,149 @@ export default function DemoPage() {
           const isReady = s.isCandidate;
           const isToxic = s.isToxic;
           const isGatePass = s.gatePass && !isReady;
+          const fullPair = s.symbol.replace("-USDT", "/USDT").replace("-USD", "/USD");
+          const priceUp = s.priceChangePct >= 0;
+          
+          const formatPrice = (price: string | undefined) => {
+            if (!price) return "—";
+            const n = parseFloat(price);
+            if (isNaN(n)) return "—";
+            if (fullPair.includes("BTC") || fullPair.includes("ETH")) {
+              return `$${n.toLocaleString("en-US", { minimumFractionDigits: 0, maximumFractionDigits: 0 })}`;
+            }
+            if (fullPair.includes("SOL") || fullPair.includes("NEAR")) {
+              return `$${n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+            }
+            return `$${n.toLocaleString("en-US", { minimumFractionDigits: 4, maximumFractionDigits: 4 })}`;
+          };
+          
+          const formatHighLow = (value: number | undefined) => {
+            if (!value) return "—";
+            if (value >= 10000) return value.toLocaleString("en-US", { minimumFractionDigits: 0, maximumFractionDigits: 0 });
+            if (value >= 1000) return value.toLocaleString("en-US", { minimumFractionDigits: 0, maximumFractionDigits: 0 });
+            if (value >= 1) return value.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+            return value.toLocaleString("en-US", { minimumFractionDigits: 4, maximumFractionDigits: 4 });
+          };
           
           return (
             <div
               key={`${key}-${i}`}
-              className={`group px-5 py-3 transition-all duration-150 hover:bg-muted/10 ${
+              className={`group px-5 py-2.5 transition-all duration-150 hover:bg-muted/10 ${
                 isReady && "bg-gradient-to-r from-green-500/5 to-transparent"
               }`}
             >
               <div className="flex items-center justify-between">
-                {/* Left side - Symbol & Side */}
-                <div className="flex items-center gap-3 min-w-[140px]">
-                  <div className={`w-2 h-2 rounded-full transition-all ${
-                    isToxic ? "bg-red-500" : isReady ? "bg-green-400 animate-pulse" : isGatePass ? "bg-yellow-500" : "bg-muted-foreground/30"
-                  }`} />
-                  <div className="flex items-center gap-2">
-                    {(() => {
-                      const base = s.symbol.replace("-USDT", "").replace("-USD", "").toLowerCase();
-                      const icons: Record<string, string> = {
-                        btc: "https://cryptologos.cc/logos/bitcoin-btc-logo.svg",
-                        eth: "https://cryptologos.cc/logos/ethereum-eth-logo.svg",
-                        sol: "https://cryptologos.cc/logos/solana-sol-logo.svg",
-                        vvv: "https://cryptologos.cc/logos/vvv-vvv-logo.svg",
-                      };
-                      const iconUrl = icons[base];
-                      return iconUrl ? (
-                        <img src={iconUrl} alt={base} className="w-5 h-5" onError={(e) => (e.target as HTMLImageElement).style.display = 'none'} />
-                      ) : (
-                        <div className="w-5 h-5 rounded-full bg-muted/20 flex items-center justify-center">
-                          <span className="text-[9px] font-bold">{base.slice(0, 2).toUpperCase()}</span>
-                        </div>
-                      );
-                    })()}
-                    <div>
-                      <p className="text-sm font-mono font-semibold">{s.symbol.replace("-USDT", "")}</p>
-                      <div className="flex items-center gap-1 mt-0.5">
-                        <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded ${
-                          s.positionSide === "LONG" ? "bg-green-500/15 text-green-400" : "bg-red-500/15 text-red-400"
-                        }`}>
-                          {s.positionSide === "LONG" ? "LONG" : "SHORT"}
-                        </span>
-                        {s.samples > 0 && (
-                          <span className="text-[8px] text-muted-foreground">{s.samples} trades</span>
+                {/* Left side */}
+                <div className="flex flex-col flex-1">
+                  {/* Linha 1: status + ícone + ticker + bolinha + preço + seta + percentual */}
+                  <div className="flex items-center gap-3">
+                    <div className={`w-1.5 h-1.5 rounded-full transition-all ${
+                      isToxic ? "bg-red-500" : isReady ? "bg-green-400 animate-pulse" : isGatePass ? "bg-yellow-500" : "bg-muted-foreground/30"
+                    }`} />
+                    
+                    <div className="flex items-center gap-2">
+                      {/* ÍCONE da moeda */}
+                      {(() => {
+                        const base = s.symbol.replace("-USDT", "").replace("-USD", "").toLowerCase();
+                        const icons: Record<string, string> = {
+  btc: "https://cryptologos.cc/logos/bitcoin-btc-logo.svg",
+  eth: "https://cryptologos.cc/logos/ethereum-eth-logo.svg",
+  sol: "https://cryptologos.cc/logos/solana-sol-logo.svg",
+  pol: "https://cryptologos.cc/logos/polygon-matic-logo.svg",
+  near: "https://cryptologos.cc/logos/near-protocol-near-logo.svg",
+  // ADICIONAR ESTES:
+  bnb: "https://cryptologos.cc/logos/bnb-bnb-logo.svg",
+  xrp: "https://cryptologos.cc/logos/xrp-xrp-logo.svg",
+  ada: "https://cryptologos.cc/logos/cardano-ada-logo.svg",
+  avax: "https://cryptologos.cc/logos/avalanche-avax-logo.svg",
+  dot: "https://cryptologos.cc/logos/polkadot-dot-logo.svg",
+  atom: "https://cryptologos.cc/logos/cosmos-atom-logo.svg",
+  link: "https://cryptologos.cc/logos/chainlink-link-logo.svg",
+  uni: "https://cryptologos.cc/logos/uniswap-uni-logo.svg",
+  arb: "https://cryptologos.cc/logos/arbitrum-arb-logo.svg",
+  op: "https://cryptologos.cc/logos/optimism-op-logo.svg",
+  doge: "https://cryptologos.cc/logos/dogecoin-doge-logo.svg",
+  shib: "https://cryptologos.cc/logos/shiba-inu-shib-logo.svg",
+  pepe: "https://cryptologos.cc/logos/pepe-pepe-logo.svg",
+  apt: "https://cryptologos.cc/logos/aptos-apt-logo.svg",
+};
+                        const iconUrl = icons[base];
+                        const isMockCoin = base === 'vvv' || base === 'bea';
+                        
+                        if (iconUrl && !isMockCoin) {
+                          return (
+                            <img 
+                              src={iconUrl} 
+                              alt={base} 
+                              className="w-5 h-5" 
+                              onError={(e) => (e.target as HTMLImageElement).style.display = 'none'} 
+                            />
+                          );
+                        } else {
+                          return (
+                            <div className="w-5 h-5 rounded-full bg-gradient-to-br from-primary/30 to-primary/10 flex items-center justify-center shadow-inner">
+                              <span className="text-[9px] font-bold text-primary/70">{base.slice(0, 2).toUpperCase()}</span>
+                            </div>
+                          );
+                        }
+                      })()}
+                      
+                      {/* TICKER */}
+                      <p className="text-[14.28px] font-mono font-semibold">{fullPair}</p>
+                      
+                      {/* MICRO BOLINHA com espaçamento maior */}
+                      <span className="w-1 h-1 rounded-full bg-muted-foreground/40 mx-1.5" />
+                      
+                      {/* PREÇO */}
+                      <p className="text-[15.45px] font-mono font-bold tabular-nums text-foreground relative -bottom-[4%] left-[2%]">
+                        {formatPrice(s.lastPrice)}
+                      </p>
+                      
+                      {/* SETA + PERCENTUAL */}
+                      <div className={`flex items-center gap-0.5 ml-0.5 ${priceUp ? "text-green-400" : "text-red-400"}`}>
+                        {priceUp ? (
+                          <ArrowUp className="w-2.5 h-2.5" />
+                        ) : (
+                          <ArrowDown className="w-2.5 h-2.5" />
                         )}
+                        <span className="text-[12.22px] font-mono font-bold tabular-nums">
+                          {priceUp ? "+" : ""}{s.priceChangePct.toFixed(2)}%
+                        </span>
                       </div>
                     </div>
                   </div>
-                </div>
 
-                {/* Center - Metrics */}
-                <div className="hidden md:flex items-center gap-6">
-                  <div className="text-right">
-                    <p className={`text-sm font-mono font-bold tabular-nums ${
-                      s.priceChangePct >= 0 ? "text-green-400" : "text-red-400"
-                    }`}>
-                      {s.priceChangePct >= 0 ? "+" : ""}{s.priceChangePct.toFixed(2)}%
-                    </p>
-                    <p className="text-[8px] text-muted-foreground uppercase tracking-wider">24h</p>
-                  </div>
-                  <div className="text-right">
-                    <p className="text-sm font-mono font-bold tabular-nums">
-                      {s.samples > 0 ? `${Math.round(s.priorityScore * 100)}` : "—"}
-                    </p>
-                    <p className="text-[8px] text-muted-foreground uppercase tracking-wider">PRIORITY</p>
-                  </div>
-                  <div className="text-right">
-                    <p className={`text-sm font-mono font-bold tabular-nums ${
-                      s.ev >= 0 ? "text-green-400" : "text-red-400"
-                    }`}>
-                      {s.ev > 0 ? "+" : ""}{s.ev.toFixed(4)}
-                    </p>
-                    <p className="text-[8px] text-muted-foreground uppercase tracking-wider">EV</p>
+                  {/* Linha 2: HIGH / LOW */}
+                  <div className="flex items-center gap-3 ml-8 mt-1">
+                    <div className="flex items-center gap-3">
+                      <span className="text-[8px] font-mono text-muted-foreground/60">
+                        H: <span className="text-foreground/70">${formatHighLow(s.high24h)}</span>
+                      </span>
+                      <span className="text-[8px] font-mono text-muted-foreground/60">
+                        L: <span className="text-foreground/70">${formatHighLow(s.low24h)}</span>
+                      </span>
+                    </div>
                   </div>
                 </div>
 
-                {/* Right side - Action */}
-                <div className="flex items-center gap-3">
+                {/* BADGE LONG/SHORT - lado direito */}
+                <div className="flex items-center gap-2">
+                  <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded ${
+                    s.positionSide === "LONG" ? "bg-green-500/15 text-green-400" : "bg-red-500/15 text-red-400"
+                  }`}>
+                    {s.positionSide === "LONG" ? "LONG" : "SHORT"}
+                  </span>
+                </div>
+
+                {/* Action button */}
+                <div className="flex items-center gap-2">
                   {isToxic ? (
-                    <div className="flex items-center gap-1.5 px-2 py-1 rounded-md bg-red-500/10">
-                      <Shield className="w-3 h-3 text-red-400" />
-                      <span className="text-[9px] font-medium text-red-400">TOXIC</span>
+                    <div className="flex items-center gap-1 px-1.5 py-0.5 rounded bg-red-500/10">
+                      <Shield className="w-2.5 h-2.5 text-red-400" />
+                      <span className="text-[7px] font-medium text-red-400">TOXIC</span>
                     </div>
                   ) : isReady ? (
-                    <Button
-                      size="sm"
+                    <button
                       onClick={() => fireDemoOrder(
                         s.symbol,
                         s.positionSide as "LONG" | "SHORT",
@@ -1241,44 +1314,30 @@ export default function DemoPage() {
                         s.lastPrice,
                       )}
                       disabled={firingSet.has(key) || autoFire}
-                      className="h-8 px-4 text-[11px] font-bold transition-all duration-200 bg-gradient-to-r from-primary to-primary/80 hover:from-primary/90 hover:to-primary shadow-lg shadow-primary/20 hover:shadow-xl hover:shadow-primary/30 active:scale-95"
+                      className="flex items-center gap-1 px-2 py-0.5 rounded-md text-[9px] font-medium transition-all duration-150 bg-muted/30 hover:bg-primary/20 text-muted-foreground hover:text-primary border border-border/30 hover:border-primary/30 disabled:opacity-50 disabled:cursor-not-allowed"
                     >
                       {firingSet.has(key) ? (
-                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        <Loader2 className="w-2.5 h-2.5 animate-spin" />
                       ) : (
                         <>
-                          <Zap className="w-3.5 h-3.5 mr-1.5" />
-                          EXECUTE
+                          <Zap className="w-2.5 h-2.5" />
+                          EXE
                         </>
                       )}
-                    </Button>
+                    </button>
                   ) : isGatePass ? (
-                    <div className="flex items-center gap-1.5 px-2 py-1 rounded-md bg-yellow-500/10">
-                      <Clock className="w-3 h-3 text-yellow-400" />
-                      <span className="text-[9px] font-medium text-yellow-400">WAITING</span>
+                    <div className="flex items-center gap-1 px-1.5 py-0.5 rounded bg-yellow-500/10">
+                      <Clock className="w-2.5 h-2.5 text-yellow-400" />
+                      <span className="text-[7px] font-medium text-yellow-400">WAIT</span>
                     </div>
                   ) : (
-                    <div className="flex items-center gap-1.5 px-2 py-1 rounded-md bg-muted/20">
-                      <XCircle className="w-3 h-3 text-muted-foreground" />
-                      <span className="text-[9px] text-muted-foreground">BLOCKED</span>
+                    <div className="flex items-center gap-1 px-1.5 py-0.5 rounded bg-muted/20">
+                      <XCircle className="w-2.5 h-2.5 text-muted-foreground" />
+                      <span className="text-[7px] text-muted-foreground">BLOCK</span>
                     </div>
                   )}
                 </div>
               </div>
-
-              {/* Progress bar for priority score */}
-              {s.samples > 0 && (
-                <div className="mt-2 ml-12">
-                  <div className="h-0.5 w-full bg-border/20 rounded-full overflow-hidden">
-                    <div 
-                      className={`h-full rounded-full transition-all duration-500 ${
-                        isToxic ? "bg-red-500" : isReady ? "bg-gradient-to-r from-green-500 to-emerald-500" : "bg-primary/40"
-                      }`}
-                      style={{ width: `${Math.min(100, Math.max(0, s.priorityScore * 100))}%` }}
-                    />
-                  </div>
-                </div>
-              )}
             </div>
           );
         })}
@@ -1288,27 +1347,23 @@ export default function DemoPage() {
 
   {/* Legend */}
   {scanSymbols.length > 0 && (
-    <div className="px-5 py-2.5 border-t border-border/15 shrink-0 bg-muted/5">
-      <div className="flex items-center gap-4 flex-wrap">
-        <div className="flex items-center gap-1.5">
+    <div className="px-5 py-2 border-t border-border/15 shrink-0 bg-muted/5">
+      <div className="flex items-center gap-3 flex-wrap">
+        <div className="flex items-center gap-1">
           <span className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse" />
-          <span className="text-[8px] text-muted-foreground uppercase tracking-wider">READY</span>
+          <span className="text-[7px] text-muted-foreground uppercase">READY</span>
         </div>
-        <div className="flex items-center gap-1.5">
+        <div className="flex items-center gap-1">
           <span className="w-1.5 h-1.5 rounded-full bg-red-500" />
-          <span className="text-[8px] text-muted-foreground uppercase tracking-wider">TOXIC</span>
+          <span className="text-[7px] text-muted-foreground uppercase">TOXIC</span>
         </div>
-        <div className="flex items-center gap-1.5">
+        <div className="flex items-center gap-1">
           <span className="w-1.5 h-1.5 rounded-full bg-yellow-500" />
-          <span className="text-[8px] text-muted-foreground uppercase tracking-wider">WAITING</span>
+          <span className="text-[7px] text-muted-foreground uppercase">WAIT</span>
         </div>
-        <div className="flex items-center gap-1.5">
+        <div className="flex items-center gap-1">
           <span className="w-1.5 h-1.5 rounded-full bg-muted-foreground/30" />
-          <span className="text-[8px] text-muted-foreground uppercase tracking-wider">BLOCKED</span>
-        </div>
-        <div className="ml-auto flex items-center gap-2">
-          <div className="w-4 h-0.5 rounded-full bg-primary/40" />
-          <span className="text-[8px] text-muted-foreground uppercase tracking-wider">PRIORITY SCORE</span>
+          <span className="text-[7px] text-muted-foreground uppercase">BLOCK</span>
         </div>
       </div>
     </div>
