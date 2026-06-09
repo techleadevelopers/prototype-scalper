@@ -203,6 +203,21 @@ CREATE TABLE IF NOT EXISTS signal_outcomes (
     finalized_at REAL
 );
 
+CREATE TABLE IF NOT EXISTS training_serving_feature_audits (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    signal_id TEXT NOT NULL,
+    prediction_id TEXT,
+    phase TEXT NOT NULL,
+    model_version TEXT,
+    feature_version TEXT,
+    feature_hash TEXT NOT NULL,
+    vector_json TEXT NOT NULL,
+    max_abs_diff REAL,
+    mismatched_features TEXT,
+    status TEXT NOT NULL DEFAULT 'RECORDED',
+    created_at REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS news_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     source TEXT NOT NULL,
@@ -347,6 +362,7 @@ CREATE INDEX IF NOT EXISTS idx_snapshots_btc_regime ON feature_snapshots(btc_reg
 CREATE INDEX IF NOT EXISTS idx_signal_context ON signal_outcomes(context_key, side);
 CREATE INDEX IF NOT EXISTS idx_signal_symbol_ts ON signal_outcomes(symbol, created_at);
 CREATE INDEX IF NOT EXISTS idx_signal_finalized ON signal_outcomes(finalized, created_at);
+CREATE INDEX IF NOT EXISTS idx_tss_signal_phase ON training_serving_feature_audits(signal_id, phase, created_at);
 CREATE INDEX IF NOT EXISTS idx_news_expires ON news_events(expires_at);
 CREATE INDEX IF NOT EXISTS idx_news_impact ON news_events(impact_score DESC);
 
@@ -396,6 +412,7 @@ def _cache_set(query: str, params: tuple, value: Any):
 
 async def init_db():
     """Inicializa banco com todas as tabelas e migrações."""
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     async with connect(DB_PATH) as db:
         await db.executescript(CREATE_TABLES)
 
@@ -536,6 +553,27 @@ async def init_db():
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_trades_playbook_ts "
             "ON trade_outcomes(playbook, timestamp)"
+        )
+
+        await db.executescript(
+            """CREATE TABLE IF NOT EXISTS training_serving_feature_audits (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                signal_id TEXT NOT NULL,
+                prediction_id TEXT,
+                phase TEXT NOT NULL,
+                model_version TEXT,
+                feature_version TEXT,
+                feature_hash TEXT NOT NULL,
+                vector_json TEXT NOT NULL,
+                max_abs_diff REAL,
+                mismatched_features TEXT,
+                status TEXT NOT NULL DEFAULT 'RECORDED',
+                created_at REAL NOT NULL
+            )"""
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tss_signal_phase "
+            "ON training_serving_feature_audits(signal_id, phase, created_at)"
         )
 
         # ── Signal lifecycle events (DEMO_LEARNING_AGGRESSIVE tracking) ──────
