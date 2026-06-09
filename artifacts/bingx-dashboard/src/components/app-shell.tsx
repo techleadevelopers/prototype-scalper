@@ -52,17 +52,15 @@ function MiniRiskChart({
   const absChange = Math.max(Math.abs(changePct), 0.2);
   const base = 100;
 
-  const raw = [
-    base - direction * absChange * 0.55,
-    base - direction * absChange * 0.30,
-    base - direction * absChange * 0.10,
-    base + direction * absChange * 0.08,
-    base + direction * absChange * 0.22,
-    base + direction * absChange * 0.50,
-    base + direction * absChange * 0.72,
-    base + direction * absChange * 0.88,
-    base + direction * absChange,
-  ];
+  // zigzag sparkline: trends toward final direction with sharp peaks/valleys
+  const phase = (Math.abs(changePct) * 3.7) % (Math.PI * 2);
+  const n = 16;
+  const raw = Array.from({ length: n }, (_, i) => {
+    const t = i / (n - 1);
+    const trend = -0.45 + 1.45 * t;
+    const osc = Math.sin(i * 2.5 + phase) * (0.38 - t * 0.22);
+    return base + direction * absChange * (trend + osc);
+  });
 
   const minV = Math.min(...raw);
   const maxV = Math.max(...raw);
