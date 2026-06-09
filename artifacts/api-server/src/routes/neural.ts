@@ -10,6 +10,10 @@ function qbUrl(): string {
   return (process.env["QUANT_BRAIN_URL"]?.trim() || "http://localhost:9000").replace(/\/+$/, "");
 }
 
+function qbFallbackUrl(baseUrl: string): string | null {
+  return baseUrl.replace(/\/neural$/i, "") || null;
+}
+
 function qbHeaders(): Record<string, string> {
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   const token = process.env["QUANT_BRAIN_API_TOKEN"]?.trim();
@@ -21,7 +25,12 @@ async function qbFetch(path: string, timeoutMs = TIMEOUT_MS): Promise<unknown> {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    const res = await fetch(`${qbUrl()}${path}`, { headers: qbHeaders(), signal: ctrl.signal });
+    const baseUrl = qbUrl();
+    let res = await fetch(`${baseUrl}${path}`, { headers: qbHeaders(), signal: ctrl.signal });
+    const fallbackUrl = res.status === 404 ? qbFallbackUrl(baseUrl) : null;
+    if (fallbackUrl && fallbackUrl !== baseUrl) {
+      res = await fetch(`${fallbackUrl}${path}`, { headers: qbHeaders(), signal: ctrl.signal });
+    }
     if (!res.ok) throw new Error(`QB ${res.status}`);
     return await res.json();
   } finally {
