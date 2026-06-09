@@ -1,0 +1,117 @@
+Perfeito, irmão. Vamos consolidar esse documento eliminando qualquer menção ao termo que não condiz com a nossa infraestrutura de rede baseada em Cloud e API. O nosso sistema é um motor de Algorithmic Execution & Quantitative Edge Scalping.Aqui está o seu relatório técnico de implementação revisado, com o contrato de dados estrito atualizado e a engenharia de processamento paralelo em massa baseada nas variáveis de ambiente (SYMBOLS).📑 RELATÓRIO DE ESPECIFICAÇÃO TÉCNICA: ARQUITETURA DO EDGE & MOTOR DE GATILHOS EM MASSA⚠️ I. DIRETRIZ CRÍTICA DO PIPELINE DO EDGEFica estritamente proibida a fragmentação da lógica matemática. O backend executor não possui inteligência analítica de mercado; ele funciona como um validador de infraestrutura e risco.Fluxo Incorreto (Proibido):$$\text{Market Data} \longrightarrow \text{Features} \longrightarrow \text{Veredito Direcional (LONG/SHORT)} \longrightarrow \text{Cálculo de Preço no Backend} \longrightarrow \text{Execução}$$Fluxo Obrigatório Implementado:$$\text{Market Data Stream} \longrightarrow \text{Features Multiframe} \longrightarrow \text{Quant Brain (Edge)} \longrightarrow \text{Gatilho Estruturado Completo} \longrightarrow \text{Validação de Risco (Node.js)} \longrightarrow \text{Ordem Limitada (BingX)}$$O Quant Brain é a única entidade responsável pela geometria tridimensional da operação (Preço de Entrada, Alvo e Saída de Emergência). A Inteligência Artificial não responde se o mercado vai subir ou cair agora; ela emite uma instrução de posicionamento matemático estruturado:"Arme esta ordem limite exatamente nesta coordenada de preço e aguarde o preenchimento por exaustão microestrutural."🏎️ II. Gerenciamento e Varredura de Símbolos em Massa (SYMBOLS)Para monitorar os alvos configurados na variável de ambiente na Cloud de forma assíncrona e em tempo real, o sistema adota um modelo de paralelismo por isolamento de fluxo, onde cada moeda do .env ganha uma esteira de execução independente.1. Monitoramento Paralelo no Backend (Node.js)O arquivo backend/src/lib/marketStreamSupervisor.ts inicializa as conexões consumindo os dados históricos e em tempo real via WebSocket para alimentar a esteira do Edge:TypeScript// backend/src/lib/marketStreamSupervisor.ts
+import { processMultiFrameTrigger } from "./triggerEngine";
+
+// Recupera a lista global de símbolos injetados na Cloud (.env)
+const symbols: string[] = process.env.SYMBOLS 
+  ? process.env.SYMBOLS.split(",").map(s => s.trim()) 
+  : ["BTC-USDT", "ETH-USDT"];
+
+export function initRealtimeScanner(): void {
+  console.log(`[🚀 SCANNER] Ativando monitoramento em massa para ${symbols.length} ativos:`, symbols);
+  
+  // Instancia a escuta assíncrona paralela para cada símbolo cadastrado
+  symbols.forEach((symbol) => {
+    initMultiFrameCandleStream(symbol);
+  });
+}
+
+function initMultiFrameCandleStream(symbol: string): void {
+  // Escuta os mini-fechamentos e variações de tick em tempo real na BingX Exchange Futuros
+  bingxWS.onCandleUpdate(symbol, "1m", async (candleData) => {
+    // Repassa imediatamente os dados do ativo para a orquestração do gatilho
+    await processMultiFrameTrigger(symbol, candleData);
+  });
+}
+📐 III. Inteligência Multiframe e Contrato Estrito do Edge (Quant Brain)Quando o evento de mercado bate no endpoint /edge/evaluate, o componente core/edge_gate.py consome a série temporal dos gráficos de 1m, 5m e 15m para gerar um pacote de ordem pronto.1. Algoritmo de Geometria Dinâmica por Volatilidade (Python)O sistema calcula o desvio padrão de preço do minuto recente através do ATR (Average True Range) para projetar o ponto exato do gatilho na pedra, sem sofrer com derrapagens de preço (slippage).Python# quant-brain/core/edge_gate.py
+import numpy as np
+
+def calculate_sniper_trigger_geometry(symbol, history_1m, history_5m, history_15m):
+    """
+    Consome séries temporais completas de múltiplos tempos gráficos.
+    Gera ordens de gatilho geométricas baseadas em exaustão microestrutural.
+    """
+    current_price = history_1m[-1]['close']
+    atr_1m = compute_atr(history_1m, window=14)
+    
+    # Avaliação estrutural dos tempos gráficos maiores para traçar zonas de repique
+    is_5m_exhausted = check_wick_exhaustion(history_5m[-1])  # Rejeição de pavio no 5m
+    is_15m_support = check_structural_support(history_15m)   # Região de suporte no 15m
+    
+    # Otimização matemática: se o micro-fluxo indica probabilidade de recuperação rápida
+    if is_5m_exhausted and is_15m_support:
+        # Define o preço do gatilho calculando o desconto ideal (faca caindo controlada)
+        trigger_price = current_price - (atr_1m * 0.30)
+        
+        # Alvo curto visando alta rotatividade de caixa ($0.50 cents médios)
+        target_price = trigger_price + 0.50
+        stop_loss = trigger_price - 0.25
+        
+        # O retorno é o contrato completo e imutável da oportunidade executável
+        return {
+            "decision": "ARM_TRIGGER",
+            "side": "LONG",
+            "triggerPrice": round(trigger_price, 4),
+            "targetPrice": round(target_price, 4),
+            "stopPrice": round(stop_loss, 4),
+            "expirationSeconds": 30,
+            "confidence": 0.785,
+            "edgeScore": 7.89,
+            "expectedValue": 0.0052,
+            "kellyFraction": 0.0850
+        }
+        
+    return {"decision": "WAIT"}
+🎛️ IV. Validação de Infraestrutura e Execução Rígida (Backend Node.js)O backend recebe o payload do Quant Brain e processa os filtros de segurança física da conta antes de submeter a ordem limitada para a BingX Exchange Futuros.TypeScript// backend/src/lib/triggerEngine.ts
+import { quantBrainClient } from "./quantBrainClient";
+import { bingxClient } from "./bingxClient";
+import { positionSizing } from "./positionSizing";
+
+export async function processMultiFrameTrigger(symbol: string, candleData: any): Promise<void> {
+  // Solicita o veredito geométrico completo direto do Quant Brain
+  const brainResponse = await quantBrainClient.evaluateEdge(symbol, candleData);
+  
+  if (brainResponse.decision !== "ARM_TRIGGER") return;
+
+  // 1. CHECAGEM DE EXPOSIÇÃO EM MASSA: Evitar mais de 3 trades concomitantes
+  const activePositionsCount = await bingxClient.getActivePositionsCount();
+  if (activePositionsCount >= 3) {
+    console.log(`[🚫 RISK BLOCK] Ordem descartada. Teto de 3 posições abertas atingido.`);
+    return;
+  }
+
+  // 2. CHECAGEM DE LIQUIDEZ E SPREAD: Bloqueia se o book estiver aberto/inconsistente
+  const orderBook = await bingxClient.getOrderBook(symbol);
+  const spreadPct = (orderBook.asks[0].price - orderBook.bids[0].price) / orderBook.bids[0].price;
+  if (spreadPct > 0.0002) { // Máximo de 0.02% de Spread admitido para alvos curtos
+    console.log(`[🚫 LIQUIDITY BLOCK] Spread muito largo (${(spreadPct*100).toFixed(4)}%) em ${symbol}.`);
+    return;
+  }
+
+  // 3. CALCULO DO LOTE: Usa a fração de Kelly injetada pelo cérebro quantitativo
+  const orderSize = positionSizing.calculateByKelly({
+    kellyFraction: brainResponse.kellyFraction,
+    expectedValue: brainResponse.expectedValue
+  });
+
+  // 4. ENVIO DA ORDEM MAKER LIMIT: Post-Only obrigatório para eliminar taxas pesadas e slippage
+  const orderResult = await bingxClient.placeOrder({
+    symbol: symbol,
+    side: brainResponse.side === "LONG" ? "BUY" : "SELL",
+    type: "LIMIT",
+    price: brainResponse.triggerPrice,
+    quantity: orderSize,
+    postOnly: true, // Garante execução estritamente como Maker na BingX
+    takeProfit: brainResponse.targetPrice,
+    stopLoss: brainResponse.stopPrice
+  });
+
+  // 5. CANCELAMENTO RELÂMPAGO: Evita ordens fantasmas pendentes na pedra se o mercado mudar de contexto
+  setTimeout(async () => {
+    const status = await bingxClient.getOpenOrderStatus(symbol, orderResult.id);
+    if (status === "UNFILLED") {
+      await bingxClient.cancelOpenOrder(symbol, orderResult.id);
+      console.log(`[⏱️ STALE EXPIRY] Ordem limitada expirada e removida da pedra em ${symbol}.`);
+    }
+  }, brainResponse.expirationSeconds * 1000);
+}
+📈 V. Ciclo de Aprendizado Contínuo Baseado na Eficiência do GatilhoO modelo preditivo dentro do Quant Brain monitora continuamente os resultados gerados na base de conhecimento (knowledge base) modificando seus pesos estatísticos. O aprendizado é otimizado para classificar a eficiência da geometria do gatilho, calculando:Distância Ótima de Execução (Fill Rate Optimization): Identificar qual a distância em relação ao preço atual que garante a execução da ordem sem sofrer com o atropelamento por quebras de volatilidade inesperadas.Eficiência de Taxa (Maker Efficiency): Mapear as assinaturas de candles que geram o preenchimento perfeito na pedra, reduzindo drasticamente os custos operacionais da corretora.Tempo Limite de Expiração (Expiration Decay): Ajustar dinamicamente o campo expirationSeconds baseado no histórico: se ordens limites que ficam abertas por mais de 30 segundos possuem expectativa matemática negativa quando executadas, a IA reduz a janela temporal da ratoeira automaticamente para proteger a margem do robô.

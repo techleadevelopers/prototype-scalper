@@ -1,0 +1,115 @@
+O nosso sistema roda em infraestrutura Cloud (como Railway/Vercel) e se comunica via WebSockets e APIs REST HTTP normais com a BingX Exchange Futuros.
+
+O que você está construindo, na verdade, é um sistema de Algorithmic Execution & Quantitative Scalping via Limit Triggers. É uma automação baseada em microestrutura e ordens na pedra (Maker) para capturar flutuações rápidas dentro da própria corretora, gerenciando o risco em massa através de lotes pulverizados.
+
+Aqui está o seu Contrato de Arquitetura Oficial e Definitivo, purgado do termo HFT e focado estritamente no que o Edge e o Quant Brain precisam entregar:
+
+📑 CONTRATO DE ARQUITETURA OBRIGATÓRIA DO EDGE
+
+⚠️ DIRETRIZ CRÍTICA DE PIPELINE
+
+NÃO IMPLEMENTAR O PIPELINE DE SINAL TRADICIONAL:
+
+$$\text{Market Data} \longrightarrow \text{Features} \longrightarrow \text{Veredito LONG/SHORT} \longrightarrow \text{Cálculo de Trigger no Backend} \longrightarrow \text{Execução}$$
+
+❌ Este fluxo está ERRADO. Ele pulveriza a lógica do trade, causa slippage e gera falha de alinhamento matemático.
+
+IMPLEMENTAR RUSTICAMENTE O PIPELINE DE FLUXO QUANTITATIVO:
+
+$$\text{Market Data} \longrightarrow \text{Features (1m, 5m, 15m + BTC)} \longrightarrow \text{Quant Brain} \longrightarrow \text{Trigger Executável Completo} \longrightarrow \text{Risk Validation (Node)} \longrightarrow \text{Order Placement (BingX)}$$
+
+🧠 1. Responsabilidade Geométrica Pura (Quant Brain)
+
+O Quant Brain é a única e exclusiva entidade responsável pela geometria e engenharia matemática da operação. Ele não assume que o backend sabe o que fazer com a ordem. O Quant Brain avalia os múltiplos tempos gráficos de candles (1m, 5m, 15m), estuda o alinhamento de curto prazo do Bitcoin, calcula o ATR de execução recente e entrega a oportunidade completamente construída.
+
+A inteligência artificial não deve computar vereditos cegos do tipo "Compre Agora" ou "Venda Agora". Ela deve ditar uma instrução estruturada de engenharia:
+
+"Arme esta ordem exatamente neste preço limite e aguarde a execução do espeto."
+
+O backend Node.js fica PROIBIDO de:
+
+Calcular ou ajustar o triggerPrice.
+
+Calcular ou ajustar o targetPrice (Take Profit) ou stopPrice (Stop Loss).
+
+Calcular o tempo de validade (expirationSeconds).
+
+Recalcular volatilidade ou tentar otimizar a entrada por conta própria.
+
+Alterar qualquer milímetro da geometria produzida pelo modelo da IA.
+
+🏎️ 2. Responsabilidade de Infraestrutura e Infra (Backend Node.js)
+
+O backend do Dashboard que se conecta com a API da BingX Exchange Futuros atua como um Músculo Cego e Validador de Segurança. Sua única preocupação é garantir a integridade da conta e o cumprimento estrito do envio.
+
+A responsabilidade exclusiva do backend é:
+
+Validar Risco e Exposição: Verificar o saldo livre e travar a concorrência se houver o teto máximo de posições simultâneas abertas no lote em massa.
+
+Validar Liquidez e Spread: Ler o livro de ordens em tempo real da BingX antes de submeter a ordem; se o spread entre o primeiro Bid e o primeiro Ask for maior que 0.02%, ele aborta o envio para proteger a matemática do alvo curto.
+
+Validar Correlação: Monitorar o comportamento imediato do BTC e impedir a abertura em massa de múltiplas altcoins correlacionadas que estejam indo na mesma direção de risco.
+
+Enviar Ordem Maker: Enviar a ordem para a BingX como LIMIT com a flag estrita Post-Only, garantindo o menor custo de taxa (Maker Fee) e eliminando o slippage.
+
+Monitorar e Cancelar: Monitorar o relógio. Se o mercado não espetar o preço e preencher a ordem limite dentro do tempo de validade (expirationSeconds), o backend envia um sinal de cancelamento imediato para a BingX.
+
+📊 3. Especificação Estrita do Contrato de Dados (Contrato Edge)
+
+O endpoint /edge/evaluate do Quant Brain NÃO PODE responder payloads de texto abertos como {"verdict": "LONG"}. Ele deve, obrigatoriamente, retornar o pacote de dados pronto para ser injetado na API da BingX:
+
+JSON
+
+
+
+{
+
+  "decision": "ARM_TRIGGER",
+
+  "side": "LONG",
+
+  "triggerPrice": 595.2100,
+
+  "targetPrice": 597.8900,
+
+  "stopPrice": 593.7200,
+
+  "expirationSeconds": 30,
+
+  "confidence": 0.7420,
+
+  "edgeScore": 8.45,
+
+  "expectedValue": 0.0042,
+
+  "kellyFraction": 0.1200
+
+}
+
+Se o contexto multiframe for incerto ou não possuir edge estatístico claro após os custos de transação, o retorno deve ser limpo:
+
+JSON
+
+
+
+{
+
+  "decision": "WAIT"
+
+}
+
+📈 4. O Mecanismo de Aprendizado Obrigatório do Modelo
+
+O modelo preditivo (Random Forest / Shadow Model) dentro do Quant Brain deixa de ser um classificador simples de direção do preço. O objetivo final do aprendizado não é adivinhar se a próxima vela é verde ou vermelha. O objetivo é produzir matrizes de gatilhos executáveis que gerem expectativa matemática positiva pós-taxas.
+
+O loop de aprendizado contínuo (signal_finalizer + trade_outcomes) deve treinar o modelo para otimizar os seguintes fatores operacionais:
+
+Distância de Trigger vs Fill Rate: Qual a distância exata em relação ao preço atual que garante que a ordem na pedra seja executada (fill) sem deixar o robô de fora e sem sofrer atropelamento por rompimento forte.
+
+Distância de Trigger vs Expectancy: Qual a geometria que maximiza o retorno líquido médio por operação.
+
+Mapeamento de Eficiência Maker: Quais moedas e contextos de volatilidade respeitam a execução de ordens limites efêmeras de curto prazo.
+
+Mapeamento de Expiração Ótima: Se os gatilhos que duram mais de 45 segundos abertos tendem a dar loss quando executados, forçando a IA a encolher o expirationSeconds para janelas mais seguras (ex: 20 ou 30 segundos).
+
+Este documento sela o alinhamento definitivo da engenharia do seu sistema. O cérebro calcula e monta a armadilha matemática baseando-se em candles reais multiframe da BingX, e o backend Node executa o gatilho sem questionar, cuidando apenas da segurança das margens e das taxas. É o desenho perfeito para buscar lucro consistente em massa com risco controlado!
