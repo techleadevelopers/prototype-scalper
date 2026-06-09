@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
+from pathlib import Path
 from typing import Any
 
 from core.candle_regime import candle_regime_status
@@ -16,6 +18,9 @@ log = logging.getLogger("shadow_sampler")
 
 
 SHADOW_SAMPLER_SOURCE_TYPE = "shadow_sampler"
+DATA_DIR = Path(__file__).parent.parent / "data"
+STATE_FILE = Path(os.environ.get("SHADOW_SAMPLER_STATE_PATH", DATA_DIR / "shadow-sampler-state.json"))
+MAX_LAST_ANALYSES = 40
 
 _sampler_state: dict[str, Any] = {
     "enabled": True,
@@ -30,6 +35,47 @@ _sampler_state: dict[str, Any] = {
     "bootstrapCycles": 0,
     "lastAnalyses": [],
 }
+
+
+def _persist_sampler_state() -> None:
+    try:
+        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        payload = dict(_sampler_state)
+        tmp = STATE_FILE.with_suffix(f"{STATE_FILE.suffix}.tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(STATE_FILE)
+    except Exception as exc:
+        log.warning("Failed to persist shadow sampler state: %s", exc)
+
+
+def _load_sampler_state() -> None:
+    try:
+        if not STATE_FILE.exists():
+            return
+        raw = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return
+        for key in (
+            "intervalSeconds",
+            "lastRunAt",
+            "lastError",
+            "cycles",
+            "attempted",
+            "recorded",
+            "skippedNoData",
+            "bootstrapCycles",
+            "lastAnalyses",
+        ):
+            if key in raw:
+                _sampler_state[key] = raw[key]
+        if isinstance(_sampler_state.get("lastAnalyses"), list):
+            _sampler_state["lastAnalyses"] = _sampler_state["lastAnalyses"][:MAX_LAST_ANALYSES]
+        else:
+            _sampler_state["lastAnalyses"] = []
+        _sampler_state["running"] = False
+        _sampler_state["enabled"] = _env_bool("SHADOW_SAMPLER_ENABLED", True)
+    except Exception as exc:
+        log.warning("Failed to load shadow sampler state: %s", exc)
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -69,6 +115,67 @@ def _sampler_config() -> dict[str, Any]:
 
 def shadow_sampler_status() -> dict[str, Any]:
     return dict(_sampler_state)
+
+
+def reconcile_shadow_sampler_status(
+    *,
+    observed: int,
+    latest_created_at: float = 0.0,
+    recent: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Recover dashboard counters from durable signal_outcomes rows."""
+    changed = False
+    observed = max(0, int(observed or 0))
+    latest_created_at = float(latest_created_at or 0)
+
+    if observed > int(_sampler_state.get("recorded", 0) or 0):
+        _sampler_state["recorded"] = observed
+        _sampler_state["attempted"] = max(int(_sampler_state.get("attempted", 0) or 0), observed)
+        changed = True
+
+    if observed > 0 and int(_sampler_state.get("cycles", 0) or 0) <= 0:
+        symbols_per_cycle = max(1, len([
+            symbol.strip()
+            for symbol in os.environ.get("SHADOW_SAMPLER_SYMBOLS", ",".join(SYMBOLS)).split(",")
+            if symbol.strip()
+        ]) * 2)
+        _sampler_state["cycles"] = max(1, (observed + symbols_per_cycle - 1) // symbols_per_cycle)
+        changed = True
+
+    if latest_created_at > float(_sampler_state.get("lastRunAt", 0) or 0):
+        _sampler_state["lastRunAt"] = latest_created_at
+        changed = True
+
+    if recent and not _sampler_state.get("lastAnalyses"):
+        analyses: list[dict[str, Any]] = []
+        for row in recent[:MAX_LAST_ANALYSES]:
+            analyses.append({
+                "symbol": row.get("symbol"),
+                "fallbackSide": row.get("side"),
+                "recorded": True,
+                "decision": row.get("decision"),
+                "score": None,
+                "target": None,
+                "expectedTimeToTargetSec": None,
+                "risk": None,
+                "momentumQuality": None,
+                "microstructureToxicity": None,
+                "altMovePct": None,
+                "btcMovePct": None,
+                "btcCommander": None,
+                "reasons": [],
+                "capturedAt": float(row.get("created_at") or 0),
+            })
+        _sampler_state["lastAnalyses"] = analyses
+        changed = True
+
+    enabled = _env_bool("SHADOW_SAMPLER_ENABLED", True)
+    _sampler_state["enabled"] = enabled
+    if enabled and not _sampler_state.get("lastError"):
+        _sampler_state["running"] = True
+    if changed:
+        _persist_sampler_state()
+    return shadow_sampler_status()
 
 
 def _compact_analysis(symbol: str, fallback_side: str, sniper: dict[str, Any], recorded: bool) -> dict[str, Any]:
@@ -158,6 +265,7 @@ async def sample_shadow_signals_once(engine: FeatureEngine) -> dict[str, Any]:
         cycle_num, attempted, recorded, skipped_no_data,
     )
 
+    previous_analyses = list(_sampler_state.get("lastAnalyses") or [])
     _sampler_state.update({
         "enabled": _env_bool("SHADOW_SAMPLER_ENABLED", True),
         "running": True,
@@ -167,8 +275,9 @@ async def sample_shadow_signals_once(engine: FeatureEngine) -> dict[str, Any]:
         "attempted": int(_sampler_state["attempted"]) + attempted,
         "recorded": int(_sampler_state["recorded"]) + recorded,
         "skippedNoData": int(_sampler_state["skippedNoData"]) + skipped_no_data,
-        "lastAnalyses": analyses[:40],
+        "lastAnalyses": (analyses + previous_analyses)[:MAX_LAST_ANALYSES],
     })
+    _persist_sampler_state()
 
     return {
         "attempted": attempted,
@@ -185,6 +294,7 @@ async def run_shadow_signal_sampler(engine: FeatureEngine, interval_seconds: int
         "running": enabled,
         "intervalSeconds": interval_seconds,
     })
+    _persist_sampler_state()
     if not enabled:
         return
 
@@ -193,8 +303,13 @@ async def run_shadow_signal_sampler(engine: FeatureEngine, interval_seconds: int
             await sample_shadow_signals_once(engine)
         except asyncio.CancelledError:
             _sampler_state["running"] = False
+            _persist_sampler_state()
             raise
         except Exception as exc:
             _sampler_state["lastError"] = f"{type(exc).__name__}: {exc}"
+            _persist_sampler_state()
 
         await asyncio.sleep(interval_seconds)
+
+
+_load_sampler_state()
