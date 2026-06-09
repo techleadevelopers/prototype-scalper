@@ -28,8 +28,8 @@ import {
   BrainCircuit,
 } from "lucide-react";
 import {
-  Line,
-  LineChart,
+  Area,
+  AreaChart,
   ReferenceLine,
   ResponsiveContainer,
   YAxis,
@@ -56,48 +56,66 @@ function MiniRiskChart({
   isToxic: boolean;
 }) {
   const direction = changePct >= 0 ? 1 : -1;
-  const absChange = Math.max(Math.abs(changePct), 0.15);
+  const absChange = Math.max(Math.abs(changePct), 0.2);
   const base = 100;
+
   const data = [
-    { t: 1, price: base - direction * absChange * 0.42 },
-    { t: 2, price: base - direction * absChange * 0.08 },
-    { t: 3, price: base + direction * absChange * 0.2 },
-    { t: 4, price: base + direction * absChange * 0.04 },
-    { t: 5, price: base + direction * absChange * 0.48 },
-    { t: 6, price: base + direction * absChange },
+    { v: base - direction * absChange * 0.55 },
+    { v: base - direction * absChange * 0.30 },
+    { v: base - direction * absChange * 0.10 },
+    { v: base + direction * absChange * 0.08 },
+    { v: base + direction * absChange * 0.22 },
+    { v: base + direction * absChange * 0.50 },
+    { v: base + direction * absChange * 0.72 },
+    { v: base + direction * absChange * 0.88 },
+    { v: base + direction * absChange },
   ];
-  const stroke = isToxic
-    ? "rgb(248 113 113)"
+
+  const strokeColor = isToxic
+    ? "#f87171"
     : isLong
-    ? "rgb(74 222 128)"
-    : "rgb(251 113 133)";
-  const target = base + direction * absChange;
-  const stop = base - direction * absChange * 0.55;
-  const domainPad = absChange * 0.95;
+    ? "#4ade80"
+    : "#fb7185";
+
+  const gradId = `grad-${isToxic ? "toxic" : isLong ? "long" : "short"}`;
+  const domainPad = absChange * 1.1;
 
   return (
-    <div className="relative h-8 flex-1 min-w-0">
+    <div className="relative h-9 flex-1 min-w-0">
       <ResponsiveContainer width="100%" height="100%">
-        <LineChart data={data} margin={{ top: 3, right: 2, bottom: 2, left: 2 }}>
+        <AreaChart data={data} margin={{ top: 2, right: 1, bottom: 1, left: 1 }}>
+          <defs>
+            <linearGradient id={gradId} x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor={strokeColor} stopOpacity={0.25} />
+              <stop offset="100%" stopColor={strokeColor} stopOpacity={0.02} />
+            </linearGradient>
+          </defs>
           <YAxis domain={[base - domainPad, base + domainPad]} hide />
-          <ReferenceLine y={base} stroke="hsl(var(--border))" strokeDasharray="2 2" strokeOpacity={0.5} />
-          <ReferenceLine y={target} stroke={stroke} strokeOpacity={0.28} />
-          <ReferenceLine y={stop} stroke="rgb(248 113 113)" strokeOpacity={0.22} />
-          <Line
-            type="monotone"
-            dataKey="price"
-            stroke={stroke}
-            strokeWidth={1.7}
+          <ReferenceLine y={base} stroke="rgba(255,255,255,0.08)" strokeDasharray="2 3" />
+          <Area
+            type="monotoneX"
+            dataKey="v"
+            stroke={strokeColor}
+            strokeWidth={1.8}
+            fill={`url(#${gradId})`}
             dot={false}
             isAnimationActive={false}
           />
-        </LineChart>
+        </AreaChart>
       </ResponsiveContainer>
-      <span className={`absolute right-0 top-0 text-[8px] font-mono tabular-nums ${changePct >= 0 ? "text-green-400" : "text-red-400"}`}>
-        {changePct >= 0 ? "+" : ""}{changePct.toFixed(2)}%
-      </span>
     </div>
   );
+}
+
+function fmtMicroPrice(v: string | undefined): string {
+  if (!v) return "";
+  const n = parseFloat(v);
+  if (isNaN(n) || n === 0) return "";
+  if (n >= 10000) return n.toLocaleString("en-US", { maximumFractionDigits: 0 });
+  if (n >= 1000) return n.toLocaleString("en-US", { minimumFractionDigits: 1, maximumFractionDigits: 1 });
+  if (n >= 10) return n.toFixed(2);
+  if (n >= 1) return n.toFixed(3);
+  return n.toFixed(4);
 }
 
 function TargetRow({
@@ -138,30 +156,41 @@ function TargetRow({
     ? "bg-muted-foreground/40"
     : "bg-orange-400";
 
+  const microPrice = fmtMicroPrice(lastPrice);
+
   return (
     <div className="px-3 py-1.5 border-b border-border/10 last:border-0">
-      <div className="flex items-center gap-2">
+      {/* Row 1: dot · symbol · side · price · change% */}
+      <div className="flex items-center gap-1.5">
         <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${dotColor}`} />
-        <span className="text-[11px] font-bold tabular-nums leading-none flex-1">{shortSym}</span>
-        <span className={`text-[9px] font-mono shrink-0 ${positionSide === "LONG" ? "text-green-400" : "text-red-400"}`}>
+        <span className="text-[11px] font-bold tabular-nums leading-none">{shortSym}</span>
+        <span className={`text-[8px] font-bold px-0.5 rounded shrink-0 ${positionSide === "LONG" ? "text-green-400" : "text-red-400"}`}>
           {positionSide === "LONG" ? "L" : "S"}
         </span>
-        <span className={`text-[10px] font-mono tabular-nums ${pUp ? "text-green-400" : "text-red-400"}`}>
+        {microPrice && (
+          <span className="font-mono text-[9px] text-foreground/60 tabular-nums ml-auto leading-none">
+            ${microPrice}
+          </span>
+        )}
+        <span className={`text-[9px] font-mono tabular-nums font-semibold ${pUp ? "text-green-400" : "text-red-400"}`}>
           {pUp ? "+" : ""}{priceChangePct.toFixed(2)}%
         </span>
       </div>
-      <div className="flex items-center gap-2 mt-0.5">
+      {/* Row 2: chart · WR · P-score */}
+      <div className="flex items-center gap-1.5 mt-0.5">
         <MiniRiskChart
           changePct={priceChangePct}
           isLong={positionSide === "LONG"}
           isToxic={isToxic}
         />
-        <span className="text-[9px] text-muted-foreground tabular-nums font-mono">
-          {samples > 0 ? `${(ewmaWinRate * 100).toFixed(0)}%` : "—"}
-        </span>
-        <span className={`text-[9px] font-semibold tabular-nums ${isToxic ? "text-red-400" : isCandidate ? "text-green-400" : "text-muted-foreground"}`}>
-          P{Math.round(priorityScore * 100)}
-        </span>
+        <div className="flex flex-col items-end shrink-0 gap-0.5">
+          <span className={`text-[8px] font-mono tabular-nums ${isToxic ? "text-red-400" : isCandidate ? "text-green-400" : "text-muted-foreground/60"}`}>
+            P{Math.round(priorityScore * 100)}
+          </span>
+          <span className="text-[8px] text-muted-foreground/50 tabular-nums font-mono">
+            {samples > 0 ? `${(ewmaWinRate * 100).toFixed(0)}%` : "—"}
+          </span>
+        </div>
       </div>
     </div>
   );
