@@ -231,6 +231,8 @@ async def sample_shadow_signals_once(engine: FeatureEngine) -> dict[str, Any]:
     window_seconds = _env_int("SHADOW_SAMPLER_WINDOW_SECONDS", 300)
     bootstrap_samples = max(3, _env_int("SHADOW_SAMPLER_BOOTSTRAP_SAMPLES", 3))
     symbols = _sampler_symbols()
+    symbol_concurrency = max(1, _env_int("SHADOW_SAMPLER_SYMBOL_CONCURRENCY", 6))
+    symbol_semaphore = asyncio.Semaphore(symbol_concurrency)
 
     cycle_num = int(_sampler_state["cycles"]) + 1
     log.info("Shadow sampler cycle=%d starting for %d symbols", cycle_num, len(symbols))
@@ -250,15 +252,16 @@ async def sample_shadow_signals_once(engine: FeatureEngine) -> dict[str, Any]:
     regime = candle_regime_status()
     btc_regime = (regime.get("symbols") or {}).get("BTC-USDT", {})
 
-    attempted = 0
-    recorded = 0
-    deduped = 0
-    rejected_zero_price = 0
-    insert_failed = 0
-    skipped_no_data = 0
-    analyses: list[dict[str, Any]] = []
-
-    for symbol in symbols:
+    async def evaluate_symbol_unbounded(symbol: str) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "attempted": 0,
+            "recorded": 0,
+            "deduped": 0,
+            "rejectedZeroPrice": 0,
+            "insertFailed": 0,
+            "skippedNoData": 0,
+            "analyses": [],
+        }
         sym = symbol if symbol.endswith("-USDT") else f"{symbol}-USDT"
         alt_history = get_snapshot_history(sym, max(window_seconds, 900))
         btc_history = get_snapshot_history("BTC-USDT", max(window_seconds, 900))
@@ -267,8 +270,8 @@ async def sample_shadow_signals_once(engine: FeatureEngine) -> dict[str, Any]:
                 "Shadow sampler skip %s: alt_history=%d btc_history=%d (need %d)",
                 sym, len(alt_history), len(btc_history), bootstrap_samples,
             )
-            skipped_no_data += 1
-            continue
+            result["skippedNoData"] = 1
+            return result
 
         sniper = await run_blocking(
             evaluate_sniper_window,
@@ -280,29 +283,47 @@ async def sample_shadow_signals_once(engine: FeatureEngine) -> dict[str, Any]:
         sniper["candleRegime"] = btc_regime
 
         for fallback_side in ("LONG", "SHORT"):
-            attempted += 1
+            result["attempted"] += 1
             signal = await record_signal_from_gate(sym, fallback_side, sniper, config)
             was_recorded = bool(signal.get("recorded"))
             record_status = str(signal.get("recordStatus") or ("recorded" if was_recorded else "unknown"))
-            recorded += 1 if was_recorded else 0
+            result["recorded"] += 1 if was_recorded else 0
             if record_status == "deduped":
-                deduped += 1
+                result["deduped"] += 1
             elif record_status == "zero_entry_price":
-                rejected_zero_price += 1
+                result["rejectedZeroPrice"] += 1
             elif record_status == "insert_failed":
-                insert_failed += 1
+                result["insertFailed"] += 1
                 log.warning(
                     "Shadow sampler insert failed: symbol=%s side=%s signal_id=%s",
                     sym,
                     fallback_side,
                     signal.get("signalId"),
                 )
-            analyses.append(_compact_analysis(sym, fallback_side, sniper, was_recorded, record_status))
+            result["analyses"].append(_compact_analysis(sym, fallback_side, sniper, was_recorded, record_status))
             await asyncio.sleep(0)
+        return result
+
+    async def evaluate_symbol(symbol: str) -> dict[str, Any]:
+        async with symbol_semaphore:
+            return await evaluate_symbol_unbounded(symbol)
+
+    symbol_results = await asyncio.gather(*[evaluate_symbol(symbol) for symbol in symbols])
+    attempted = sum(int(item["attempted"]) for item in symbol_results)
+    recorded = sum(int(item["recorded"]) for item in symbol_results)
+    deduped = sum(int(item["deduped"]) for item in symbol_results)
+    rejected_zero_price = sum(int(item["rejectedZeroPrice"]) for item in symbol_results)
+    insert_failed = sum(int(item["insertFailed"]) for item in symbol_results)
+    skipped_no_data = sum(int(item["skippedNoData"]) for item in symbol_results)
+    analyses = [
+        analysis
+        for item in symbol_results
+        for analysis in item["analyses"]
+    ]
 
     log.info(
-        "Shadow sampler cycle=%d done: attempted=%d recorded=%d deduped=%d zero_price=%d insert_failed=%d skipped=%d",
-        cycle_num, attempted, recorded, deduped, rejected_zero_price, insert_failed, skipped_no_data,
+        "Shadow sampler cycle=%d done: attempted=%d recorded=%d deduped=%d zero_price=%d insert_failed=%d skipped=%d concurrency=%d",
+        cycle_num, attempted, recorded, deduped, rejected_zero_price, insert_failed, skipped_no_data, symbol_concurrency,
     )
 
     previous_analyses = list(_sampler_state.get("lastAnalyses") or [])
