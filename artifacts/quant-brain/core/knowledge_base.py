@@ -1117,6 +1117,52 @@ async def finalize_signal_outcome(
         await db.commit()
 
 
+async def expire_signal_outcome(
+    signal_id: str,
+    *,
+    reason: str = "EXPIRED_NO_HISTORY",
+    first_event_seconds: float | None = None,
+) -> bool:
+    if not signal_id:
+        return False
+    async with connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """UPDATE signal_outcomes
+               SET finalized=1,
+                   finalized_at=?,
+                   first_event=?,
+                   first_event_seconds=?,
+                   label_source='expired_no_history'
+               WHERE signal_id=? AND finalized=0""",
+            (time.time(), reason, first_event_seconds, signal_id),
+        )
+        await db.commit()
+        return int(getattr(cursor, "rowcount", 0) or 0) > 0
+
+
+async def expire_signal_outcomes(
+    signal_ids: list[str],
+    *,
+    reason: str = "EXPIRED_NO_HISTORY",
+) -> int:
+    ids = [str(signal_id) for signal_id in signal_ids if signal_id]
+    if not ids:
+        return 0
+    placeholders = ",".join("?" for _ in ids)
+    async with connect(DB_PATH) as db:
+        cursor = await db.execute(
+            f"""UPDATE signal_outcomes
+                SET finalized=1,
+                    finalized_at=?,
+                    first_event=?,
+                    label_source='expired_no_history'
+                WHERE finalized=0 AND signal_id IN ({placeholders})""",
+            (time.time(), reason, *ids),
+        )
+        await db.commit()
+        return int(getattr(cursor, "rowcount", 0) or 0)
+
+
 async def get_signal_edge_stats(
     symbol: str,
     side: str,
