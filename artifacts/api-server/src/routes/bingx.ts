@@ -93,7 +93,8 @@ router.post("/bingx/connect", async (req: Request, res: Response) => {
     // Real-money order routes independently enforce the live deployment,
     // configured account identity, and execution confirmation.
     const resolvedAccountId = accountId?.trim() || `session-${credentialFingerprint(apiKey)}`;
-    if (isLiveExecutionConfigured() && resolvedAccountId !== process.env.LIVE_ACCOUNT_ID?.trim()) {
+    const approvedAccountId = process.env.LIVE_ACCOUNT_ID?.trim();
+    if (isLiveExecutionConfigured() && approvedAccountId && resolvedAccountId !== approvedAccountId) {
       res.status(403).json({ error: "Live credentials must declare the approved LIVE_ACCOUNT_ID." });
       return;
     }
