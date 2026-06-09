@@ -54,7 +54,7 @@ function MiniRiskChart({
 
   // zigzag sparkline: trends toward final direction with sharp peaks/valleys
   const phase = (Math.abs(changePct) * 3.7) % (Math.PI * 2);
-  const n = 16;
+  const n = 24; // more points for finer zigzag
   const raw = Array.from({ length: n }, (_, i) => {
     const t = i / (n - 1);
     const trend = -0.45 + 1.45 * t;
@@ -77,6 +77,7 @@ function MiniRiskChart({
     })
     .join(" ");
 
+  // Finer, sharper color (removed glow/opacity)
   const color = isToxic ? "#f87171" : isLong ? "#4ade80" : "#fb7185";
 
   return (
@@ -92,7 +93,7 @@ function MiniRiskChart({
           points={points}
           fill="none"
           stroke={color}
-          strokeWidth="2.2"
+          strokeWidth="0.9"
           strokeLinejoin="round"
           strokeLinecap="round"
         />
@@ -154,20 +155,29 @@ function TargetRow({
 
   return (
     <div className="px-3 py-1.5 border-b border-border/10 last:border-0">
-      {/* Row 1: dot · symbol · side · price · change% */}
+      {/* Row 1: dot · symbol · side (FULL WORD) · price · change% */}
       <div className="flex items-center gap-1.5">
         <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${dotColor}`} />
         <span className="text-[11px] font-bold tabular-nums leading-none">{shortSym}</span>
-        <span className={`text-[8px] font-bold px-0.5 rounded shrink-0 ${positionSide === "LONG" ? "text-green-400" : "text-red-400"}`}>
-          {positionSide === "LONG" ? "L" : "S"}
+        <span
+          className={`text-[8px] font-bold px-1 rounded shrink-0 ${
+            positionSide === "LONG" ? "text-green-400" : "text-red-400"
+          }`}
+        >
+          {positionSide === "LONG" ? "LONG" : "SHORT"}
         </span>
         {microPrice && (
           <span className="font-mono text-[9px] text-foreground/60 tabular-nums ml-auto leading-none">
             ${microPrice}
           </span>
         )}
-        <span className={`text-[9px] font-mono tabular-nums font-semibold ${pUp ? "text-green-400" : "text-red-400"}`}>
-          {pUp ? "+" : ""}{priceChangePct.toFixed(2)}%
+        <span
+          className={`text-[9px] font-mono tabular-nums font-semibold ${
+            pUp ? "text-green-400" : "text-red-400"
+          }`}
+        >
+          {pUp ? "+" : ""}
+          {priceChangePct.toFixed(2)}%
         </span>
       </div>
       {/* Row 2: chart · WR · P-score */}
@@ -178,7 +188,15 @@ function TargetRow({
           isToxic={isToxic}
         />
         <div className="flex flex-col items-end shrink-0 gap-0.5">
-          <span className={`text-[8px] font-mono tabular-nums ${isToxic ? "text-red-400" : isCandidate ? "text-green-400" : "text-muted-foreground/60"}`}>
+          <span
+            className={`text-[8px] font-mono tabular-nums ${
+              isToxic
+                ? "text-red-400"
+                : isCandidate
+                ? "text-green-400"
+                : "text-muted-foreground/60"
+            }`}
+          >
             P{Math.round(priorityScore * 100)}
           </span>
           <span className="text-[8px] text-muted-foreground/50 tabular-nums font-mono">
@@ -196,7 +214,12 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
 
   const { data: btcTicker } = useGetBingXTicker(
     { symbol: "BTC-USDT" },
-    { query: { refetchInterval: 5000, queryKey: getGetBingXTickerQueryKey({ symbol: "BTC-USDT" }) } }
+    {
+      query: {
+        refetchInterval: 5000,
+        queryKey: getGetBingXTickerQueryKey({ symbol: "BTC-USDT" }),
+      },
+    }
   );
 
   const { data: summary } = useGetBingXSummary({
@@ -262,57 +285,96 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
         </div>
 
         {/* BTC Compass */}
-<div className={`mx-3 mt-3 p-3 rounded-lg border shrink-0 ${btcUp ? "border-green-500/25 bg-green-500/5" : "border-red-500/25 bg-red-500/5"}`}>
-  <div className="flex items-center justify-between mb-1">
-    <div className="flex items-center gap-1.5">
-      <span className="text-[9px] font-bold text-muted-foreground uppercase tracking-widest">BTC/USDT</span>
-    </div>
-    <img 
-      src="https://cryptologos.cc/logos/bitcoin-btc-logo.svg" 
-      alt="BTC" 
-      className="w-5 h-5"
-      onError={(e) => {
-        (e.target as HTMLImageElement).style.display = 'none';
-      }}
-    />
-  </div>
-  <div className="font-bold font-mono text-base tabular-nums">
-    ${fmtPrice(btcTicker?.lastPrice)}
-  </div>
-  <div className={`flex items-center gap-1 mt-0.5 ${btcUp ? "text-green-400" : "text-red-400"}`}>
-    {btcUp ? <ArrowUp className="w-3 h-3" /> : <ArrowDown className="w-3 h-3" />}
-    <span className="text-xs font-semibold font-mono">{btcUp ? "+" : ""}{btcChange.toFixed(2)}%</span>
-    <span className={`ml-auto text-[9px] font-bold px-1.5 py-0.5 rounded ${btcUp ? "bg-green-500/15 text-green-400" : "bg-red-500/15 text-red-400"}`}>
-      {btcUp ? "BULL" : "BEAR"}
-    </span>
-  </div>
-  {btcTicker && (
-    <div className="flex justify-between mt-2 text-[9px] text-muted-foreground font-mono">
-      <span>H: <span className="text-foreground/70">{fmtPrice(btcTicker.highPrice)}</span></span>
-      <span>L: <span className="text-foreground/70">{fmtPrice(btcTicker.lowPrice)}</span></span>
-    </div>
-  )}
-</div>
+        <div
+          className={`mx-3 mt-3 p-3 rounded-lg border shrink-0 ${
+            btcUp
+              ? "border-green-500/25 bg-green-500/5"
+              : "border-red-500/25 bg-red-500/5"
+          }`}
+        >
+          <div className="flex items-center justify-between mb-1">
+            <div className="flex items-center gap-1.5">
+              <span className="text-[9px] font-bold text-muted-foreground uppercase tracking-widest">
+                BTC/USDT
+              </span>
+            </div>
+            <img
+              src="https://cryptologos.cc/logos/bitcoin-btc-logo.svg"
+              alt="BTC"
+              className="w-5 h-5"
+              onError={(e) => {
+                (e.target as HTMLImageElement).style.display = "none";
+              }}
+            />
+          </div>
+          <div className="font-bold font-mono text-base tabular-nums">
+            ${fmtPrice(btcTicker?.lastPrice)}
+          </div>
+          <div
+            className={`flex items-center gap-1 mt-0.5 ${
+              btcUp ? "text-green-400" : "text-red-400"
+            }`}
+          >
+            {btcUp ? <ArrowUp className="w-3 h-3" /> : <ArrowDown className="w-3 h-3" />}
+            <span className="text-xs font-semibold font-mono">
+              {btcUp ? "+" : ""}
+              {btcChange.toFixed(2)}%
+            </span>
+            <span
+              className={`ml-auto text-[9px] font-bold px-1.5 py-0.5 rounded ${
+                btcUp
+                  ? "bg-green-500/15 text-green-400"
+                  : "bg-red-500/15 text-red-400"
+              }`}
+            >
+              {btcUp ? "BULL" : "BEAR"}
+            </span>
+          </div>
+          {btcTicker && (
+            <div className="flex justify-between mt-2 text-[9px] text-muted-foreground font-mono">
+              <span>
+                H: <span className="text-foreground/70">{fmtPrice(btcTicker.highPrice)}</span>
+              </span>
+              <span>
+                L: <span className="text-foreground/70">{fmtPrice(btcTicker.lowPrice)}</span>
+              </span>
+            </div>
+          )}
+        </div>
 
         {/* Account mini-summary */}
         {summary?.connected && (
           <div className="mx-3 mt-2 p-3 rounded-lg border border-border/30 bg-muted/10 shrink-0">
-            <p className="text-[9px] text-muted-foreground uppercase tracking-widest mb-1.5">Account</p>
+            <p className="text-[9px] text-muted-foreground uppercase tracking-widest mb-1.5">
+              Account
+            </p>
             <div className="space-y-1">
               <div className="flex justify-between text-[10px]">
                 <span className="text-muted-foreground">Balance</span>
-                <span className="font-mono font-semibold">${parseFloat(summary.totalBalance).toFixed(2)}</span>
+                <span className="font-mono font-semibold">
+                  ${parseFloat(summary.totalBalance).toFixed(2)}
+                </span>
               </div>
               <div className="flex justify-between text-[10px]">
                 <span className="text-muted-foreground">Realized</span>
-                <span className={`font-mono font-semibold ${recentRealizedPnl >= 0 ? "text-green-400" : "text-red-400"}`}>
-                  {recentRealizedPnl >= 0 ? "+" : ""}{recentRealizedPnl.toFixed(4)}
+                <span
+                  className={`font-mono font-semibold ${
+                    recentRealizedPnl >= 0 ? "text-green-400" : "text-red-400"
+                  }`}
+                >
+                  {recentRealizedPnl >= 0 ? "+" : ""}
+                  {recentRealizedPnl.toFixed(4)}
                 </span>
               </div>
               <div className="flex justify-between text-[10px]">
                 <span className="text-muted-foreground">Open PnL</span>
-                <span className={`font-mono font-semibold ${openPnl >= 0 ? "text-green-400" : "text-red-400"}`}>
-                  {openPnl >= 0 ? "+" : ""}{openPnl.toFixed(4)}
+                <span
+                  className={`font-mono font-semibold ${
+                    openPnl >= 0 ? "text-green-400" : "text-red-400"
+                  }`}
+                >
+                  {openPnl >= 0 ? "+" : ""}
+                  {openPnl.toFixed(4)}
                 </span>
               </div>
               <div className="flex justify-between text-[10px]">
@@ -340,10 +402,18 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
                     : "text-muted-foreground hover:text-foreground hover:bg-muted/30"
                 }`}
               >
-                <Icon className={`w-4 h-4 shrink-0 ${active ? "text-primary" : highlight ? "text-blue-400" : ""}`} />
+                <Icon
+                  className={`w-4 h-4 shrink-0 ${
+                    active ? "text-primary" : highlight ? "text-blue-400" : ""
+                  }`}
+                />
                 {label}
                 {active && <span className="ml-auto w-1.5 h-1.5 rounded-full bg-primary" />}
-                {!active && highlight && <span className="ml-auto text-[8px] font-bold px-1 py-0.5 rounded bg-blue-500/15 text-blue-400 uppercase tracking-wide">VST</span>}
+                {!active && highlight && (
+                  <span className="ml-auto text-[8px] font-bold px-1 py-0.5 rounded bg-blue-500/15 text-blue-400 uppercase tracking-wide">
+                    VST
+                  </span>
+                )}
               </Link>
             );
           })}
@@ -356,33 +426,49 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
             <div className="flex items-center justify-between px-3 py-2 border-b border-border/20">
               <div className="flex items-center gap-1.5">
                 <Radio className="w-3 h-3 text-primary" />
-                <span className="text-[9px] font-bold text-muted-foreground uppercase tracking-widest">Targets</span>
+                <span className="text-[9px] font-bold text-muted-foreground uppercase tracking-widest">
+                  Targets
+                </span>
               </div>
               <div className="flex items-center gap-1.5">
                 {scan && (
-                  <span className={`text-[9px] font-bold px-1 py-0.5 rounded ${
-                    candidateCount > 0
-                      ? "bg-green-500/15 text-green-400"
-                      : "bg-muted/30 text-muted-foreground"
-                  }`}>
+                  <span
+                    className={`text-[9px] font-bold px-1 py-0.5 rounded ${
+                      candidateCount > 0
+                        ? "bg-green-500/15 text-green-400"
+                        : "bg-muted/30 text-muted-foreground"
+                    }`}
+                  >
                     {candidateCount} ready
                   </span>
                 )}
-                <span className={`text-[9px] font-mono text-muted-foreground`}>≤10/s</span>
+                <span className="text-[9px] font-mono text-muted-foreground">≤10/s</span>
               </div>
             </div>
 
             {/* Regime row */}
             {scan && (
-              <div className={`px-3 py-1.5 border-b border-border/10 flex items-center justify-between ${
-                scan.btcRegime === "BULL" ? "bg-green-500/5" :
-                scan.btcRegime === "BEAR" ? "bg-red-500/5" : "bg-muted/5"
-              }`}>
+              <div
+                className={`px-3 py-1.5 border-b border-border/10 flex items-center justify-between ${
+                  scan.btcRegime === "BULL"
+                    ? "bg-green-500/5"
+                    : scan.btcRegime === "BEAR"
+                    ? "bg-red-500/5"
+                    : "bg-muted/5"
+                }`}
+              >
                 <span className="text-[9px] text-muted-foreground">Regime</span>
-                <span className={`text-[9px] font-bold ${
-                  scan.btcRegime === "BULL" ? "text-green-400" :
-                  scan.btcRegime === "BEAR" ? "text-red-400" : "text-muted-foreground"
-                }`}>{scan.btcRegime} · UTC{scan.currentHourUtc}h</span>
+                <span
+                  className={`text-[9px] font-bold ${
+                    scan.btcRegime === "BULL"
+                      ? "text-green-400"
+                      : scan.btcRegime === "BEAR"
+                      ? "text-red-400"
+                      : "text-muted-foreground"
+                  }`}
+                >
+                  {scan.btcRegime} · UTC{scan.currentHourUtc}h
+                </span>
               </div>
             )}
 
@@ -434,9 +520,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
       </aside>
 
       {/* Main content */}
-      <main className="flex-1 overflow-y-auto">
-        {children}
-      </main>
+      <main className="flex-1 overflow-y-auto">{children}</main>
     </div>
   );
 }
