@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -13,7 +14,9 @@ from layers.strategic import build_strategic_report
 
 class RuntimeRegressionTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.temp_dir = tempfile.TemporaryDirectory()
+        tmp_root = Path(os.environ.get("QUANT_BRAIN_TEST_TMP", r"C:\tmp" if os.name == "nt" else str(Path(__file__).parent / ".tmp")))
+        tmp_root.mkdir(parents=True, exist_ok=True)
+        self.temp_dir = tempfile.TemporaryDirectory(dir=tmp_root, ignore_cleanup_errors=True)
         self.original_db_path = kb.DB_PATH
         kb.DB_PATH = Path(self.temp_dir.name) / "knowledge.db"
 
