@@ -476,9 +476,9 @@ export default function AnalysisPage() {
           </CardContent>
         </Card>
 
-        <div className="grid gap-4 xl:grid-cols-[1.05fr_0.95fr]">
-          <Card className="border-border/60 bg-card/35">
-            <CardHeader className="border-b border-border/40 px-5 py-3">
+        <div className="grid gap-4 xl:grid-cols-[1.05fr_0.95fr] items-start">
+          <Card className="border-border/60 bg-card/35 flex flex-col">
+            <CardHeader className="border-b border-border/40 px-5 py-3 shrink-0">
               <div className="flex items-center justify-between gap-2">
                 <CardTitle className="flex items-center gap-2 text-sm font-semibold">
                   <Activity className="h-4 w-4 text-primary" />
@@ -490,6 +490,7 @@ export default function AnalysisPage() {
               </div>
             </CardHeader>
             <CardContent className="p-0">
+              <div className="h-[260px] overflow-y-auto custom-scrollbar">
               {analysisSource !== "DEMO" ? (
                 <div className="p-5 text-xs text-muted-foreground">Use VST DEMO para ver posições abertas consolidadas nesta tela.</div>
               ) : sortedDemoPositions.length === 0 ? (
@@ -539,23 +540,25 @@ export default function AnalysisPage() {
                   })}
                 </div>
               )}
+              </div>
             </CardContent>
           </Card>
 
-          <Card className="border-border/60 bg-card/35">
-            <CardHeader className="border-b border-border/40 px-5 py-3">
+          <Card className="border-border/60 bg-card/35 flex flex-col">
+            <CardHeader className="border-b border-border/40 px-5 py-3 shrink-0">
               <div className="flex items-center justify-between gap-2">
                 <CardTitle className="flex items-center gap-2 text-sm font-semibold">
                   <Clock className="h-4 w-4 text-primary" />
-                  Operacoes fechadas
+                  Operações fechadas
                 </CardTitle>
                 <span className="font-mono text-[10px] text-muted-foreground">ultimo: {latestCloseTime}</span>
               </div>
             </CardHeader>
             <CardContent className="p-0">
+              <div className="h-[260px] overflow-y-auto custom-scrollbar">
               {recentOutcomes.length > 0 ? (
                 <div className="divide-y divide-border/30">
-                  <div className="grid grid-cols-[86px_1fr_74px_82px_128px] items-center gap-3 px-5 py-2 text-[9px] font-semibold uppercase tracking-wider text-muted-foreground">
+                  <div className="grid grid-cols-[86px_1fr_74px_82px_128px] items-center gap-3 px-5 py-2 text-[9px] font-semibold uppercase tracking-wider text-muted-foreground sticky top-0 bg-card/95 backdrop-blur-sm z-10">
                     <span>Hora</span>
                     <span>Par / lado</span>
                     <span>Motivo</span>
@@ -623,6 +626,7 @@ export default function AnalysisPage() {
                   </p>
                 </div>
               )}
+              </div>
             </CardContent>
           </Card>
         </div>
