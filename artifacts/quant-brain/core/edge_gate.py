@@ -2,16 +2,19 @@ from __future__ import annotations
 
 import asyncio
 import math
+import os
 import random
 import time
+import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from core.movement_sniper import evaluate_sniper_window
+from core.movement_sniper import MovementFeatures, evaluate_sniper_window
 from core import knowledge_base as kb
 from core.recommendation import recommend_entry
-from core.async_utils import run_blocking
+from core.async_utils import run_edge_blocking
 from core.signal_learning import (
+    build_context_key,
     finalize_due_signal_outcomes,
     record_signal_from_gate,
     score_signal_context,
@@ -58,6 +61,75 @@ def _target_moves(config: dict[str, Any]) -> dict[str, float]:
     }
     targets["configured"] = max(0.0, _num(config.get("takeProfitPct"), 0.15))
     return targets
+
+
+def _risk_geometry_blocks(
+    *,
+    config: dict[str, Any],
+    net_target_pct: float,
+    stop_move_pct: float,
+    cost_pct: float,
+    hit_probability: float,
+    ev_samples: int,
+    shadow_ml: dict[str, Any],
+    min_samples: int,
+) -> tuple[list[str], dict[str, Any]]:
+    loss_pct = max(0.0, stop_move_pct + cost_pct)
+    reward_risk = net_target_pct / loss_pct if loss_pct > 0 else 0.0
+    breakeven_probability = (
+        loss_pct / max(0.000001, net_target_pct + loss_pct)
+        if net_target_pct > 0 and loss_pct > 0
+        else 1.0
+    )
+    min_reward_risk = max(
+        0.0,
+        _num(
+            config.get("minRewardRiskRatio"),
+            _num(os.environ.get("MIN_REWARD_RISK_RATIO"), 0.75),
+        ),
+    )
+    edge_buffer = max(
+        0.0,
+        _num(
+            config.get("minProbabilityEdge"),
+            _num(os.environ.get("MIN_PROBABILITY_EDGE"), 0.03),
+        ),
+    )
+
+    probability_source = "none"
+    probability_estimate: float | None = None
+    if shadow_ml.get("available") and shadow_ml.get("calibratedProbability") is not None:
+        probability_estimate = max(0.0, min(1.0, float(shadow_ml["calibratedProbability"])))
+        probability_source = "shadow_ml"
+    elif ev_samples >= min_samples:
+        probability_estimate = max(0.0, min(1.0, hit_probability))
+        probability_source = "realized_signal_edge"
+
+    blocks: list[str] = []
+    if reward_risk < min_reward_risk:
+        blocks.append(
+            "RISK_REWARD_REJECT: "
+            f"net reward:risk {reward_risk:.2f} < {min_reward_risk:.2f} "
+            f"(netTarget={net_target_pct:.4f}%, stopPlusCost={loss_pct:.4f}%)"
+        )
+
+    required_probability = min(0.99, breakeven_probability + edge_buffer)
+    if probability_estimate is not None and probability_estimate < required_probability:
+        blocks.append(
+            "BREAKEVEN_PROB_REJECT: "
+            f"{probability_source}={probability_estimate:.3f} < required={required_probability:.3f} "
+            f"(breakeven={breakeven_probability:.3f})"
+        )
+
+    return blocks, {
+        "netRewardRisk": round(reward_risk, 4),
+        "minRewardRisk": round(min_reward_risk, 4),
+        "breakevenProbability": round(breakeven_probability, 4),
+        "requiredProbability": round(required_probability, 4),
+        "probabilityEstimate": round(probability_estimate, 4) if probability_estimate is not None else None,
+        "probabilitySource": probability_source,
+        "lossPctWithCost": round(loss_pct, 6),
+    }
 
 
 def _num(value: Any, fallback: float = 0.0) -> float:
@@ -434,6 +506,7 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
     now_hour = datetime.now(timezone.utc).hour
     hour_utc = int(payload.get("hourUtc", payload.get("hour_utc", now_hour)))
     config = payload.get("config") or {}
+    intelligence_only = bool(payload.get("intelligenceOnly"))
     if payload.get("observationSourceType"):
         config = {**config, "signalSourceType": payload.get("observationSourceType")}
 
@@ -447,7 +520,8 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
     is_aggressive = risk_profile in ("aggressive", "sniper_max", "demo_learning_aggressive")
 
     # ── Signal metadata ──────────────────────────────────────────────────────
-    signal_id = payload.get("signalId")
+    signal_id = payload.get("signalId") or str(uuid.uuid4())
+    request_signal_id = str(signal_id)
     market_event_id = payload.get("marketEventId")
     feature_version = payload.get("featureVersion", "sniper-v1")
     experiment_assignments = assign_signal_to_experiments(payload)
@@ -493,12 +567,13 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
     alt_history = get_snapshot_history(symbol, 900)
     btc_history = get_snapshot_history("BTC-USDT", 900)
     target_moves_pct = _target_moves(config)
-    sniper = await run_blocking(
+    sniper = await run_edge_blocking(
         evaluate_sniper_window,
         symbol, alt_history, btc_history, target_moves_pct=target_moves_pct
     )
     signal_metadata = {
         "signalId": signal_id,
+        "predictionId": str(payload.get("predictionId") or uuid.uuid4()),
         "marketEventId": market_event_id,
         "featureVersion": feature_version,
         "featureTimestampMs": payload.get("featureTimestampMs"),
@@ -507,14 +582,30 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
         "referencePrice": payload.get("referencePrice"),
         "configVersion": payload.get("configVersion") or config.get("configVersion"),
     }
-    signal_memory = await record_signal_from_gate(
-        symbol,
-        position_side,
-        sniper,
-        config,
-        metadata=signal_metadata,
-    )
-    signal_id = signal_memory["signalId"]
+    if intelligence_only:
+        alt_for_context = MovementFeatures(**sniper["altFeatures"])
+        btc_for_context = MovementFeatures(**sniper["btcFeatures"])
+        taker_fee_bps = _num(config.get("takerFeeBps"), _num(config.get("taker_fee_bps"), 5.0))
+        slippage_bps = _num(config.get("slippageBpsPerSide"), _num(config.get("slippage_bps_per_side"), 2.0))
+        funding_pct = _num(config.get("estimatedFundingCostPct"), 0.0)
+        signal_memory = {
+            "signalId": request_signal_id,
+            "side": position_side,
+            "contextKey": build_context_key(alt_for_context, btc_for_context),
+            "targetMovesPct": target_moves_pct,
+            "estimatedCostPct": (taker_fee_bps + slippage_bps * 2.0) / 100.0 + funding_pct,
+            "recordStatus": "intelligence_only",
+        }
+        memory_signal_id = request_signal_id
+    else:
+        signal_memory = await record_signal_from_gate(
+            symbol,
+            position_side,
+            sniper,
+            config,
+            metadata=signal_metadata,
+        )
+        memory_signal_id = signal_memory["signalId"]
     signal_edge, news_context, operational_risk = await asyncio.gather(
         score_signal_context(symbol, signal_memory["side"], signal_memory["contextKey"]),
         kb.get_active_news_context(symbol),
@@ -551,7 +642,7 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
     ev_samples = int(effective_stats.get("samples", 0))
 
     # ── Shadow ML ────────────────────────────────────────────────────────────
-    shadow_ml = await run_blocking(
+    shadow_ml = await run_edge_blocking(
         predict_shadow,
         {
             "symbol": symbol,
@@ -671,6 +762,16 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
         realized_score=float(recommendation.get("score", 1.0)),
         rec_samples=rec_samples,
         rec_has_recommendation=bool(recommendation.get("shadowRecommendation")),
+    )
+    risk_geometry_blocks, risk_geometry = _risk_geometry_blocks(
+        config=config,
+        net_target_pct=net_target_pct,
+        stop_move_pct=stop_move_pct,
+        cost_pct=cost_pct,
+        hit_probability=hit_probability,
+        ev_samples=ev_samples,
+        shadow_ml=shadow_ml,
+        min_samples=int(signal_edge.get("minSamples", 8)),
     )
 
     # In non-aggressive profiles: also apply the optional user-configured thresholds
@@ -820,7 +921,7 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
                 "COST_EDGE_REJECT: target does not clear execution costs + noise margin"
             )
 
-    all_blocks = judge_result["blocks"] + high_sample_blocks + extra_blocks
+    all_blocks = judge_result["blocks"] + high_sample_blocks + risk_geometry_blocks + extra_blocks
     allow = len(all_blocks) == 0
 
     # ── LAYER 2: Coach Ranker — scoring, soft penalties, ranking ────────────
@@ -857,20 +958,22 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
         if shadow_ml.get("available")
         else "MODEL_UNAVAILABLE"
     )
-    await kb.update_signal_decision_audit(
-        signal_id,
-        allowed=allow,
-        reject_reasons=all_blocks,
-        raw_score=float(coaching["executionPriority"]),
-        calibrated_score=float(coaching.get("calibratedScore", coaching["executionPriority"])),
-        policy_version=primary_experiment["policyVersion"] if primary_experiment else None,
-        playbook=regime_playbook.get("playbook"),
-        regime=regime_playbook.get("regime"),
-        setup_type=(regime_playbook.get("allowedSetups") or [None])[0],
-    )
+    if not intelligence_only:
+        await kb.update_signal_decision_audit(
+            memory_signal_id,
+            allowed=allow,
+            reject_reasons=all_blocks,
+            raw_score=float(coaching["executionPriority"]),
+            calibrated_score=float(coaching.get("calibratedScore", coaching["executionPriority"])),
+            policy_version=primary_experiment["policyVersion"] if primary_experiment else None,
+            playbook=regime_playbook.get("playbook"),
+            regime=regime_playbook.get("regime"),
+            setup_type=(regime_playbook.get("allowedSetups") or [None])[0],
+        )
 
     return {
         "allow": allow,
+        "available": True,
         "gateRejects": all_blocks,
         "score": coaching["executionPriority"],
         "aggressiveScore": coaching["aggressiveScore"],
@@ -883,7 +986,8 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
         "judgeSniper": judge_result,
         "coachRanker": coaching,
         # Contract v2 — provenance & ML audit
-        "signalId": signal_id,
+        "signalId": request_signal_id,
+        "predictionId": str(payload.get("predictionId") or uuid.uuid4()),
         "marketEventId": market_event_id,
         "featureVersion": feature_version,
         "experimentAssignments": experiment_assignments,
@@ -893,7 +997,10 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
         "modelVersion": ml_model_version,
         "calibratedProbability": round(ml_calibrated_prob, 6) if ml_calibrated_prob is not None else None,
         "uncertaintyType": ml_uncertainty_type,
-        "predictionTimestamp": time.time(),
+        "predictionTimestamp": int(time.time() * 1000),
+        "contractVersion": "edge-v3",
+        "probabilityDefinition": "probability_configured_target_hit_before_stop",
+        "dataAgeMs": None,
         "symbol": symbol,
         "side": side,
         "positionSide": position_side,
@@ -931,6 +1038,7 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
             "kellyFraction": optimal_size["kelly_fraction"],
             "playbookSizeMultiplier": size_multiplier,
             "baseOptimalMarginKelly": optimal_size.get("base_optimal_margin_usdt", 0.0),
+            "riskGeometry": risk_geometry,
         },
         "newsContext": news_context,
         "dataQuality": data_quality,
