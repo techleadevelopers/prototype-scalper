@@ -850,6 +850,21 @@ export default function DemoPage() {
               <p className="text-xs text-muted-foreground mt-0.5">
                 VST account · sniper lógica completa · sem risco real
               </p>
+              {config && (
+                <div className="flex flex-row mt-2 rounded-md border border-border/30 bg-muted/15 overflow-hidden divide-x divide-border/20">
+                  {([
+                    { label: "Leverage · Margin", value: `${config.leverage}× · ${config.marginPerTrade} USDT` },
+                    { label: "TP · SL", value: `${config.takeProfitPct}% · ${config.stopLossPct}%` },
+                    { label: "EV mín · WR mín", value: `${config.evMinThreshold > 0 ? `≥${config.evMinThreshold.toFixed(4)}` : "off"} · ${config.winRateMin > 0 ? `≥${(config.winRateMin * 100).toFixed(0)}%` : "off"}` },
+                    { label: "Cycles · Placed · Open", value: `${sniperStatus?.cycleCount ?? 0} · ${sniperStatus?.totalPlaced ?? 0} · ${sniperStatus?.openTrades ?? 0}` },
+                  ] as { label: string; value: string }[]).map(({ label, value }) => (
+                    <div key={label} className="px-3 py-1.5 flex flex-col gap-0.5">
+                      <span className="text-[9px] text-muted-foreground whitespace-nowrap">{label}</span>
+                      <span className="text-[11px] font-mono font-semibold whitespace-nowrap">{value}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           </div>
 
