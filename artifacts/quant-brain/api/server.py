@@ -13,6 +13,7 @@ import logging
 import uuid
 import json
 import gzip
+import threading
 from contextlib import asynccontextmanager
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -66,6 +67,8 @@ _DB_INIT_RETRY_SECONDS = float(os.environ.get("DB_INIT_RETRY_SECONDS", "10"))
 _MODEL_MAINTENANCE_SECONDS = float(os.environ.get("MODEL_MAINTENANCE_SECONDS", "120"))
 _TACTICAL_LOOP_SECONDS = max(5, int(float(os.environ.get("TACTICAL_LOOP_SECONDS", "15"))))
 _JOB_MAX_CONCURRENCY = max(1, int(os.environ.get("JOB_MAX_CONCURRENCY", "2")))
+_JOB_MAX_QUEUE_SIZE = max(1, int(os.environ.get("JOB_MAX_QUEUE_SIZE", "256")))
+_JOB_RESERVED_PRIORITY = max(0, int(os.environ.get("JOB_RESERVED_PRIORITY", "1")))
 _JOB_STALE_AFTER_SECONDS = max(30, int(float(os.environ.get("JOB_STALE_AFTER_SECONDS", "120"))))
 _TACTICAL_JOB_TIMEOUT_SECONDS = max(5, int(float(os.environ.get("TACTICAL_JOB_TIMEOUT_SECONDS", "20"))))
 _SHADOW_SAMPLER_JOB_TIMEOUT_SECONDS = max(5, int(float(os.environ.get("SHADOW_SAMPLER_JOB_TIMEOUT_SECONDS", "25"))))
@@ -74,6 +77,8 @@ _MACRO_CANDLE_ANALYSIS_SECONDS = max(60, int(float(os.environ.get("MACRO_CANDLE_
 _MACRO_CANDLE_JOB_TIMEOUT_SECONDS = max(10, int(float(os.environ.get("MACRO_CANDLE_JOB_TIMEOUT_SECONDS", "30"))))
 job_supervisor = JobSupervisor(
     max_concurrent_jobs=_JOB_MAX_CONCURRENCY,
+    max_queue_size=_JOB_MAX_QUEUE_SIZE,
+    reserved_priority=_JOB_RESERVED_PRIORITY,
     stale_after_seconds=_JOB_STALE_AFTER_SECONDS,
 )
 _RETENTION_MAINTENANCE_SECONDS = float(
@@ -81,6 +86,32 @@ _RETENTION_MAINTENANCE_SECONDS = float(
 )
 _last_model_training_attempt_samples = 0
 _last_retention_maintenance_at = 0.0
+_training_lock = asyncio.Lock()
+_training_task: asyncio.Task | None = None
+_training_status: dict[str, Any] = {
+    "running": False,
+    "startedAt": None,
+    "finishedAt": None,
+    "lastResult": None,
+    "lastError": None,
+}
+
+
+def _quant_fail_closed(reason: str, *, symbol: str = "", position_side: str = "", error: str | None = None) -> dict[str, Any]:
+    return {
+        "allow": False,
+        "available": False,
+        "gateRejects": [reason],
+        "score": 0.0,
+        "calibratedProbability": None,
+        "uncertainty": 1.0,
+        "authority": "quant-brain-fail-closed",
+        "mode": "degraded_fail_closed",
+        "symbol": symbol,
+        "positionSide": position_side,
+        "error": error or reason,
+        "predictionTimestamp": time.time(),
+    }
 
 # ========== NOVAS ESTRUTURAS PARA EXCELÊNCIA ==========
 
@@ -356,9 +387,11 @@ async def _run_model_maintenance_once():
         and unseen_attempt
     ):
         _last_model_training_attempt_samples = samples
-        result = await train_shadow_model(min_samples=300)
+        if not _training_status.get("running"):
+            asyncio.create_task(_background_training(300, "auto_maintenance"))
+        result = {"trained": False, "reason": "training_scheduled", "samples": samples}
         log.info(
-            "Shadow model training completed: trained=%s samples=%s reason=%s",
+            "Shadow model training scheduled: trained=%s samples=%s reason=%s",
             result.get("trained"),
             samples,
             result.get("reason"),
@@ -460,6 +493,46 @@ async def _initialize_runtime_services():
 
     _runtime_state["services_started"] = True
     return
+
+
+async def _run_training_job(min_samples: int, reason: str = "manual") -> dict[str, Any]:
+    async with _training_lock:
+        _training_status.update({
+            "running": True,
+            "startedAt": time.time(),
+            "finishedAt": None,
+            "lastError": None,
+            "reason": reason,
+            "thread": threading.current_thread().name,
+        })
+        try:
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(
+                None,
+                lambda: asyncio.run(train_shadow_model(min_samples=min_samples)),
+            )
+            _training_status.update({
+                "running": False,
+                "finishedAt": time.time(),
+                "lastResult": result,
+                "lastError": None,
+            })
+            return result
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            _training_status.update({
+                "running": False,
+                "finishedAt": time.time(),
+                "lastError": error,
+            })
+            raise
+
+
+async def _background_training(min_samples: int, reason: str) -> None:
+    try:
+        await _run_training_job(min_samples=min_samples, reason=reason)
+    except Exception:
+        log.exception("Shadow model background training failed")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -1068,24 +1141,20 @@ async def evaluate_edge_endpoint(body: dict):
         return await asyncio.wait_for(evaluate_edge_gate(body), timeout=25)
     except asyncio.TimeoutError:
         log.exception("edge evaluate timeout")
-        return {
-            "allow": True,
-            "gateRejects": [],
-            "score": 0.0,
-            "authority": "quant-brain-degraded",
-            "mode": "degraded_timeout",
-            "error": "edge_evaluate_timeout",
-        }
+        return _quant_fail_closed(
+            "QB_TIMEOUT_REJECT",
+            symbol=str(body.get("symbol", "")),
+            position_side=str(body.get("positionSide", body.get("side", ""))),
+            error="edge_evaluate_timeout",
+        )
     except Exception as exc:
         log.exception("edge evaluate failed")
-        return {
-            "allow": True,
-            "gateRejects": [],
-            "score": 0.0,
-            "authority": "quant-brain-degraded",
-            "mode": "degraded_error",
-            "error": f"{type(exc).__name__}: {exc}",
-        }
+        return _quant_fail_closed(
+            "QB_ERROR_REJECT",
+            symbol=str(body.get("symbol", "")),
+            position_side=str(body.get("positionSide", body.get("side", ""))),
+            error=f"{type(exc).__name__}: {exc}",
+        )
 
 
 @app.post("/position-sizing/evaluate")
@@ -1133,6 +1202,9 @@ async def rank_cycle_candidates(body: dict):
     candidates_raw = body.get("candidates")
     if not candidates_raw or not isinstance(candidates_raw, list):
         raise HTTPException(400, "Required field: candidates (non-empty list)")
+    max_candidates = max(1, int(os.environ.get("CYCLE_RANK_MAX_CANDIDATES", "50")))
+    if len(candidates_raw) > max_candidates:
+        raise HTTPException(413, f"Too many candidates: {len(candidates_raw)} > {max_candidates}")
 
     shared_config = body.get("config") or {}
     shared_btc_regime = body.get("btcRegime")
@@ -1154,20 +1226,23 @@ async def rank_cycle_candidates(body: dict):
         try:
             result = await asyncio.wait_for(evaluate_edge_gate(merged), timeout=20)
         except asyncio.TimeoutError:
-            result = {
-                "allow": True, "gateRejects": [], "score": 0.0,
-                "aggressiveScore": 0.0, "executionPriority": 0.0,
-                "authority": "quant-brain-degraded", "mode": "degraded_timeout",
-                "symbol": merged.get("symbol", ""), "positionSide": merged.get("positionSide", ""),
-            }
+            result = _quant_fail_closed(
+                "QB_TIMEOUT_REJECT",
+                symbol=str(merged.get("symbol", "")),
+                position_side=str(merged.get("positionSide", "")),
+                error="cycle_rank_edge_timeout",
+            )
+            result["aggressiveScore"] = 0.0
+            result["executionPriority"] = 0.0
         except Exception as exc:
-            result = {
-                "allow": True, "gateRejects": [], "score": 0.0,
-                "aggressiveScore": 0.0, "executionPriority": 0.0,
-                "authority": "quant-brain-degraded", "mode": "degraded_error",
-                "error": f"{type(exc).__name__}: {exc}",
-                "symbol": merged.get("symbol", ""), "positionSide": merged.get("positionSide", ""),
-            }
+            result = _quant_fail_closed(
+                "QB_ERROR_REJECT",
+                symbol=str(merged.get("symbol", "")),
+                position_side=str(merged.get("positionSide", "")),
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            result["aggressiveScore"] = 0.0
+            result["executionPriority"] = 0.0
         return result
 
     results = await asyncio.gather(*[_evaluate_one(c) for c in candidates_raw])
@@ -1470,7 +1545,28 @@ async def exit_stats_endpoint(
 @app.post("/models/sniper/train")
 async def train_sniper_model_endpoint(min_samples: int = Query(300, ge=100, le=100000)):
     """Train and validate the calibrated sniper model; authority remains shadow-only."""
-    return await train_shadow_model(min_samples=min_samples)
+    global _training_task
+    if _training_status.get("running"):
+        return {
+            "accepted": False,
+            "reason": "training_already_running",
+            "status": _training_status,
+        }
+    _training_task = asyncio.create_task(_background_training(min_samples, "manual_endpoint"))
+    return {
+        "accepted": True,
+        "running": True,
+        "minSamples": min_samples,
+        "statusUrl": "/models/sniper/train/status",
+    }
+
+
+@app.get("/models/sniper/train/status")
+async def train_sniper_model_status_endpoint():
+    return {
+        **_training_status,
+        "taskDone": None if _training_task is None else _training_task.done(),
+    }
 
 
 @app.get("/models/sniper/status")
