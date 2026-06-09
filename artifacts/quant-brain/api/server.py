@@ -42,6 +42,7 @@ from core.execution_auditor import record_trade_audit, get_execution_audit_repor
 from core.pipeline_auditor import validate_learning_eligibility
 from core.position_sizing import calculate_position_size, build_status as build_position_sizing_status
 from core.job_supervisor import JobSupervisor
+from core.async_utils import run_blocking, run_training_blocking
 from core.score_calibration import run_score_calibration
 from core.candle_regime import analyze_macro_candle_regime, candle_regime_status
 from core.regime_playbook import classify_regime_playbook
@@ -61,12 +62,17 @@ _runtime_state = {
     "services_started": False,
     "startup_error": None,
     "started_at": time.time(),
+    "event_loop_lag_ms": 0.0,
+    "event_loop_lag_max_ms": 0.0,
+    "event_loop_lag_updated_at": 0.0,
 }
 _DB_INIT_TIMEOUT_SECONDS = float(os.environ.get("DB_INIT_TIMEOUT_SECONDS", "20"))
 _DB_INIT_RETRY_SECONDS = float(os.environ.get("DB_INIT_RETRY_SECONDS", "10"))
 _MODEL_MAINTENANCE_SECONDS = float(os.environ.get("MODEL_MAINTENANCE_SECONDS", "120"))
+_SIGNAL_FINALIZER_SECONDS = float(os.environ.get("SIGNAL_FINALIZER_SECONDS", str(_MODEL_MAINTENANCE_SECONDS)))
+_MIN_TRAINING_SAMPLES = max(1, int(os.environ.get("MIN_TRAINING_SAMPLES", "300")))
 _TACTICAL_LOOP_SECONDS = max(5, int(float(os.environ.get("TACTICAL_LOOP_SECONDS", "15"))))
-_JOB_MAX_CONCURRENCY = max(1, int(os.environ.get("JOB_MAX_CONCURRENCY", "2")))
+_JOB_MAX_CONCURRENCY = max(1, int(os.environ.get("JOB_MAX_CONCURRENCY", "1")))
 _JOB_MAX_QUEUE_SIZE = max(1, int(os.environ.get("JOB_MAX_QUEUE_SIZE", "256")))
 _JOB_RESERVED_PRIORITY = max(0, int(os.environ.get("JOB_RESERVED_PRIORITY", "1")))
 _JOB_STALE_AFTER_SECONDS = max(30, int(float(os.environ.get("JOB_STALE_AFTER_SECONDS", "120"))))
@@ -371,13 +377,12 @@ def cache_response(ttl_seconds: int = None):
 async def _run_model_maintenance_once():
     global _last_model_training_attempt_samples, _last_retention_maintenance_at
 
-    await finalize_due_signal_outcomes()
     await restore_shadow_model()
     summary = await kb.get_signal_training_summary(decision_group=None, source_type=None)
     status = shadow_model_status()
     trained_samples = int(status.get("samples", 0) or 0)
     samples = int(summary["samples"])
-    needs_initial_train = not status.get("available") and samples >= 300
+    needs_initial_train = not status.get("available") and samples >= _MIN_TRAINING_SAMPLES
     needs_refresh = status.get("available") and samples >= trained_samples + 100
     unseen_attempt = samples > _last_model_training_attempt_samples
 
@@ -388,7 +393,7 @@ async def _run_model_maintenance_once():
     ):
         _last_model_training_attempt_samples = samples
         if not _training_status.get("running"):
-            asyncio.create_task(_background_training(300, "auto_maintenance"))
+            asyncio.create_task(_background_training(_MIN_TRAINING_SAMPLES, "auto_maintenance"))
         result = {"trained": False, "reason": "training_scheduled", "samples": samples}
         log.info(
             "Shadow model training scheduled: trained=%s samples=%s reason=%s",
@@ -401,6 +406,10 @@ async def _run_model_maintenance_once():
         _last_retention_maintenance_at = time.time()
         if any(deleted.values()):
             log.info("Retention cleanup completed: %s", deleted)
+
+
+async def _run_signal_finalizer_once():
+    return await finalize_due_signal_outcomes()
 
 
 async def _run_model_maintenance_loop():
@@ -466,7 +475,18 @@ async def _initialize_runtime_services():
         timeout_seconds=_MODEL_JOB_TIMEOUT_SECONDS,
         priority="low",
     )
-    log.info(f"Signal finalizer/model maintenance registered ({_MODEL_MAINTENANCE_SECONDS:.1f}s interval)")
+    job_supervisor.register(
+        "signal_finalizer",
+        _run_signal_finalizer_once,
+        interval_seconds=_SIGNAL_FINALIZER_SECONDS,
+        timeout_seconds=max(10, int(float(os.environ.get("SIGNAL_FINALIZER_JOB_TIMEOUT_SECONDS", "30")))),
+        priority="low",
+    )
+    log.info(
+        "Signal finalizer registered (%.1fs); model maintenance registered (%.1fs)",
+        _SIGNAL_FINALIZER_SECONDS,
+        _MODEL_MAINTENANCE_SECONDS,
+    )
 
     job_supervisor.register(
         "macro_candle_regime",
@@ -506,9 +526,7 @@ async def _run_training_job(min_samples: int, reason: str = "manual") -> dict[st
             "thread": threading.current_thread().name,
         })
         try:
-            loop = asyncio.get_running_loop()
-            result = await loop.run_in_executor(
-                None,
+            result = await run_training_blocking(
                 lambda: asyncio.run(train_shadow_model(min_samples=min_samples)),
             )
             _training_status.update({
@@ -533,6 +551,23 @@ async def _background_training(min_samples: int, reason: str) -> None:
         await _run_training_job(min_samples=min_samples, reason=reason)
     except Exception:
         log.exception("Shadow model background training failed")
+
+
+async def _event_loop_lag_monitor() -> None:
+    interval = max(0.1, float(os.environ.get("EVENT_LOOP_LAG_INTERVAL_SECONDS", "1.0")))
+    expected = time.perf_counter() + interval
+    while True:
+        await asyncio.sleep(interval)
+        now = time.perf_counter()
+        lag_ms = max(0.0, (now - expected) * 1000)
+        _runtime_state["event_loop_lag_ms"] = round(lag_ms, 3)
+        _runtime_state["event_loop_lag_max_ms"] = round(
+            max(float(_runtime_state.get("event_loop_lag_max_ms", 0.0) or 0.0), lag_ms),
+            3,
+        )
+        _runtime_state["event_loop_lag_updated_at"] = time.time()
+        expected = now + interval
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -563,6 +598,8 @@ async def lifespan(app: FastAPI):
 
     t3 = asyncio.create_task(cache_cleaner())
     _tasks.append(t3)
+    lag_task = asyncio.create_task(_event_loop_lag_monitor())
+    _tasks.append(lag_task)
 
     elapsed = time.time() - start_time
     log.info(f"✅ Quant Brain HTTP online em {elapsed:.2f}s; runtime initializing")
@@ -650,6 +687,11 @@ async def get_metrics():
             "ttl_seconds": _CACHE_TTL_SECONDS,
         },
         "jobs": job_supervisor.status(),
+        "eventLoop": {
+            "lagMs": _runtime_state["event_loop_lag_ms"],
+            "lagMaxMs": _runtime_state["event_loop_lag_max_ms"],
+            "updatedAt": _runtime_state["event_loop_lag_updated_at"],
+        },
     }
 
     for endpoint, stats in _endpoint_stats.items():
@@ -678,6 +720,10 @@ async def liveness_check():
             "staleJobs": job_supervisor.status()["staleJobs"],
             "maxConcurrentJobs": job_supervisor.status()["maxConcurrentJobs"],
         },
+        "eventLoop": {
+            "lagMs": _runtime_state["event_loop_lag_ms"],
+            "lagMaxMs": _runtime_state["event_loop_lag_max_ms"],
+        },
         "timestamp": time.time(),
     }
 
@@ -697,6 +743,10 @@ async def readiness_check():
         "services_started": _runtime_state["services_started"],
         "startup_error": _runtime_state["startup_error"],
         "jobs": jobs,
+        "eventLoop": {
+            "lagMs": _runtime_state["event_loop_lag_ms"],
+            "lagMaxMs": _runtime_state["event_loop_lag_max_ms"],
+        },
         "ai_enabled": _has_ai(),
         "timestamp": time.time()
     }
@@ -766,10 +816,15 @@ async def get_macro_candle_regime():
 
 @app.get("/sniper/btc-commander")
 @cache_response(ttl_seconds=2)
-async def get_btc_commander(window_seconds: int = Query(300, ge=60, le=900)):
+async def get_btc_commander(window_seconds: int = Query(int(os.environ.get("SNIPER_WINDOW_SECONDS", "300")), ge=60, le=900)):
     """BTC real-time commander for sniper scalp gating."""
     history = get_snapshot_history("BTC-USDT", window_seconds)
-    features = build_movement_features("BTC-USDT", history, window_seconds)
+    features = await run_blocking(
+        build_movement_features,
+        "BTC-USDT",
+        history,
+        window_seconds,
+    )
     return {
         "timestamp": time.time(),
         "windowSeconds": window_seconds,
@@ -780,14 +835,20 @@ async def get_btc_commander(window_seconds: int = Query(300, ge=60, le=900)):
 
 @app.get("/sniper/evaluate/{symbol}")
 @cache_response(ttl_seconds=2)
-async def evaluate_sniper_symbol(symbol: str, window_seconds: int = Query(300, ge=60, le=900)):
+async def evaluate_sniper_symbol(symbol: str, window_seconds: int = Query(int(os.environ.get("SNIPER_WINDOW_SECONDS", "300")), ge=60, le=900)):
     """Evaluate a symbol against BTC movement for short-target sniper entries."""
     sym = symbol.upper()
     if not sym.endswith("-USDT"):
         sym = f"{sym}-USDT"
     alt_history = get_snapshot_history(sym, window_seconds)
     btc_history = get_snapshot_history("BTC-USDT", window_seconds)
-    return evaluate_sniper_window(sym, alt_history, btc_history, window_seconds=window_seconds)
+    return await run_blocking(
+        evaluate_sniper_window,
+        sym,
+        alt_history,
+        btc_history,
+        window_seconds=window_seconds,
+    )
 
 
 # ========== TACTICAL ==========
@@ -1210,40 +1271,43 @@ async def rank_cycle_candidates(body: dict):
     shared_btc_regime = body.get("btcRegime")
     shared_btc_change = body.get("btcChangePct")
     shared_hour = body.get("hourUtc")
+    rank_concurrency = max(1, int(os.environ.get("CYCLE_RANK_CONCURRENCY", "8")))
+    rank_semaphore = asyncio.Semaphore(rank_concurrency)
 
     async def _evaluate_one(candidate: dict) -> dict:
-        merged = {**candidate}
-        if shared_config and "config" not in merged:
-            merged["config"] = shared_config
-        elif shared_config:
-            merged["config"] = {**shared_config, **(merged.get("config") or {})}
-        if shared_btc_regime and "btcRegime" not in merged:
-            merged["btcRegime"] = shared_btc_regime
-        if shared_btc_change is not None and "btcChangePct" not in merged:
-            merged["btcChangePct"] = shared_btc_change
-        if shared_hour is not None and "hourUtc" not in merged:
-            merged["hourUtc"] = shared_hour
-        try:
-            result = await asyncio.wait_for(evaluate_edge_gate(merged), timeout=20)
-        except asyncio.TimeoutError:
-            result = _quant_fail_closed(
-                "QB_TIMEOUT_REJECT",
-                symbol=str(merged.get("symbol", "")),
-                position_side=str(merged.get("positionSide", "")),
-                error="cycle_rank_edge_timeout",
-            )
-            result["aggressiveScore"] = 0.0
-            result["executionPriority"] = 0.0
-        except Exception as exc:
-            result = _quant_fail_closed(
-                "QB_ERROR_REJECT",
-                symbol=str(merged.get("symbol", "")),
-                position_side=str(merged.get("positionSide", "")),
-                error=f"{type(exc).__name__}: {exc}",
-            )
-            result["aggressiveScore"] = 0.0
-            result["executionPriority"] = 0.0
-        return result
+        async with rank_semaphore:
+            merged = {**candidate}
+            if shared_config and "config" not in merged:
+                merged["config"] = shared_config
+            elif shared_config:
+                merged["config"] = {**shared_config, **(merged.get("config") or {})}
+            if shared_btc_regime and "btcRegime" not in merged:
+                merged["btcRegime"] = shared_btc_regime
+            if shared_btc_change is not None and "btcChangePct" not in merged:
+                merged["btcChangePct"] = shared_btc_change
+            if shared_hour is not None and "hourUtc" not in merged:
+                merged["hourUtc"] = shared_hour
+            try:
+                result = await asyncio.wait_for(evaluate_edge_gate(merged), timeout=20)
+            except asyncio.TimeoutError:
+                result = _quant_fail_closed(
+                    "QB_TIMEOUT_REJECT",
+                    symbol=str(merged.get("symbol", "")),
+                    position_side=str(merged.get("positionSide", "")),
+                    error="cycle_rank_edge_timeout",
+                )
+                result["aggressiveScore"] = 0.0
+                result["executionPriority"] = 0.0
+            except Exception as exc:
+                result = _quant_fail_closed(
+                    "QB_ERROR_REJECT",
+                    symbol=str(merged.get("symbol", "")),
+                    position_side=str(merged.get("positionSide", "")),
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+                result["aggressiveScore"] = 0.0
+                result["executionPriority"] = 0.0
+            return result
 
     results = await asyncio.gather(*[_evaluate_one(c) for c in candidates_raw])
 
@@ -1294,7 +1358,8 @@ async def regime_playbook_status_endpoint(days: int = Query(30, ge=1, le=365)):
         try:
             alt_history = get_snapshot_history(symbol, 900)
             btc_history = get_snapshot_history("BTC-USDT", 900)
-            sniper = evaluate_sniper_window(
+            sniper = await run_blocking(
+                evaluate_sniper_window,
                 symbol,
                 alt_history,
                 btc_history,
@@ -1416,7 +1481,8 @@ async def exit_evaluate_endpoint(body: dict):
         raise HTTPException(400, "symbol required")
 
     try:
-        result = evaluate_exit(
+        result = await run_blocking(
+            evaluate_exit,
             symbol=symbol.upper(),
             position_side=str(position_side).upper(),
             entry_price=float(body.get("entryPrice", body.get("entry_price", 0))),
@@ -1543,7 +1609,7 @@ async def exit_stats_endpoint(
 
 
 @app.post("/models/sniper/train")
-async def train_sniper_model_endpoint(min_samples: int = Query(300, ge=100, le=100000)):
+async def train_sniper_model_endpoint(min_samples: int = Query(_MIN_TRAINING_SAMPLES, ge=50, le=100000)):
     """Train and validate the calibrated sniper model; authority remains shadow-only."""
     global _training_task
     if _training_status.get("running"):
@@ -1591,15 +1657,15 @@ async def sniper_model_status_endpoint():
     interval = int(sampler_st.get("intervalSeconds", 60) or 60)
     samples_per_hour = round((recorded / cycles) * (3600 / interval)) if cycles > 0 else 0
     pending = int(pipeline.get("pending", 0) or 0)
-    samples_needed = max(0, 300 - samples - pending)
+    samples_needed = max(0, _MIN_TRAINING_SAMPLES - samples - pending)
     eta_hours = round(samples_needed / samples_per_hour, 2) if samples_per_hour > 0 else None
 
     return {
         **status,
         "samples": int(status.get("samples", samples) or samples),
         "trainingSamplesAvailable": samples,
-        "minSamples": 300,
-        "samplesRemaining": max(0, 300 - samples),
+        "minSamples": _MIN_TRAINING_SAMPLES,
+        "samplesRemaining": max(0, _MIN_TRAINING_SAMPLES - samples),
         "hits": progress["hits"],
         "misses": progress["misses"],
         "hasBothClasses": progress["hasBothClasses"],
@@ -1620,8 +1686,11 @@ async def sniper_model_status_endpoint():
 
 @app.get("/signals/shadow-sampler/status")
 async def shadow_sampler_status_endpoint():
-    sources = await kb.get_signal_source_summary()
-    recent = await kb.get_recent_signal_outcomes(limit=20, source_type="shadow_sampler")
+    sources, recent, pipeline = await asyncio.gather(
+        kb.get_signal_source_summary(),
+        kb.get_recent_signal_outcomes(limit=20, source_type="shadow_sampler"),
+        kb.get_signal_pipeline_summary(),
+    )
     shadow_source = next((item for item in sources if item.get("sourceType") == "shadow_sampler"), None) or {}
     return {
         "sampler": reconcile_shadow_sampler_status(
@@ -1629,7 +1698,7 @@ async def shadow_sampler_status_endpoint():
             latest_created_at=float(shadow_source.get("latestCreatedAt", 0) or 0),
             recent=recent,
         ),
-        "pipeline": await kb.get_signal_pipeline_summary(),
+        "pipeline": pipeline,
         "sources": sources,
         "recent": recent,
     }
@@ -1642,7 +1711,7 @@ async def sniper_reconciliation_status_endpoint(
     limit: int = Query(10000, ge=1, le=50000),
 ):
     """Shadow/demo/live reconciliation status for sniper promotion evidence."""
-    await finalize_due_signal_outcomes()
+    asyncio.create_task(finalize_due_signal_outcomes())
     return await kb.get_sniper_reconciliation_status(days=days, limit=limit)
 
 
