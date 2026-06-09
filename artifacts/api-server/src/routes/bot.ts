@@ -17,6 +17,7 @@ import {
   getQuantBrainQueueStats,
   quantBrainGateMode,
   type QuantBrainEdgeInput,
+  type QuantBrainIntelligence,
 } from "../lib/quantBrainClient";
 import { recordPredictionExecutionAge } from "../lib/runtimeMetrics";
 import { getMarketSentiment, getMarketSentimentBulk, type SentimentResult } from "../lib/sentimentEngine";
@@ -57,6 +58,7 @@ import {
   type PositionRiskTier,
 } from "../lib/positionSizing";
 import { getServiceState } from "../lib/serviceState";
+import { buildTelemetryState } from "./telemetry";
 import {
   applyAggressionToConfig,
   evaluateAggression,
@@ -2314,17 +2316,84 @@ router.get("/bot/intelligence", async (req: Request, res: Response) => {
   const symbolProfile = engine.symbolProfile(symbol);
   const context = engine.contextSignal(clusterKey);
 
-  const intelligence = await getQuantBrainIntelligence({
-    symbol,
-    side: positionSide === "LONG" ? "BUY" : "SELL",
-    positionSide,
-    hourUtc,
-    btcChangePct,
-    currentEv: cluster?.ev ?? symbolProfile?.ev ?? 0,
-    currentWinRate: cluster?.ewmaWinRate ?? symbolProfile?.winRate ?? 0.5,
-    currentProfitFactor: cluster?.profitFactor ?? symbolProfile?.profitFactor ?? 0,
-    config,
-  });
+  // Shared 1 400 ms deadline — neither QB intelligence nor telemetry state
+  // may block the endpoint longer than this, so a slow/aborting QB never freezes the UI.
+  const localTelemetryFallback = { recentOutcomes: engine.rawOutcomes() };
+  const QB_DEADLINE_MS = 1_400;
+  const qbDeadline = new Promise<null>((r) => setTimeout(() => r(null), QB_DEADLINE_MS));
+
+  // Timeout fallback for QB intelligence (allow = true so trades aren't hard-blocked)
+  const gm = quantBrainGateMode();
+  const intelligenceOnTimeout: QuantBrainIntelligence = {
+    connected: false,
+    enabled: true,
+    gateMode: gm,
+    checkedAt: Date.now(),
+    edge: {
+      allow: gm !== "enforce",
+      available: false,
+      contractVersion: "edge-v3",
+      gateRejects: gm === "enforce" ? ["QB_TIMEOUT"] : [],
+      score: null,
+      calibratedProbability: null,
+      uncertaintyType: "SERVICE_UNAVAILABLE",
+      error: "intelligence timeout",
+    },
+    health: null,
+    model: null,
+    signalEdge: null,
+    newsContext: null,
+    errors: { service: `QB timeout (>${QB_DEADLINE_MS}ms)` },
+  };
+
+  const [intelligence, telemetryState] = await Promise.all([
+    Promise.race([
+      getQuantBrainIntelligence({
+        symbol,
+        side: positionSide === "LONG" ? "BUY" : "SELL",
+        positionSide,
+        hourUtc,
+        btcChangePct,
+        currentEv: cluster?.ev ?? symbolProfile?.ev ?? 0,
+        currentWinRate: cluster?.ewmaWinRate ?? symbolProfile?.winRate ?? 0.5,
+        currentProfitFactor: cluster?.profitFactor ?? symbolProfile?.profitFactor ?? 0,
+        config,
+      }),
+      qbDeadline.then(() => intelligenceOnTimeout),
+    ]),
+    Promise.race([
+      buildTelemetryState(source),
+      qbDeadline.then(() => localTelemetryFallback),
+    ]),
+  ]);
+
+  // Compute real stats from QB-merged outcomes (same source as Demo Analysis page)
+  const recentOutcomes = (telemetryState as { recentOutcomes?: TradeOutcome[] }).recentOutcomes ?? [];
+
+  // Helper: compute win rate + profit factor from a set of outcomes
+  function computeStats(outcomes: typeof recentOutcomes) {
+    const wins = outcomes.filter((o) => o.realizedPnl > 0);
+    const losses = outcomes.filter((o) => o.realizedPnl <= 0);
+    const totalWin = wins.reduce((s, o) => s + o.realizedPnl, 0);
+    const totalLoss = Math.abs(losses.reduce((s, o) => s + o.realizedPnl, 0));
+    return {
+      samples: outcomes.length,
+      winRate: outcomes.length > 0 ? wins.length / outcomes.length : null,
+      profitFactor: totalLoss > 0 ? totalWin / totalLoss : wins.length > 0 ? 999 : null,
+    };
+  }
+
+  const symbolOutcomes = recentOutcomes.filter(
+    (o) => o.symbol === symbol && o.positionSide === positionSide,
+  );
+  const symbolStats = computeStats(symbolOutcomes);
+  // Fall back to global stats when no symbol-specific data
+  const globalStats = computeStats(recentOutcomes);
+
+  const mergedSamples = symbolStats.samples > 0 ? symbolStats.samples : globalStats.samples;
+  const mergedWinRate = symbolStats.winRate ?? globalStats.winRate;
+  const mergedProfitFactor = symbolStats.profitFactor ?? globalStats.profitFactor;
+  const mergedNetPnl = recentOutcomes.reduce((s, o) => s + o.realizedPnl, 0);
 
   res.json({
     symbol,
@@ -2335,14 +2404,15 @@ router.get("/bot/intelligence", async (req: Request, res: Response) => {
     executionEnabled: config.allowExecution,
     telemetrySource: source,
     telemetry: {
-      samples: context.samples,
+      samples: mergedSamples > 0 ? mergedSamples : (context.samples ?? 0),
       priorityScore: context.priorityScore,
       toxicityScore: context.toxicityScore,
       ev: cluster?.ev ?? symbolProfile?.ev ?? 0,
-      winRate: cluster?.ewmaWinRate ?? symbolProfile?.winRate ?? 0.5,
-      profitFactor: cluster?.profitFactor ?? symbolProfile?.profitFactor ?? 0,
-      netPnl: symbolProfile?.netPnl ?? 0,
+      winRate: mergedWinRate !== null ? mergedWinRate : (cluster?.ewmaWinRate ?? symbolProfile?.winRate ?? 0.5),
+      profitFactor: mergedProfitFactor !== null ? mergedProfitFactor : (cluster?.profitFactor ?? symbolProfile?.profitFactor ?? 0),
+      netPnl: recentOutcomes.length > 0 ? mergedNetPnl : (symbolProfile?.netPnl ?? 0),
       isToxic: symbolProfile?.isToxic ?? false,
+      totalOutcomes: recentOutcomes.length,
     },
     quantBrain: intelligence,
   });

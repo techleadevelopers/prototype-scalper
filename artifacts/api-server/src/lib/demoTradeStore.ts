@@ -499,6 +499,46 @@ export function getClosedTradesForCampaign(campaignId: string): DemoClosedTrade[
   return result.sort((a, b) => a.entryTime - b.entryTime);
 }
 
+/** Aggregate PnL stats from in-memory closed-trade cache (no disk I/O). */
+export interface DemoTelemetryStats {
+  totalTrades: number;
+  wins: number;
+  losses: number;
+  winRate: number;
+  profitFactor: number;
+  netPnl: number;
+  avgWin: number;
+  avgLoss: number;
+}
+
+export function getDemoTelemetryStats(symbol?: string, side?: string): DemoTelemetryStats {
+  const trades = Array.from(_closedCache.values()).filter((t) => {
+    if (symbol && t.symbol !== symbol) return false;
+    if (side && t.positionSide !== side) return false;
+    return true;
+  });
+  const wins = trades.filter((t) => t.realizedPnl > 0);
+  const losses = trades.filter((t) => t.realizedPnl <= 0);
+  const netPnl = trades.reduce((s, t) => s + t.realizedPnl, 0);
+  const totalWinPnl = wins.reduce((s, t) => s + t.realizedPnl, 0);
+  const totalLossPnl = Math.abs(losses.reduce((s, t) => s + t.realizedPnl, 0));
+  const avgWin = wins.length > 0 ? totalWinPnl / wins.length : 0;
+  const avgLoss = losses.length > 0 ? totalLossPnl / losses.length : 0;
+  const profitFactor =
+    totalLossPnl > 0 ? totalWinPnl / totalLossPnl :
+    wins.length > 0 ? 999 : 0;
+  return {
+    totalTrades: trades.length,
+    wins: wins.length,
+    losses: losses.length,
+    winRate: trades.length > 0 ? wins.length / trades.length : 0,
+    profitFactor,
+    netPnl,
+    avgWin,
+    avgLoss,
+  };
+}
+
 export async function loadClosedTrades(limit = 500): Promise<DemoClosedTrade[]> {
   if (!fs.existsSync(CLOSED_FILE())) return [];
   const results: DemoClosedTrade[] = [];
