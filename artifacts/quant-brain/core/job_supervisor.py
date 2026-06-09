@@ -34,11 +34,22 @@ class RuntimeJob:
 class JobSupervisor:
     max_concurrent_jobs: int = 2
     stale_after_seconds: float = 120.0
+    max_queue_size: int = 256
+    reserved_priority: int = 1
     jobs: dict[str, RuntimeJob] = field(default_factory=dict)
     _tasks: list[asyncio.Task] = field(default_factory=list)
     _semaphore: asyncio.Semaphore | None = None
     _started_at: float = field(default_factory=time.time)
     _stopping: bool = False
+    _queued: int = 0
+    _completed: int = 0
+    _failed: int = 0
+    _rejected: int = 0
+    _retried: int = 0
+    _deduplicated: int = 0
+    _preempted: int = 0
+    _locks: set[str] = field(default_factory=set)
+    _preempt_low_priority_count: int = 0
 
     def register(
         self,
@@ -67,6 +78,103 @@ class JobSupervisor:
         for job in self.jobs.values():
             if job.enabled and not any(t.get_name() == f"job:{job.name}" for t in self._tasks):
                 self._tasks.append(asyncio.create_task(self._runner(job), name=f"job:{job.name}"))
+
+    def _priority_rank(self, priority: str) -> int:
+        order = {
+            "protection": 100,
+            "critical": 90,
+            "entry": 70,
+            "reconciliation": 60,
+            "inference": 50,
+            "market": 45,
+            "normal": 40,
+            "training": 20,
+            "analytics": 10,
+            "low": 0,
+        }
+        return order.get(priority, 40)
+
+    def _is_low_priority(self, priority: str) -> bool:
+        return self._priority_rank(priority) <= self._priority_rank("analytics")
+
+    async def execute(
+        self,
+        name: str,
+        fn: JobFn,
+        *,
+        priority: str = "normal",
+        timeout_seconds: float = 30.0,
+        queue_timeout_seconds: float | None = None,
+        retry_budget: int = 0,
+        lock_key: str | None = None,
+    ) -> Any:
+        if self._semaphore is None:
+            self._semaphore = asyncio.Semaphore(max(1, self.max_concurrent_jobs))
+
+        if lock_key:
+            if lock_key in self._locks:
+                self._deduplicated += 1
+                raise RuntimeError(f"lock already held: {lock_key}")
+            self._locks.add(lock_key)
+
+        bypass_queue = self._priority_rank(priority) >= self._priority_rank("protection")
+        if self._queued >= self.max_queue_size and not bypass_queue:
+            self._rejected += 1
+            if lock_key:
+                self._locks.discard(lock_key)
+            raise RuntimeError("job queue full")
+        if self._queued >= self.max_queue_size and bypass_queue:
+            self._preempted += 1
+            self._preempt_low_priority_count += 1
+
+        self._queued += 1
+        try:
+            if bypass_queue:
+                return await self._execute_with_retries(name, fn, priority, timeout_seconds, retry_budget)
+
+            acquire = self._semaphore.acquire()
+            if queue_timeout_seconds is not None:
+                await asyncio.wait_for(acquire, timeout=queue_timeout_seconds)
+            else:
+                await acquire
+            try:
+                if self._is_low_priority(priority) and self._preempt_low_priority_count > 0:
+                    self._preempt_low_priority_count -= 1
+                    self._rejected += 1
+                    raise RuntimeError("preempted by critical work")
+                return await self._execute_with_retries(name, fn, priority, timeout_seconds, retry_budget)
+            finally:
+                self._semaphore.release()
+        except Exception:
+            raise
+        finally:
+            self._queued = max(0, self._queued - 1)
+            if lock_key:
+                self._locks.discard(lock_key)
+
+    async def _execute_with_retries(
+        self,
+        name: str,
+        fn: JobFn,
+        priority: str,
+        timeout_seconds: float,
+        retry_budget: int,
+    ) -> Any:
+        attempts = max(1, retry_budget + 1)
+        last_error: Exception | None = None
+        for attempt in range(attempts):
+            try:
+                result = await asyncio.wait_for(fn(), timeout=max(0.1, timeout_seconds))
+                self._completed += 1
+                return result
+            except Exception as exc:
+                last_error = exc
+                if attempt < attempts - 1:
+                    self._retried += 1
+                    continue
+                self._failed += 1
+                raise
+        raise last_error or RuntimeError(f"job failed: {name}")
 
     async def stop(self) -> None:
         self._stopping = True
@@ -154,6 +262,14 @@ class JobSupervisor:
             "running": not self._stopping,
             "uptimeSeconds": round(now - self._started_at, 3),
             "maxConcurrentJobs": self.max_concurrent_jobs,
+            "maxQueueSize": self.max_queue_size,
+            "queueDepth": self._queued,
+            "completed": self._completed,
+            "failed": self._failed,
+            "rejected": self._rejected,
+            "retried": self._retried,
+            "deduplicated": self._deduplicated,
+            "preempted": self._preempted,
             "staleAfterSeconds": self.stale_after_seconds,
             "staleJobs": stale_jobs,
             "jobs": jobs,
