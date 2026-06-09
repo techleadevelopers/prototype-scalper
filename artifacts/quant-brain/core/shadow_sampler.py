@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from core.candle_regime import candle_regime_status
+from core.async_utils import run_blocking
 from core.feature_engine import FeatureEngine, SYMBOLS
 from core.movement_sniper import evaluate_sniper_window
 from core.signal_learning import record_signal_from_gate
@@ -21,6 +22,14 @@ SHADOW_SAMPLER_SOURCE_TYPE = "shadow_sampler"
 DATA_DIR = Path(__file__).parent.parent / "data"
 STATE_FILE = Path(os.environ.get("SHADOW_SAMPLER_STATE_PATH", DATA_DIR / "shadow-sampler-state.json"))
 MAX_LAST_ANALYSES = 40
+DEFAULT_SHADOW_SYMBOLS = [
+    "BTC-USDT",
+    "ETH-USDT",
+    "SOL-USDT",
+    "NEAR-USDT",
+    "HYPE-USDT",
+    "POL-USDT",
+]
 
 _sampler_state: dict[str, Any] = {
     "enabled": True,
@@ -31,6 +40,9 @@ _sampler_state: dict[str, Any] = {
     "cycles": 0,
     "attempted": 0,
     "recorded": 0,
+    "deduped": 0,
+    "rejectedZeroPrice": 0,
+    "insertFailed": 0,
     "skippedNoData": 0,
     "bootstrapCycles": 0,
     "lastAnalyses": [],
@@ -62,6 +74,9 @@ def _load_sampler_state() -> None:
             "cycles",
             "attempted",
             "recorded",
+            "deduped",
+            "rejectedZeroPrice",
+            "insertFailed",
             "skippedNoData",
             "bootstrapCycles",
             "lastAnalyses",
@@ -99,6 +114,14 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _sampler_symbols() -> list[str]:
+    raw = os.environ.get("SHADOW_SAMPLER_SYMBOLS", "").strip()
+    if not raw:
+        raw = ",".join(DEFAULT_SHADOW_SYMBOLS)
+    symbols = [symbol.strip().upper() for symbol in raw.split(",") if symbol.strip()]
+    return symbols or list(DEFAULT_SHADOW_SYMBOLS)
+
+
 def _sampler_config() -> dict[str, Any]:
     return {
         "marginPerTrade": _env_float("SHADOW_SAMPLER_MARGIN_PER_TRADE", 5.0),
@@ -108,7 +131,7 @@ def _sampler_config() -> dict[str, Any]:
         "takerFeeBps": _env_float("SHADOW_SAMPLER_TAKER_FEE_BPS", 5.0),
         "slippageBpsPerSide": _env_float("SHADOW_SAMPLER_SLIPPAGE_BPS_PER_SIDE", 2.0),
         "estimatedFundingCostPct": _env_float("SHADOW_SAMPLER_ESTIMATED_FUNDING_COST_PCT", 0.0),
-        "signalDedupeSeconds": _env_int("SHADOW_SAMPLER_DEDUPE_SECONDS", 300),
+        "signalDedupeSeconds": _env_int("SHADOW_SAMPLER_DEDUPE_SECONDS", 60),
         "signalSourceType": SHADOW_SAMPLER_SOURCE_TYPE,
     }
 
@@ -134,11 +157,7 @@ def reconcile_shadow_sampler_status(
         changed = True
 
     if observed > 0 and int(_sampler_state.get("cycles", 0) or 0) <= 0:
-        symbols_per_cycle = max(1, len([
-            symbol.strip()
-            for symbol in os.environ.get("SHADOW_SAMPLER_SYMBOLS", ",".join(SYMBOLS)).split(",")
-            if symbol.strip()
-        ]) * 2)
+        symbols_per_cycle = max(1, len(_sampler_symbols()) * 2)
         _sampler_state["cycles"] = max(1, (observed + symbols_per_cycle - 1) // symbols_per_cycle)
         changed = True
 
@@ -178,13 +197,20 @@ def reconcile_shadow_sampler_status(
     return shadow_sampler_status()
 
 
-def _compact_analysis(symbol: str, fallback_side: str, sniper: dict[str, Any], recorded: bool) -> dict[str, Any]:
+def _compact_analysis(
+    symbol: str,
+    fallback_side: str,
+    sniper: dict[str, Any],
+    recorded: bool,
+    record_status: str,
+) -> dict[str, Any]:
     alt = sniper.get("altFeatures", {}) or {}
     btc = sniper.get("btcFeatures", {}) or {}
     return {
         "symbol": symbol,
         "fallbackSide": fallback_side,
         "recorded": recorded,
+        "recordStatus": record_status,
         "decision": sniper.get("decision"),
         "score": sniper.get("score"),
         "target": sniper.get("target"),
@@ -204,11 +230,7 @@ async def sample_shadow_signals_once(engine: FeatureEngine) -> dict[str, Any]:
     config = _sampler_config()
     window_seconds = _env_int("SHADOW_SAMPLER_WINDOW_SECONDS", 300)
     bootstrap_samples = max(3, _env_int("SHADOW_SAMPLER_BOOTSTRAP_SAMPLES", 3))
-    symbols = [
-        symbol.strip().upper()
-        for symbol in os.environ.get("SHADOW_SAMPLER_SYMBOLS", ",".join(SYMBOLS)).split(",")
-        if symbol.strip()
-    ]
+    symbols = _sampler_symbols()
 
     cycle_num = int(_sampler_state["cycles"]) + 1
     log.info("Shadow sampler cycle=%d starting for %d symbols", cycle_num, len(symbols))
@@ -230,6 +252,9 @@ async def sample_shadow_signals_once(engine: FeatureEngine) -> dict[str, Any]:
 
     attempted = 0
     recorded = 0
+    deduped = 0
+    rejected_zero_price = 0
+    insert_failed = 0
     skipped_no_data = 0
     analyses: list[dict[str, Any]] = []
 
@@ -245,7 +270,8 @@ async def sample_shadow_signals_once(engine: FeatureEngine) -> dict[str, Any]:
             skipped_no_data += 1
             continue
 
-        sniper = evaluate_sniper_window(
+        sniper = await run_blocking(
+            evaluate_sniper_window,
             sym,
             alt_history,
             btc_history,
@@ -257,12 +283,26 @@ async def sample_shadow_signals_once(engine: FeatureEngine) -> dict[str, Any]:
             attempted += 1
             signal = await record_signal_from_gate(sym, fallback_side, sniper, config)
             was_recorded = bool(signal.get("recorded"))
+            record_status = str(signal.get("recordStatus") or ("recorded" if was_recorded else "unknown"))
             recorded += 1 if was_recorded else 0
-            analyses.append(_compact_analysis(sym, fallback_side, sniper, was_recorded))
+            if record_status == "deduped":
+                deduped += 1
+            elif record_status == "zero_entry_price":
+                rejected_zero_price += 1
+            elif record_status == "insert_failed":
+                insert_failed += 1
+                log.warning(
+                    "Shadow sampler insert failed: symbol=%s side=%s signal_id=%s",
+                    sym,
+                    fallback_side,
+                    signal.get("signalId"),
+                )
+            analyses.append(_compact_analysis(sym, fallback_side, sniper, was_recorded, record_status))
+            await asyncio.sleep(0)
 
     log.info(
-        "Shadow sampler cycle=%d done: attempted=%d recorded=%d skipped=%d",
-        cycle_num, attempted, recorded, skipped_no_data,
+        "Shadow sampler cycle=%d done: attempted=%d recorded=%d deduped=%d zero_price=%d insert_failed=%d skipped=%d",
+        cycle_num, attempted, recorded, deduped, rejected_zero_price, insert_failed, skipped_no_data,
     )
 
     previous_analyses = list(_sampler_state.get("lastAnalyses") or [])
@@ -274,6 +314,9 @@ async def sample_shadow_signals_once(engine: FeatureEngine) -> dict[str, Any]:
         "cycles": cycle_num,
         "attempted": int(_sampler_state["attempted"]) + attempted,
         "recorded": int(_sampler_state["recorded"]) + recorded,
+        "deduped": int(_sampler_state.get("deduped", 0) or 0) + deduped,
+        "rejectedZeroPrice": int(_sampler_state.get("rejectedZeroPrice", 0) or 0) + rejected_zero_price,
+        "insertFailed": int(_sampler_state.get("insertFailed", 0) or 0) + insert_failed,
         "skippedNoData": int(_sampler_state["skippedNoData"]) + skipped_no_data,
         "lastAnalyses": (analyses + previous_analyses)[:MAX_LAST_ANALYSES],
     })
@@ -282,6 +325,9 @@ async def sample_shadow_signals_once(engine: FeatureEngine) -> dict[str, Any]:
     return {
         "attempted": attempted,
         "recorded": recorded,
+        "deduped": deduped,
+        "rejectedZeroPrice": rejected_zero_price,
+        "insertFailed": insert_failed,
         "skippedNoData": skipped_no_data,
         "analyses": analyses,
     }
