@@ -34,7 +34,7 @@ interface TelemetryOutcome {
   realizedPnl: number;
   grossPnl: number;
   fee: number;
-  pnlSource?: "balance_delta" | "price_estimate";
+  pnlSource?: "balance_delta" | "price_estimate" | "exchange_reported";
   estimated?: boolean;
   exitReason?: "TP" | "SL" | "MANUAL";
 }
