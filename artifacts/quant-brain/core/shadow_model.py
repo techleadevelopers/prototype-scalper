@@ -14,7 +14,9 @@ from core import knowledge_base as kb
 MODEL_DIR = Path(__file__).parent.parent / "data" / "models"
 MODEL_PATH = MODEL_DIR / "sniper_target_050.joblib"
 METADATA_PATH = MODEL_DIR / "sniper_target_050.json"
-MIN_TRAINING_SAMPLES = 300
+MIN_TRAINING_SAMPLES = max(1, int(os.environ.get("MIN_TRAINING_SAMPLES", "300")))
+_bundle_cache: dict[str, Any] = {"mtime": None, "bundle": None}
+_metadata_cache: dict[str, Any] = {"mtime": None, "metadata": None}
 
 # Constantes para features
 CATEGORICAL_FEATURES = [
@@ -596,6 +598,8 @@ async def train_shadow_model(min_samples: int = MIN_TRAINING_SAMPLES) -> dict[st
         }
         MODEL_DIR.mkdir(parents=True, exist_ok=True)
         joblib.dump(final_model, MODEL_PATH)
+        _bundle_cache["mtime"] = MODEL_PATH.stat().st_mtime
+        _bundle_cache["bundle"] = final_model
         METADATA_PATH.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
         await kb.save_model_artifact(
             "sniper_target_050",
@@ -626,7 +630,13 @@ def shadow_model_status() -> dict[str, Any]:
     if not MODEL_PATH.exists() or not METADATA_PATH.exists():
         return {"available": False, "authority": "shadow"}
 
-    metadata = json.loads(METADATA_PATH.read_text(encoding="utf-8"))
+    mtime = METADATA_PATH.stat().st_mtime
+    if _metadata_cache.get("metadata") is not None and _metadata_cache.get("mtime") == mtime:
+        metadata = _metadata_cache["metadata"]
+    else:
+        metadata = json.loads(METADATA_PATH.read_text(encoding="utf-8"))
+        _metadata_cache["mtime"] = mtime
+        _metadata_cache["metadata"] = metadata
 
     # Avaliação de qualidade: combina AUC, baseline e profitabilidade
     quality = "poor"
@@ -650,6 +660,18 @@ def shadow_model_status() -> dict[str, Any]:
     }
 
 
+def _load_shadow_bundle() -> Any:
+    import joblib
+
+    mtime = MODEL_PATH.stat().st_mtime
+    if _bundle_cache.get("bundle") is not None and _bundle_cache.get("mtime") == mtime:
+        return _bundle_cache["bundle"]
+    bundle = joblib.load(MODEL_PATH)
+    _bundle_cache["mtime"] = mtime
+    _bundle_cache["bundle"] = bundle
+    return bundle
+
+
 def predict_shadow(row: dict[str, Any]) -> dict[str, Any]:
     """
     Predição com ensemble de modelos.
@@ -665,7 +687,7 @@ def predict_shadow(row: dict[str, Any]) -> dict[str, Any]:
         return {"available": False, "authority": "shadow", "reason": "joblib_missing"}
 
     try:
-        bundle = joblib.load(MODEL_PATH)
+        bundle = _load_shadow_bundle()
         features = _feature_dict(row)
 
         # Ensemble prediction
