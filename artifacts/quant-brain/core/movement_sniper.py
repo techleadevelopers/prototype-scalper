@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import time
 import math
+import os
 from dataclasses import dataclass, field
 from typing import Any
 
 from core.candle_intelligence import build_multiframe_context
 
 
-SNIPER_WINDOW_SECONDS = 300
+SNIPER_WINDOW_SECONDS = int(os.environ.get("SNIPER_WINDOW_SECONDS", "300"))
 
 
 @dataclass
