@@ -81,7 +81,7 @@ function SentimentPanel({ symbol }: { symbol: string }) {
   });
 
   if (isLoading && !data) {
-    return <Skeleton className="h-10 w-full rounded-xl" />;
+    return <Skeleton className="h-[72px] w-full rounded-xl" />;
   }
   if (!data) return null;
 
@@ -91,59 +91,71 @@ function SentimentPanel({ symbol }: { symbol: string }) {
   const longPct = Math.round(entryBias.longWeight * 100);
   const shortPct = 100 - longPct;
 
-  const chips: { label: string; value: number; unit: string }[] = [
-    { label: "VWAP", value: indicators.vwapDeviation, unit: "%" },
-    { label: "ΔVol", value: indicators.volumeDelta * 100, unit: "%" },
-    { label: "M4h", value: indicators.momentum4h, unit: "%" },
-    { label: "M24h", value: indicators.momentum24h, unit: "%" },
-    { label: "Body", value: indicators.bodyBias * 100, unit: "%" },
-  ];
-
   const breakoutLabel =
-    indicators.highLowBreak === "BREAKOUT_UP" ? "↑ BRK UP" :
-    indicators.highLowBreak === "BREAKOUT_DOWN" ? "↓ BRK DN" : "RANGE";
+    indicators.highLowBreak === "BREAKOUT_UP" ? "↑ Rompimento" :
+    indicators.highLowBreak === "BREAKOUT_DOWN" ? "↓ Quebra baixo" : "Faixa/Range";
   const breakoutColor =
     indicators.highLowBreak === "BREAKOUT_UP" ? "text-green-400" :
     indicators.highLowBreak === "BREAKOUT_DOWN" ? "text-red-400" : "text-muted-foreground";
 
-  return (
-    <section className={`flex flex-wrap items-center gap-2 rounded-xl border px-3 py-2 shadow-lg shadow-black/30 ${dirBorder}`}>
-      <BarChart2 className="h-3 w-3 text-primary/60 shrink-0" />
-      <span className="text-[11px] font-semibold text-muted-foreground">24h</span>
-      <Badge variant="outline" className={`px-1.5 py-0 text-[10px] font-mono font-bold leading-4 ${dirColor}`}>
-        {direction}
-      </Badge>
-      <span className="text-[10px] text-muted-foreground">{(confidence * 100).toFixed(0)}%</span>
+  const metrics: { label: string; tooltip: string; value: number; unit: string }[] = [
+    { label: "VWAP", tooltip: "Desvio do preço médio ponderado por volume", value: indicators.vwapDeviation, unit: "%" },
+    { label: "Δ Volume", tooltip: "Variação do volume nas últimas 24h", value: indicators.volumeDelta * 100, unit: "%" },
+    { label: "Mom. 4h", tooltip: "Momentum de preço nas últimas 4 horas", value: indicators.momentum4h, unit: "%" },
+    { label: "Mom. 24h", tooltip: "Momentum de preço nas últimas 24 horas", value: indicators.momentum24h, unit: "%" },
+    { label: "Corpo vela", tooltip: "Viés do corpo das velas (positivo = maioria bullish)", value: indicators.bodyBias * 100, unit: "%" },
+  ];
 
-      <div className="flex h-5 w-[140px] shrink-0 overflow-hidden rounded border border-border/30">
-        <div
-          className="flex items-center justify-center bg-green-500/20 text-[9px] font-bold text-green-400"
-          style={{ width: `${longPct}%` }}
-        >
-          {longPct}%L
+  const emaColor = indicators.ema12vs24 === "BULL" ? "text-green-400" : indicators.ema12vs24 === "BEAR" ? "text-red-400" : "text-amber-400";
+  const volColor = indicators.volumeTrend === "RISING" ? "text-green-400" : indicators.volumeTrend === "FALLING" ? "text-red-400" : "text-muted-foreground";
+  const rangePos = (indicators.rangePosition * 100).toFixed(0);
+  const rangePosColor = indicators.rangePosition > 0.7 ? "text-green-400" : indicators.rangePosition < 0.3 ? "text-red-400" : "text-amber-400";
+
+  return (
+    <section className={`rounded-xl border shadow-md shadow-black/20 overflow-hidden ${dirBorder}`}>
+      {/* Linha 1 — direção + confiança + viés */}
+      <div className="flex flex-wrap items-center gap-3 px-3 py-2 border-b border-border/15">
+        <BarChart2 className="h-3.5 w-3.5 text-primary/60 shrink-0" />
+        <span className="text-[10px] font-semibold text-muted-foreground">Sentimento 24h</span>
+        <Badge variant="outline" className={`px-1.5 py-0 text-[10px] font-mono font-bold leading-4 ${dirColor}`}>
+          {direction}
+        </Badge>
+        <span className="text-[10px] text-muted-foreground">{(confidence * 100).toFixed(0)}% confiança</span>
+        <div className="flex h-5 w-[160px] shrink-0 overflow-hidden rounded border border-border/30" title="Viés de entrada: proporção long vs short">
+          <div className="flex items-center justify-center bg-green-500/20 text-[9px] font-bold text-green-400" style={{ width: `${longPct}%` }}>
+            {longPct}% LONG
+          </div>
+          <div className="flex items-center justify-center bg-red-500/20 text-[9px] font-bold text-red-400" style={{ width: `${shortPct}%` }}>
+            {shortPct}% SHORT
+          </div>
         </div>
-        <div
-          className="flex items-center justify-center bg-red-500/20 text-[9px] font-bold text-red-400"
-          style={{ width: `${shortPct}%` }}
-        >
-          {shortPct}%S
-        </div>
+        <span className={`ml-auto font-mono text-[10px] font-semibold ${breakoutColor}`}>{breakoutLabel}</span>
       </div>
 
-      <span className="mx-0.5 h-3 w-px bg-border/40" />
-
-      {chips.map((c) => (
-        <span key={c.label} className={`font-mono text-[10px] ${c.value >= 0 ? "text-green-400" : "text-red-400"}`}>
-          <span className="text-muted-foreground">{c.label} </span>
-          {c.value >= 0 ? "+" : ""}{c.value.toFixed(2)}{c.unit}
-        </span>
-      ))}
-
-      <span className={`font-mono text-[10px] ${breakoutColor}`}>{breakoutLabel}</span>
-
-      <span className="ml-auto text-[9px] font-mono text-muted-foreground">
-        EMA:{indicators.ema12vs24} · Pos:{(indicators.rangePosition * 100).toFixed(0)}% · Vol:{indicators.volumeTrend}
-      </span>
+      {/* Linha 2 — indicadores detalhados */}
+      <div className="flex flex-wrap items-center gap-x-5 gap-y-1 px-3 py-2">
+        {metrics.map((m) => (
+          <div key={m.label} className="flex items-baseline gap-1" title={m.tooltip}>
+            <span className="text-[9px] text-muted-foreground whitespace-nowrap">{m.label}</span>
+            <span className={`font-mono text-[10px] font-semibold ${m.value >= 0 ? "text-green-400" : "text-red-400"}`}>
+              {m.value >= 0 ? "+" : ""}{m.value.toFixed(2)}{m.unit}
+            </span>
+          </div>
+        ))}
+        <span className="h-3 w-px bg-border/30" />
+        <div className="flex items-baseline gap-1" title="EMA 12 vs EMA 24: tendência da média móvel">
+          <span className="text-[9px] text-muted-foreground">EMA</span>
+          <span className={`font-mono text-[10px] font-semibold ${emaColor}`}>{indicators.ema12vs24}</span>
+        </div>
+        <div className="flex items-baseline gap-1" title="Posição do preço dentro da faixa das últimas 24h (0% = mínima, 100% = máxima)">
+          <span className="text-[9px] text-muted-foreground">Pos. faixa</span>
+          <span className={`font-mono text-[10px] font-semibold ${rangePosColor}`}>{rangePos}%</span>
+        </div>
+        <div className="flex items-baseline gap-1" title="Tendência do volume">
+          <span className="text-[9px] text-muted-foreground">Volume</span>
+          <span className={`font-mono text-[10px] font-semibold ${volColor}`}>{indicators.volumeTrend}</span>
+        </div>
+      </div>
     </section>
   );
 }
@@ -517,44 +529,34 @@ export default function IntelligencePage() {
         ) : (
           <>
             {/* ── Decision bar ── */}
-            <section className={`rounded-xl border-l-4 px-4 py-3 shadow-md shadow-black/25 ${
-              allowed
-                ? "border-green-500 bg-green-500/5"
-                : "border-red-500 bg-red-500/5"
+            <section className={`flex flex-wrap items-center gap-3 rounded-xl border-l-4 px-4 py-2.5 shadow-md shadow-black/25 ${
+              allowed ? "border-green-500 bg-green-500/5" : "border-red-500 bg-red-500/5"
             }`}>
-              <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-                <div className="flex items-center gap-3">
-                  <div className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-lg ${
-                    allowed ? "bg-green-500/15 text-green-400" : "bg-red-500/15 text-red-400"
-                  }`}>
-                    {allowed ? <Target className="h-5 w-5" /> : <ShieldAlert className="h-5 w-5" />}
-                  </div>
-                  <div>
-                    <p className="text-[9px] font-semibold uppercase tracking-widest text-muted-foreground">Decisão</p>
-                    <p className={`font-mono text-xl font-black leading-tight ${allowed ? "text-green-400" : "text-red-400"}`}>
-                      {decision}
-                    </p>
-                    <p className="text-[10px] text-muted-foreground">{data?.symbol} · {data?.positionSide} · BTC {data?.btcRegime}</p>
-                  </div>
-                </div>
-                <div className="flex gap-5 text-right">
-                  <div><p className="text-[9px] uppercase text-muted-foreground">Score</p><p className="font-mono text-base font-bold">{(score * 100).toFixed(1)}</p></div>
-                  <div><p className="text-[9px] uppercase text-muted-foreground">Gate</p><p className="font-mono text-base font-bold">{quant?.gateMode}</p></div>
-                  <div><p className="text-[9px] uppercase text-muted-foreground">Exec</p><p className={`font-mono text-base font-bold ${data?.executionEnabled ? "text-green-400" : "text-amber-400"}`}>{data?.executionEnabled ? "LIVE" : "OFF"}</p></div>
-                </div>
+              <div className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-md ${allowed ? "bg-green-500/15 text-green-400" : "bg-red-500/15 text-red-400"}`}>
+                {allowed ? <Target className="h-4 w-4" /> : <ShieldAlert className="h-4 w-4" />}
+              </div>
+              <div>
+                <p className="text-[9px] font-semibold uppercase tracking-widest text-muted-foreground leading-none mb-0.5">Decisão</p>
+                <p className={`font-mono text-lg font-black leading-tight ${allowed ? "text-green-400" : "text-red-400"}`}>{decision}</p>
+              </div>
+              <span className="text-[10px] text-muted-foreground">{data?.symbol} · {data?.positionSide} · BTC {data?.btcRegime}</span>
+              <div className="ml-auto flex items-center gap-5">
+                <div className="text-right"><p className="text-[9px] uppercase text-muted-foreground">Score</p><p className="font-mono text-sm font-bold">{(score * 100).toFixed(1)}</p></div>
+                <div className="text-right"><p className="text-[9px] uppercase text-muted-foreground">Gate QB</p><p className="font-mono text-sm font-bold">{quant?.gateMode ?? "—"}</p></div>
+                <div className="text-right"><p className="text-[9px] uppercase text-muted-foreground">Execução</p><p className={`font-mono text-sm font-bold ${data?.executionEnabled ? "text-green-400" : "text-amber-400"}`}>{data?.executionEnabled ? "LIVE" : "DESLIG."}</p></div>
               </div>
             </section>
 
             {/* ── Metrics row ── */}
             <section className="grid grid-cols-2 gap-2 lg:grid-cols-4 xl:grid-cols-8">
-              <Metric label="P(hit)" value={`${(Number(economics.hitProbability ?? targetHit) * 100).toFixed(1)}%`} detail={`${signalSamples} amostras`} />
+              <Metric label="P(acerto)" value={`${(Number(economics.hitProbability ?? targetHit) * 100).toFixed(1)}%`} detail={`${signalSamples} amostras`} />
               <Metric label="EV líquido" value={`${num(economics.netEvUsdt, 4)}`} detail="USDT" tone={Number(economics.netEvUsdt) > 0 ? "good" : "bad"} />
-              <Metric label="Alvo líq." value={`${num(economics.estimatedNetTargetUsdt, 4)}`} detail="USDT" />
+              <Metric label="Ganho est." value={`${num(economics.estimatedNetTargetUsdt, 4)}`} detail="USDT" />
               <Metric label="Perda est." value={`${num(economics.estimatedLossUsdt, 4)}`} detail="USDT" tone="bad" />
-              <Metric label="Custos" value={pct(economics.estimatedCostPct, 3)} />
-              <Metric label="Win rate" value={`${(Number(data?.telemetry.winRate ?? 0) * 100).toFixed(1)}%`} />
-              <Metric label="Prof. factor" value={`${num(data?.telemetry.profitFactor, 2)}x`} />
-              <Metric label="PnL real." value={`${num(data?.telemetry.netPnl, 4)}`} detail="USDT" tone={Number(data?.telemetry.netPnl) >= 0 ? "good" : "bad"} />
+              <Metric label="Taxas" value={pct(economics.estimatedCostPct, 3)} />
+              <Metric label="Taxa acerto" value={`${(Number(data?.telemetry.winRate ?? 0) * 100).toFixed(1)}%`} />
+              <Metric label="Fat. lucro" value={`${num(data?.telemetry.profitFactor, 2)}x`} />
+              <Metric label="PnL acum." value={`${num(data?.telemetry.netPnl, 4)}`} detail="USDT" tone={Number(data?.telemetry.netPnl) >= 0 ? "good" : "bad"} />
             </section>
 
             {/* ── Multiframe + Gate reasons ── */}
@@ -585,8 +587,8 @@ export default function IntelligencePage() {
 
               <PanelBox
                 icon={<AlertTriangle className="h-3.5 w-3.5 text-amber-400" />}
-                title="Motivos do gate"
-                badge={<Badge variant="outline" className="font-mono text-[10px]">{rejects.length}</Badge>}
+                title="Por que bloqueou"
+                badge={<Badge variant="outline" className="font-mono text-[10px]">{rejects.length} bloqueio{rejects.length !== 1 ? "s" : ""}</Badge>}
               >
                 <div className="max-h-[180px] overflow-auto custom-scrollbar">
                   {(rejects.length ? rejects : reasons).length === 0 ? (
@@ -683,25 +685,25 @@ export default function IntelligencePage() {
 
             {/* ── Bottom 4 panels ── */}
             <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-              <PanelBox icon={<Target className="h-3.5 w-3.5 text-primary" />} title="Memória sinais">
-                <Row label="Contexto" value={String(signalSamples)} />
-                <Row label="Target hit" value={`${(targetHit * 100).toFixed(1)}%`} />
+              <PanelBox icon={<Target className="h-3.5 w-3.5 text-primary" />} title="Histórico de sinais">
+                <Row label="Amostras" value={String(signalSamples)} />
+                <Row label="Acerto alvo" value={`${(targetHit * 100).toFixed(1)}%`} />
                 <Row label="Score" value={num(signalEdge.score, 3)} />
                 <Row label="Veredito" value={<span className="font-mono text-xs uppercase">{signalEdge.verdict ?? "--"}</span>} />
               </PanelBox>
 
-              <PanelBox icon={<ShieldAlert className="h-3.5 w-3.5 text-primary" />} title="Risco operacional">
+              <PanelBox icon={<ShieldAlert className="h-3.5 w-3.5 text-primary" />} title="Gestão de risco">
                 <Row label="PnL 24h" value={pct(operationalRisk.netPnlPct)} />
-                <Row label="Drawdown" value={<span className="font-mono text-xs text-red-400">{pct(operationalRisk.maxDrawdownPct)}</span>} />
-                <Row label="Loss streak" value={String(operationalRisk.consecutiveLosses ?? 0)} />
-                <Row label="Trades" value={String(operationalRisk.trades ?? 0)} />
+                <Row label="Drawdown máx." value={<span className="font-mono text-xs text-red-400">{pct(operationalRisk.maxDrawdownPct)}</span>} />
+                <Row label="Perdas seguidas" value={String(operationalRisk.consecutiveLosses ?? 0)} />
+                <Row label="Operações" value={String(operationalRisk.trades ?? 0)} />
               </PanelBox>
 
-              <PanelBox icon={<Gauge className="h-3.5 w-3.5 text-primary" />} title="Notícias / API">
-                <Row label="QB" value={<span className={`flex items-center gap-1 text-xs ${quant?.connected ? "text-green-400" : "text-red-400"}`}>{quant?.connected ? <Wifi className="h-3 w-3" /> : <WifiOff className="h-3 w-3" />}{quant?.connected ? "ONLINE" : "OFFLINE"}</span>} />
-                <Row label="News" value={<span className="font-mono text-xs uppercase">{news.action ?? "none"}</span>} />
-                <Row label="Risk" value={<span className="font-mono text-xs uppercase">{news.riskLevel ?? news.risk_level ?? "LOW"}</span>} />
-                <Row label="UTC" value={<span className="flex items-center gap-1 font-mono text-xs"><Clock3 className="h-2.5 w-2.5" />{data?.hourUtc}:00</span>} />
+              <PanelBox icon={<Gauge className="h-3.5 w-3.5 text-primary" />} title="Status QB / Notícias">
+                <Row label="Quant Brain" value={<span className={`flex items-center gap-1 text-xs ${quant?.connected ? "text-green-400" : "text-red-400"}`}>{quant?.connected ? <Wifi className="h-3 w-3" /> : <WifiOff className="h-3 w-3" />}{quant?.connected ? "ONLINE" : "OFFLINE"}</span>} />
+                <Row label="Notícias" value={<span className="font-mono text-xs uppercase">{news.action ?? "none"}</span>} />
+                <Row label="Risco notícia" value={<span className="font-mono text-xs uppercase">{news.riskLevel ?? news.risk_level ?? "LOW"}</span>} />
+                <Row label="Hora UTC" value={<span className="flex items-center gap-1 font-mono text-xs"><Clock3 className="h-2.5 w-2.5" />{data?.hourUtc}:00</span>} />
               </PanelBox>
 
               <ServiceStatePanel />
