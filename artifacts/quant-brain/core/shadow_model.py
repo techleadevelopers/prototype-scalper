@@ -477,7 +477,7 @@ async def train_shadow_model(min_samples: int = MIN_TRAINING_SAMPLES) -> dict[st
                 min_samples_leaf=6,
                 class_weight="balanced_subsample",
                 random_state=42,
-                n_jobs=-1,
+                n_jobs=max(1, int(os.environ.get("SHADOW_MODEL_RF_N_JOBS", "1"))),
             )),
         ])
 
