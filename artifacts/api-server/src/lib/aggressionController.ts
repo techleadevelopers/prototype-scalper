@@ -248,8 +248,7 @@ function chooseState(input: AggressionControllerInput, metrics: AggressionMetric
     && metrics.hotSymbols >= 3
     && metrics.marketMomentum >= 1.25
     && metrics.consecutiveLosses === 0
-    && metrics.openPositionPressure < 0.75
-    && (input.btcRegime === "BULL" || input.btcRegime === "BEAR");
+    && metrics.openPositionPressure < 0.75;
   if (maxSniper) return { state: "MAX_SNIPER", reason: "multiple_hot_symbols_good_execution_market_momentum" };
   if (boosted) return { state: "BOOST", reason: "recent_profit_factor_high_drawdown_low" };
   return { state: "NORMAL", reason: "baseline_conditions" };
