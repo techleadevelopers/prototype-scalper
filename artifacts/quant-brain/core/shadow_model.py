@@ -782,6 +782,8 @@ def predict_shadow(row: dict[str, Any]) -> dict[str, Any]:
             "error": str(e),
             "calibratedProbability": 0.5,
             "verdict": "ERROR_FALLBACK",
+            "uncertaintyType": "MODEL_UNAVAILABLE",
+            "modelVersion": "shadow-error",
         }
 
 
