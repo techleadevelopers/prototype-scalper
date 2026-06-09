@@ -971,8 +971,8 @@ async def record_signal_decision(
                     calibrated_score,
                     policy_version,
                     config_version,
-                    feature_version,
-                    label_version,
+                    feature_version or "sniper-v1",
+                    label_version or "price-window-v1",
                     None if allowed is None else (1 if allowed else 0),
                     json.dumps(reject_reasons or []),
                     expires_at,
@@ -983,6 +983,17 @@ async def record_signal_decision(
             return True
         except IntegrityError:
             return False
+
+
+async def signal_outcome_exists(signal_id: str) -> bool:
+    if not signal_id:
+        return False
+    async with connect(DB_PATH) as db:
+        row = await (await db.execute(
+            "SELECT 1 FROM signal_outcomes WHERE signal_id=? LIMIT 1",
+            (signal_id,),
+        )).fetchone()
+    return row is not None
 
 
 async def get_pending_signal_outcomes(min_age_seconds: int = 300, limit: int = 200) -> list[dict]:
