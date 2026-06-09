@@ -2298,6 +2298,7 @@ router.get("/bot/edge", async (req: Request, res: Response) => {
 
 /** GET /api/bot/intelligence - consolidated operational view of Quant Brain. */
 router.get("/bot/intelligence", async (req: Request, res: Response) => {
+  try {
   const config = getBotConfig();
   const source = normalizeTelemetrySource(req.query.source);
   const engine = getTelemetryEngineForSource(source);
@@ -2419,6 +2420,70 @@ router.get("/bot/intelligence", async (req: Request, res: Response) => {
     },
     quantBrain: intelligence,
   });
+  } catch (err) {
+    const source = normalizeTelemetrySource(req.query.source);
+    const requestedSymbol = String(req.query.symbol ?? "BTC-USDT").toUpperCase();
+    const symbol = requestedSymbol.endsWith("-USDT") ? requestedSymbol : `${requestedSymbol}-USDT`;
+    const positionSide: PositionSide = String(req.query.side ?? "LONG").toUpperCase() === "SHORT"
+      ? "SHORT"
+      : "LONG";
+    const btcChangePct = Number(req.query.btcChangePct ?? 0);
+    let config: ReturnType<typeof getBotConfig> | null = null;
+    try {
+      config = getBotConfig();
+    } catch {
+      config = null;
+    }
+    const btcRegime: BtcRegime = config
+      ? btcChangePct >= config.btcRegimeThresholdPct ? "BULL"
+        : btcChangePct <= -config.btcRegimeThresholdPct ? "BEAR"
+          : "NEUTRAL"
+      : "NEUTRAL";
+    const gateMode = quantBrainGateMode();
+    const message = err instanceof Error ? err.message : String(err);
+    req.log.warn({ err, symbol, positionSide }, "bot intelligence degraded fallback");
+    res.status(200).json({
+      symbol,
+      positionSide,
+      btcRegime,
+      hourUtc: new Date().getUTCHours(),
+      symbols: config?.allowedSymbols ?? [symbol],
+      executionEnabled: config?.allowExecution ?? false,
+      telemetrySource: source,
+      telemetry: {
+        samples: 0,
+        priorityScore: 0,
+        toxicityScore: 0,
+        ev: 0,
+        winRate: 0.5,
+        profitFactor: 0,
+        netPnl: 0,
+        isToxic: false,
+        totalOutcomes: 0,
+      },
+      quantBrain: {
+        connected: false,
+        enabled: true,
+        gateMode,
+        checkedAt: Date.now(),
+        edge: {
+          allow: gateMode !== "enforce",
+          available: false,
+          contractVersion: "edge-v3",
+          gateRejects: gateMode === "enforce" ? [`QB_INTELLIGENCE_ERROR: ${message}`] : [],
+          score: null,
+          calibratedProbability: null,
+          uncertaintyType: "SERVICE_UNAVAILABLE",
+          error: message,
+        },
+        health: null,
+        model: null,
+        signalEdge: null,
+        newsContext: null,
+        errors: { service: message },
+      },
+    });
+  }
 });
 
 // ── Bot Modes ─────────────────────────────────────────────────────────────────
