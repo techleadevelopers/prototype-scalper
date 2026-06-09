@@ -887,7 +887,7 @@ export default function DemoPage() {
           </div>
         </div>
 
-        <div className="grid grid-cols-1 xl:grid-cols-[380px_1fr_320px] gap-5">
+        <div className="grid grid-cols-1 xl:grid-cols-[380px_1fr_320px] gap-5 items-start">
           {/* ── LEFT PANEL ── */}
           <div className="space-y-4">
             {/* Connect form */}
@@ -1173,7 +1173,7 @@ export default function DemoPage() {
           </div>
 
        {/* ── CENTER PANEL — scanner ── */}
-<Card className="bg-card/30 border-border/40 flex flex-col h-full">
+<Card className="bg-card/30 border-border/40 flex flex-col h-[320px]">
   <CardHeader className="px-5 pt-5 pb-3 border-b border-border/15 shrink-0">
     <div className="flex items-center justify-between">
       <div className="flex items-center gap-2">
@@ -1408,7 +1408,7 @@ export default function DemoPage() {
 </Card>
 
 {/* ── RIGHT PANEL — log ── */}
-<Card className="bg-card/30 border-border/40 flex flex-col h-full">
+<Card className="bg-card/30 border-border/40 flex flex-col h-[320px]">
   <CardHeader className="px-4 pt-4 pb-3 border-b border-border/20 shrink-0">
     <div className="flex items-center justify-between">
       <CardTitle className="text-sm font-semibold flex items-center gap-2">
@@ -1432,7 +1432,7 @@ export default function DemoPage() {
   </CardHeader>
 
   {/* Log entries */}
-  <div ref={logRef} className="flex-1 overflow-y-auto min-h-[200px]">
+  <div ref={logRef} className="flex-1 overflow-y-auto custom-scrollbar">
     {log.length === 0 ? (
       <div className="flex flex-col items-center gap-3 py-16 text-muted-foreground">
         <ArrowRight className="w-6 h-6 opacity-20" />

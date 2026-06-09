@@ -1,0 +1,248 @@
+IA Sniper
+Quant timeout
+shadow
+Decisão operacional, economia líquida, memória pós-sinal e qualidade multiframe
+
+
+BTC-USDT
+LONG
+SHORT
+
+21:26:06
+Sentimento 24h · Viés Direcional
+BEAR
+confiança 100%
+Distribuição de entradas recomendada
+
+80% L
+20% S
+80% LONG
+20% SHORT
+EMA 12/24
+
+BULL
+
+Posição
+
+38%
+
+meio
+
+Vol trend
+
+— FLAT
+
+Desvio VWAP
+-0.500%
+Delta vol
+-22.110%
+Mom 4h
+-0.451%
+Mom 24h
+-0.386%
+Bias body
+-4.560%
+Breakout
+RANGE BOUND
+Baseado em 24 candles 1h · 21:23:31 · Cache 5min
+
+Operação
+
+VST DEMO ATIVA
+
+PnL aberto
+
++0.0000 VST
+
+Posições
+
+0 abertas
+
+Decisão autoritativa
+
+ALLOW
+
+BTC-USDT · LONG · BTC BEAR
+
+Score
+
+0.0
+
+Gate
+
+shadow
+
+Execução
+
+LIVE
+
+P(hit)
+
+0.0%
+
+0 amostras
+
+EV líquido
+
+0.0000 USDT
+
+Alvo líquido
+
+0.0000 USDT
+
+Perda estimada
+
+0.0000 USDT
+
+Custos
+
++0.000%
+
+Win rate
+
+100.0%
+
+Profit factor
+
+88.00x
+
+PnL realizado
+
+0.3484 USDT
+
+Contexto multiframe
+movimento · volume · breakout · qualidade
+1m
++0.00%
+0.00x vol
+NO_DATA
+NO_DATA
+5m
++0.00%
+0.00x vol
+NO_DATA
+NO_DATA
+15m
++0.00%
+0.00x vol
+NO_DATA
+NO_DATA
+Movimento ALT
+
++0.00%
+
+Momentum
+
+--
+
+Toxicidade micro
+
+0.000
+
+Motivos do gate
+0
+Nenhuma rejeição ativa
+Aprendizado shadow 24h
+Sem ciclo
+0 observados
+Ciclos
+
+0
+
+a cada --s
+
+Registrados
+
+0
+
+0 tentativas
+
+Pendentes
+
+0
+
+0 finalizados
+
+Hit sampler
+
+0.0%
+
+0 hit · 0 miss
+
+Última análise capturada
+
+--
+Símbolo
+
+--
+
+Decisão
+
+--
+
+Score
+
+0.000
+
+Momentum
+
+--
+
+Sem análise shadow capturada ainda
+
+Shadow ML
+Coletando
+Amostras
+0/300
+0
+Pendentes
+0
+Finalizados
+0
+Treináveis
+Velocidade
+--
+Classes
+0 hit · 0 miss
+Memória de sinais
+Contexto
+0
+Target hit
+0.0%
+Score
+0.000
+Veredito
+--
+Risco operacional
+PnL 24h
++0.00%
+Drawdown
++0.00%
+Loss streak
+0
+Trades
+0
+Serviço e notícias
+API
+OFFLINE
+News action
+none
+Risk level
+LOW
+Hora UTC
+0:00
+Estado do serviço
+21:26:06
+Estado
+HEALTHY
+QB falhas (5min)
+0
+Perdas seguidas
+0
+PnL acumulado
++$0.00
+BTC price age
+n/a
+Dados parcialmente indisponíveis
+
+health: This operation was aborted · model: This operation was aborted · signalEdge: This operation was aborted · newsContext: This operation was aborted
