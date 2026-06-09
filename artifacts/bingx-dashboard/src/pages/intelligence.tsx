@@ -5,7 +5,6 @@ import {
   AlertTriangle,
   BrainCircuit,
   CheckCircle2,
-  Clock3,
   Cpu,
   Gauge,
   RefreshCw,
@@ -18,8 +17,10 @@ import {
   Wifi,
   WifiOff,
   XCircle,
-  BarChart2,
   Pause,
+  Clock,
+  Zap,
+  BarChart2,
 } from "lucide-react";
 import {
   getGetBingXTickerQueryKey,
@@ -85,12 +86,13 @@ function SentimentPanel({ symbol }: { symbol: string }) {
   }
   if (!data) return null;
 
-  const { direction, confidence, entryBias, indicators } = data;
+  const { direction, confidence, entryBias, indicators, fetchedAt, candles24h } = data;
   const dirColor = direction === "BULL" ? "text-green-400" : direction === "BEAR" ? "text-red-400" : "text-amber-400";
   const dirBorder = direction === "BULL" ? "border-green-500/25 bg-green-500/5" : direction === "BEAR" ? "border-red-500/25 bg-red-500/5" : "border-amber-500/25 bg-amber-500/5";
   const longPct = Math.round(entryBias.longWeight * 100);
   const shortPct = 100 - longPct;
 
+  // CORRIGIDO: usar valores em INGLÊS do backend para breakout
   const breakoutLabel =
     indicators.highLowBreak === "BREAKOUT_UP" ? "↑ Rompimento" :
     indicators.highLowBreak === "BREAKOUT_DOWN" ? "↓ Quebra baixo" : "Faixa/Range";
@@ -103,57 +105,135 @@ function SentimentPanel({ symbol }: { symbol: string }) {
     { label: "Δ Volume", tooltip: "Variação do volume nas últimas 24h", value: indicators.volumeDelta * 100, unit: "%" },
     { label: "Mom. 4h", tooltip: "Momentum de preço nas últimas 4 horas", value: indicators.momentum4h, unit: "%" },
     { label: "Mom. 24h", tooltip: "Momentum de preço nas últimas 24 horas", value: indicators.momentum24h, unit: "%" },
-    { label: "Corpo vela", tooltip: "Viés do corpo das velas (positivo = maioria bullish)", value: indicators.bodyBias * 100, unit: "%" },
+    { label: "Corpo vela", tooltip: "Viés do corpo das velas", value: indicators.bodyBias * 100, unit: "%" },
   ];
 
   const emaColor = indicators.ema12vs24 === "BULL" ? "text-green-400" : indicators.ema12vs24 === "BEAR" ? "text-red-400" : "text-amber-400";
   const volColor = indicators.volumeTrend === "RISING" ? "text-green-400" : indicators.volumeTrend === "FALLING" ? "text-red-400" : "text-muted-foreground";
-  const rangePos = (indicators.rangePosition * 100).toFixed(0);
+  
+  // CORRIGIDO: rangePosNum para número, rangePos para string com %
+  const rangePosNum = indicators.rangePosition * 100;
+  const rangePos = `${Math.round(rangePosNum)}%`;
   const rangePosColor = indicators.rangePosition > 0.7 ? "text-green-400" : indicators.rangePosition < 0.3 ? "text-red-400" : "text-amber-400";
+  
+  const dirBgColor = direction === "BULL" ? "bg-green-500/15" : direction === "BEAR" ? "bg-red-500/15" : "bg-muted/30";
+  const dirConfidenceColor = direction === "BULL" ? "bg-green-500" : direction === "BEAR" ? "bg-red-500" : "bg-muted-foreground";
+  
+  // CORRIGIDO: usar indicators.highLowBreak (inglês) para cor de fundo
+  const breakoutBgColor = indicators.highLowBreak === "BREAKOUT_UP" ? "bg-green-500/15" : indicators.highLowBreak === "BREAKOUT_DOWN" ? "bg-red-500/15" : "bg-muted/20";
+  const emaBgColor = indicators.ema12vs24 === "BULL" ? "bg-green-500/15" : indicators.ema12vs24 === "BEAR" ? "bg-red-500/15" : "bg-muted/20";
+  const volBgColor = indicators.volumeTrend === "RISING" ? "bg-green-500/15" : indicators.volumeTrend === "FALLING" ? "bg-red-500/15" : "bg-muted/20";
 
   return (
-    <section className={`rounded-xl border shadow-md shadow-black/20 overflow-hidden ${dirBorder}`}>
-      {/* Linha 1 — direção + confiança + viés */}
-      <div className="flex flex-wrap items-center gap-3 px-3 py-2 border-b border-border/15">
-        <BarChart2 className="h-3.5 w-3.5 text-primary/60 shrink-0" />
-        <span className="text-[10px] font-semibold text-muted-foreground">Sentimento 24h</span>
-        <Badge variant="outline" className={`px-1.5 py-0 text-[10px] font-mono font-bold leading-4 ${dirColor}`}>
-          {direction}
-        </Badge>
-        <span className="text-[10px] text-muted-foreground">{(confidence * 100).toFixed(0)}% confiança</span>
-        <div className="flex h-5 w-[160px] shrink-0 overflow-hidden rounded border border-border/30" title="Viés de entrada: proporção long vs short">
-          <div className="flex items-center justify-center bg-green-500/20 text-[9px] font-bold text-green-400" style={{ width: `${longPct}%` }}>
-            {longPct}% LONG
+    <section className={`rounded-xl border shadow-md shadow-black/20 overflow-hidden transition-all hover:shadow-lg ${dirBorder}`}>
+      {/* Header */}
+      <div className="flex items-center justify-between px-4 py-2.5 border-b border-border/15 bg-muted/5">
+        <div className="flex items-center gap-2">
+          <div className={`p-1 rounded-md ${dirBgColor}`}>
+            <TrendingUp className={`h-3.5 w-3.5 ${dirColor}`} />
           </div>
-          <div className="flex items-center justify-center bg-red-500/20 text-[9px] font-bold text-red-400" style={{ width: `${shortPct}%` }}>
-            {shortPct}% SHORT
+          <span className="text-[11px] font-bold text-foreground/80 uppercase tracking-wider">Sentimento 24h</span>
+          <Badge variant="outline" className={`px-2 py-0.5 text-[10px] font-mono font-bold border-0 ${dirBgColor} ${dirColor}`}>
+            {direction}
+          </Badge>
+        </div>
+        <div className="flex items-center gap-3">
+          <div className="flex items-center gap-1.5">
+            <span className="text-[9px] text-muted-foreground">Confiança</span>
+            <div className="w-16 h-1.5 bg-muted/30 rounded-full overflow-hidden">
+              <div className={`h-full rounded-full transition-all duration-500 ${dirConfidenceColor}`} style={{ width: `${confidence * 100}%` }} />
+            </div>
+            <span className="text-[10px] font-mono font-bold text-foreground/70">{(confidence * 100).toFixed(0)}%</span>
+          </div>
+          <div className="flex items-center gap-1 text-[9px] text-muted-foreground/50">
+            <Clock className="h-2.5 w-2.5" />
+            <span>{new Date(fetchedAt).toLocaleTimeString()}</span>
           </div>
         </div>
-        <span className={`ml-auto font-mono text-[10px] font-semibold ${breakoutColor}`}>{breakoutLabel}</span>
       </div>
 
-      {/* Linha 2 — indicadores detalhados */}
-      <div className="flex flex-wrap items-center gap-x-5 gap-y-1 px-3 py-2">
-        {metrics.map((m) => (
-          <div key={m.label} className="flex items-baseline gap-1" title={m.tooltip}>
-            <span className="text-[9px] text-muted-foreground whitespace-nowrap">{m.label}</span>
-            <span className={`font-mono text-[10px] font-semibold ${m.value >= 0 ? "text-green-400" : "text-red-400"}`}>
-              {m.value >= 0 ? "+" : ""}{m.value.toFixed(2)}{m.unit}
+      {/* Grid 2 colunas */}
+      <div className="grid grid-cols-1 md:grid-cols-2 divide-y md:divide-y-0 md:divide-x divide-border/15">
+        
+        {/* Coluna esquerda - Viés */}
+        <div className="p-3">
+          <div className="flex items-center justify-between mb-2">
+            <span className="text-[9px] font-semibold text-muted-foreground uppercase tracking-wider">VIÉS DE ENTRADA</span>
+            <span className="text-[8px] text-muted-foreground/50 font-mono">proporção long vs short</span>
+          </div>
+          <div className="relative h-10 w-full overflow-hidden rounded-lg border border-border/30 bg-muted/10">
+            <div className="absolute inset-y-0 left-0 flex items-center justify-end pr-2 bg-gradient-to-r from-green-600/80 to-green-500/60 text-[10px] font-bold text-white shadow-sm transition-all duration-300" style={{ width: `${longPct}%` }}>
+              {longPct >= 25 && <span>{longPct}% LONG</span>}
+            </div>
+            <div className="absolute inset-y-0 right-0 flex items-center justify-start pl-2 bg-gradient-to-l from-red-600/80 to-red-500/60 text-[10px] font-bold text-white shadow-sm transition-all duration-300" style={{ width: `${shortPct}%` }}>
+              {shortPct >= 25 && <span>{shortPct}% SHORT</span>}
+            </div>
+            {longPct < 25 && shortPct < 25 && (
+              <div className="absolute inset-0 flex items-center justify-center text-[10px] font-bold text-muted-foreground">
+                {longPct}% LONG · {shortPct}% SHORT
+              </div>
+            )}
+          </div>
+          <div className="flex items-center justify-end mt-1.5">
+            <div className={`flex items-center gap-1 px-1.5 py-0.5 rounded ${breakoutBgColor}`}>
+              <Zap className={`h-2.5 w-2.5 ${breakoutColor}`} />
+              <span className={`text-[9px] font-mono font-bold ${breakoutColor}`}>{breakoutLabel}</span>
+            </div>
+          </div>
+        </div>
+
+        {/* Coluna direita - Métricas */}
+        <div className="p-3">
+          <div className="grid grid-cols-2 gap-x-4 gap-y-2">
+            {metrics.map((m) => (
+              <div key={m.label} className="flex items-center justify-between group" title={m.tooltip}>
+                <div className="flex items-center gap-1.5">
+                  <div className={`w-1.5 h-1.5 rounded-full ${m.value >= 0 ? 'bg-green-500' : 'bg-red-500'}`} />
+                  <span className="text-[9px] text-muted-foreground font-medium whitespace-nowrap">{m.label}</span>
+                </div>
+                <span className={`font-mono text-[10px] font-bold tabular-nums ${m.value >= 0 ? "text-green-400" : "text-red-400"}`}>
+                  {m.value >= 0 ? "+" : ""}{m.value.toFixed(2)}{m.unit}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {/* Footer */}
+      <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-2 border-t border-border/15 bg-muted/8">
+        <div className="flex items-center gap-4">
+          <div className="flex items-center gap-1.5">
+            <Activity className="h-3 w-3 text-muted-foreground/60" />
+            <span className="text-[9px] text-muted-foreground">EMA</span>
+            <span className={`px-1.5 py-0.5 rounded text-[9px] font-mono font-bold ${emaColor} ${emaBgColor}`}>
+              {indicators.ema12vs24}
             </span>
           </div>
-        ))}
-        <span className="h-3 w-px bg-border/30" />
-        <div className="flex items-baseline gap-1" title="EMA 12 vs EMA 24: tendência da média móvel">
-          <span className="text-[9px] text-muted-foreground">EMA</span>
-          <span className={`font-mono text-[10px] font-semibold ${emaColor}`}>{indicators.ema12vs24}</span>
+          <div className="w-px h-3 bg-border/30" />
+          <div className="flex items-center gap-1.5">
+            <Target className="h-3 w-3 text-muted-foreground/60" />
+            <span className="text-[9px] text-muted-foreground">Pos. faixa</span>
+            <div className="w-12 h-1 bg-muted/30 rounded-full overflow-hidden">
+              <div 
+                className={`h-full rounded-full transition-all ${rangePosNum >= 70 ? 'bg-green-500' : rangePosNum <= 30 ? 'bg-red-500' : 'bg-yellow-500'}`}
+                style={{ width: `${Math.min(100, Math.max(0, rangePosNum))}%` }}
+              />
+            </div>
+            <span className={`text-[9px] font-mono font-bold ${rangePosColor}`}>{rangePos}</span>
+          </div>
+          <div className="w-px h-3 bg-border/30" />
+          <div className="flex items-center gap-1.5">
+            <BarChart2 className="h-3 w-3 text-muted-foreground/60" />
+            <span className="text-[9px] text-muted-foreground">Volume</span>
+            <span className={`px-1.5 py-0.5 rounded text-[9px] font-mono font-bold ${volColor} ${volBgColor}`}>
+              {indicators.volumeTrend}
+            </span>
+          </div>
         </div>
-        <div className="flex items-baseline gap-1" title="Posição do preço dentro da faixa das últimas 24h (0% = mínima, 100% = máxima)">
-          <span className="text-[9px] text-muted-foreground">Pos. faixa</span>
-          <span className={`font-mono text-[10px] font-semibold ${rangePosColor}`}>{rangePos}%</span>
-        </div>
-        <div className="flex items-baseline gap-1" title="Tendência do volume">
-          <span className="text-[9px] text-muted-foreground">Volume</span>
-          <span className={`font-mono text-[10px] font-semibold ${volColor}`}>{indicators.volumeTrend}</span>
+        <div className="flex items-center gap-1">
+          <div className={`w-1.5 h-1.5 rounded-full ${candles24h >= 24 ? 'bg-green-500' : 'bg-yellow-500'}`} />
+          <span className="text-[8px] text-muted-foreground/50 font-mono">{candles24h}/24 candles</span>
         </div>
       </div>
     </section>
@@ -228,7 +308,7 @@ interface ServiceStateSnapshot {
 }
 
 function ServiceStatePanel() {
-  const { data, isLoading, dataUpdatedAt } = useQuery<ServiceStateSnapshot>({
+  const { data, isLoading } = useQuery<ServiceStateSnapshot>({
     queryKey: ["service-state"],
     queryFn: async () => {
       const res = await fetch(apiUrl("/api/service-state"), { credentials: "include" });
@@ -254,7 +334,6 @@ function ServiceStatePanel() {
   };
 
   const state = data?.state ?? "HEALTHY";
-  const colorClass = stateColors[state] ?? stateColors.HEALTHY;
   const icon = stateIcon[state] ?? stateIcon.HEALTHY;
   const btcAgeMs = data?.lastBtcPriceAt ? Date.now() - data.lastBtcPriceAt : null;
   const btcStale = btcAgeMs !== null && data?.staleDataThresholdMs ? btcAgeMs > data.staleDataThresholdMs : false;
@@ -265,7 +344,7 @@ function ServiceStatePanel() {
         <p className="text-[10px] text-muted-foreground">Carregando...</p>
       ) : (
         <div className="space-y-2">
-          <Row label="Estado" value={<span className={`font-mono font-bold text-xs flex items-center gap-1`}>{icon}{state}</span>} />
+          <Row label="Estado" value={<span className="font-mono font-bold text-xs flex items-center gap-1">{icon}{state}</span>} />
           {data.reason && <Row label="Motivo" value={<span className="font-mono text-[10px] uppercase">{data.reason}</span>} />}
           <Row label="QB falhas" value={<span className={`font-mono text-xs ${data.qbFailures >= 3 ? "text-amber-400" : ""}`}>{data.qbFailures}</span>} />
           <Row label="Losses" value={<span className={`font-mono text-xs ${data.consecutiveLosses >= 4 ? "text-red-400" : ""}`}>{data.consecutiveLosses}</span>} />
@@ -319,9 +398,7 @@ function Row({ label, value }: { label: string; value: React.ReactNode }) {
   return (
     <div className="flex justify-between items-center">
       <span className="text-[10px] text-muted-foreground">{label}</span>
-      {typeof value === "string"
-        ? <span className="font-mono text-xs">{value}</span>
-        : value}
+      {typeof value === "string" ? <span className="font-mono text-xs">{value}</span> : value}
     </div>
   );
 }
@@ -334,9 +411,7 @@ function PanelBox({ icon, title, badge, children }: { icon?: React.ReactNode; ti
         <h2 className="text-xs font-semibold">{title}</h2>
         {badge && <div className="ml-auto">{badge}</div>}
       </div>
-      <div className="p-3 space-y-2">
-        {children}
-      </div>
+      <div className="p-3 space-y-2">{children}</div>
     </section>
   );
 }
@@ -423,9 +498,7 @@ export default function IntelligencePage() {
   const modelProbability = Number(shadow.calibratedProbability ?? shadow.rocAuc ?? 0);
   const trainingSamples = Number(shadow.trainingSamplesAvailable ?? shadow.samples ?? 0);
   const minimumTrainingSamples = Number(shadow.minSamples ?? 300);
-  const trainingProgress = minimumTrainingSamples > 0
-    ? Math.min(100, (trainingSamples / minimumTrainingSamples) * 100)
-    : 0;
+  const trainingProgress = minimumTrainingSamples > 0 ? Math.min(100, (trainingSamples / minimumTrainingSamples) * 100) : 0;
   const score = Number(edge.score ?? 0);
   const signalSamples = Number(signalEdge?.context?.samples ?? signalEdge?.symbolSide?.samples ?? signalEdge?.samples ?? 0);
   const targetHit = Number(signalEdge?.context?.hit_configured ?? signalEdge?.symbolSide?.hit_configured ?? 0);
@@ -464,7 +537,7 @@ export default function IntelligencePage() {
   return (
     <AppShell>
       <div className="mx-auto max-w-[1500px] space-y-4 p-4 md:p-5">
-        {/* ── Header ── */}
+        {/* Header */}
         <header className="flex flex-wrap items-center gap-3 border-b border-border/30 pb-4">
           <div className="flex items-center gap-2 flex-1">
             <BrainCircuit className="h-4 w-4 text-primary" />
@@ -521,7 +594,7 @@ export default function IntelligencePage() {
           </div>
         </header>
 
-        {/* ── Sentiment strip ── */}
+        {/* Sentiment Panel */}
         <SentimentPanel symbol={symbol} />
 
         {query.isPending && !data ? (
@@ -534,7 +607,7 @@ export default function IntelligencePage() {
           </div>
         ) : (
           <>
-            {/* ── Decision bar ── */}
+            {/* Decision bar */}
             <section className={`flex flex-wrap items-center gap-3 rounded-xl border-l-4 px-4 py-2.5 shadow-md shadow-black/25 ${
               allowed ? "border-green-500 bg-green-500/5" : "border-red-500 bg-red-500/5"
             }`}>
@@ -553,7 +626,7 @@ export default function IntelligencePage() {
               </div>
             </section>
 
-            {/* ── Metrics row ── */}
+            {/* Metrics row */}
             <section className="grid grid-cols-2 gap-2 lg:grid-cols-4 xl:grid-cols-8">
               <Metric label="P(acerto)" value={`${(Number(economics.hitProbability ?? targetHit) * 100).toFixed(1)}%`} detail={`${signalSamples} amostras`} />
               <Metric label="EV líquido" value={`${num(economics.netEvUsdt, 4)}`} detail="USDT" tone={Number(economics.netEvUsdt) > 0 ? "good" : "bad"} />
@@ -565,7 +638,7 @@ export default function IntelligencePage() {
               <Metric label="PnL acum." value={`${num(data?.telemetry.netPnl, 4)}`} detail="USDT" tone={Number(data?.telemetry.netPnl) >= 0 ? "good" : "bad"} />
             </section>
 
-            {/* ── Multiframe + Gate reasons ── */}
+            {/* Multiframe + Gate reasons */}
             <div className="grid gap-4 xl:grid-cols-[1.3fr_0.7fr]">
               <PanelBox
                 icon={<Activity className="h-3.5 w-3.5 text-primary" />}
@@ -576,18 +649,9 @@ export default function IntelligencePage() {
                 <FrameRow name="5m" frame={frames["5m"] ?? {}} />
                 <FrameRow name="15m" frame={frames["15m"] ?? {}} />
                 <div className="mt-1 grid grid-cols-3 gap-2 border-t border-border/20 pt-2 text-center">
-                  <div>
-                    <p className="text-[9px] text-muted-foreground">Mov ALT</p>
-                    <p className="font-mono text-xs font-bold">{pct(sniper.altFeatures?.price_change_pct)}</p>
-                  </div>
-                  <div>
-                    <p className="text-[9px] text-muted-foreground">Momentum</p>
-                    <p className="font-mono text-xs font-bold uppercase">{sniper.altFeatures?.momentum_quality ?? "--"}</p>
-                  </div>
-                  <div>
-                    <p className="text-[9px] text-muted-foreground">Toxicidade</p>
-                    <p className="font-mono text-xs font-bold">{num(sniper.altFeatures?.microstructure_toxicity, 3)}</p>
-                  </div>
+                  <div><p className="text-[9px] text-muted-foreground">Mov ALT</p><p className="font-mono text-xs font-bold">{pct(sniper.altFeatures?.price_change_pct)}</p></div>
+                  <div><p className="text-[9px] text-muted-foreground">Momentum</p><p className="font-mono text-xs font-bold uppercase">{sniper.altFeatures?.momentum_quality ?? "--"}</p></div>
+                  <div><p className="text-[9px] text-muted-foreground">Toxicidade</p><p className="font-mono text-xs font-bold">{num(sniper.altFeatures?.microstructure_toxicity, 3)}</p></div>
                 </div>
               </PanelBox>
 
@@ -611,24 +675,19 @@ export default function IntelligencePage() {
               </PanelBox>
             </div>
 
-            {/* ── Shadow learning + 4 panels ── */}
+            {/* Shadow learning */}
             <PanelBox
               icon={<BrainCircuit className="h-3.5 w-3.5 text-primary" />}
               title="Shadow ML"
               badge={
                 <div className="flex items-center gap-1.5">
-                  <StatusBadge
-                    ok={Boolean(sampler.running)}
-                    on="Ativo"
-                    off={sampler.enabled === false ? "Off" : "Sem ciclo"}
-                  />
+                  <StatusBadge ok={Boolean(sampler.running)} on="Ativo" off={sampler.enabled === false ? "Off" : "Sem ciclo"} />
                   <span className="font-mono text-[10px] text-muted-foreground">{shadowSamplerSource?.observed ?? 0} obs</span>
                 </div>
               }
             >
               <div className="grid gap-3 sm:grid-cols-[1fr_1.4fr]">
                 <div className="space-y-2">
-                  {/* Progress bar */}
                   <div>
                     <div className="mb-1 flex justify-between text-[10px]">
                       <span className="text-muted-foreground">Amostras</span>
@@ -636,20 +695,10 @@ export default function IntelligencePage() {
                     </div>
                     <Progress value={shadow.available ? Math.min(100, modelProbability * 100) : trainingProgress} className="h-1.5" />
                   </div>
-                  {/* Pipeline */}
                   <div className="grid grid-cols-3 gap-1 rounded-lg bg-muted/20 p-2 text-center">
-                    <div>
-                      <div className="font-mono text-xs font-semibold">{shadow.signalPipeline?.pending ?? 0}</div>
-                      <div className="text-[9px] text-muted-foreground">Pend.</div>
-                    </div>
-                    <div>
-                      <div className="font-mono text-xs font-semibold">{shadow.signalPipeline?.finalized ?? 0}</div>
-                      <div className="text-[9px] text-muted-foreground">Final.</div>
-                    </div>
-                    <div>
-                      <div className="font-mono text-xs font-semibold">{trainingSamples}</div>
-                      <div className="text-[9px] text-muted-foreground">Train.</div>
-                    </div>
+                    <div><div className="font-mono text-xs font-semibold">{shadow.signalPipeline?.pending ?? 0}</div><div className="text-[9px] text-muted-foreground">Pend.</div></div>
+                    <div><div className="font-mono text-xs font-semibold">{shadow.signalPipeline?.finalized ?? 0}</div><div className="text-[9px] text-muted-foreground">Final.</div></div>
+                    <div><div className="font-mono text-xs font-semibold">{trainingSamples}</div><div className="text-[9px] text-muted-foreground">Train.</div></div>
                   </div>
                   {!shadow.available && (
                     <div className="space-y-1.5">
@@ -689,7 +738,7 @@ export default function IntelligencePage() {
               </div>
             </PanelBox>
 
-            {/* ── Bottom 4 panels ── */}
+            {/* Bottom 4 panels */}
             <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
               <PanelBox icon={<Target className="h-3.5 w-3.5 text-primary" />} title="Histórico de sinais">
                 <Row label="Amostras" value={String(signalSamples)} />
@@ -709,17 +758,15 @@ export default function IntelligencePage() {
                 <Row label="Quant Brain" value={<span className={`flex items-center gap-1 text-xs ${quant?.connected ? "text-green-400" : "text-red-400"}`}>{quant?.connected ? <Wifi className="h-3 w-3" /> : <WifiOff className="h-3 w-3" />}{quant?.connected ? "ONLINE" : "OFFLINE"}</span>} />
                 <Row label="Notícias" value={<span className="font-mono text-xs uppercase">{news.action ?? "none"}</span>} />
                 <Row label="Risco notícia" value={<span className="font-mono text-xs uppercase">{news.riskLevel ?? news.risk_level ?? "LOW"}</span>} />
-                <Row label="Hora UTC" value={<span className="flex items-center gap-1 font-mono text-xs"><Clock3 className="h-2.5 w-2.5" />{data?.hourUtc}:00</span>} />
+                <Row label="Hora UTC" value={<span className="flex items-center gap-1 font-mono text-xs"><Clock className="h-2.5 w-2.5" />{data?.hourUtc}:00</span>} />
               </PanelBox>
 
               <ServiceStatePanel />
             </div>
 
-            {/* ── Errors — only real failures, not transient timeouts ── */}
+            {/* Errors */}
             {(() => {
-              const realErrors = quant
-                ? Object.entries(quant.errors).filter(([, v]) => !/aborted|timeout/i.test(String(v)))
-                : [];
+              const realErrors = quant ? Object.entries(quant.errors).filter(([, v]) => !/aborted|timeout/i.test(String(v))) : [];
               if (realErrors.length === 0) return null;
               return (
                 <section className="flex items-start gap-2 rounded-xl border border-amber-500/25 bg-amber-500/5 px-3 py-2.5">
