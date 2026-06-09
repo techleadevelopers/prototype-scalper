@@ -572,6 +572,8 @@ export interface ScanSymbol {
   gateRejects: string[];
   isCandidate: boolean;
   isToxic: boolean;
+  high24h: number;  // ← ADICIONAR ESTA LINHA
+  low24h: number;   // ← ADICIONAR ESTA LINHA
 }
 
 export type ScanResultBtcRegime = typeof ScanResultBtcRegime[keyof typeof ScanResultBtcRegime];
