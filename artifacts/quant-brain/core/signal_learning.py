@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from core import knowledge_base as kb
 from core.database import connect
 from core.movement_sniper import MovementFeatures
+from core.training_serving_skew import audit_finalized_signal
 from layers.tactical import get_snapshot_history
 
 
@@ -609,6 +610,10 @@ async def _finalize_due_signal_outcomes_locked() -> dict[str, Any]:
             max_favorable_pct=round(max_favorable, 4),
             max_adverse_pct=round(max_adverse, 4),
         )
+        try:
+            skew_audit = await audit_finalized_signal(signal)
+        except Exception as exc:
+            skew_audit = {"status": "AUDIT_ERROR", "error": str(exc)}
 
         results.append({
             "signal_id": signal["signal_id"],
@@ -617,6 +622,7 @@ async def _finalize_due_signal_outcomes_locked() -> dict[str, Any]:
             "sharpe": round(sharpe, 3),
             "max_favorable": round(max_favorable, 2),
             "max_adverse": round(max_adverse, 2),
+            "feature_skew": skew_audit.get("status"),
         })
         finalized += 1
         await asyncio.sleep(0)
