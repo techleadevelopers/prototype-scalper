@@ -71,6 +71,15 @@ function wrBarColor(wr: number) {
   return "bg-red-500";
 }
 
+function sourceObserved(sources: unknown, sourceType: string) {
+  if (Array.isArray(sources)) {
+    const row = sources.find((item: any) => item?.sourceType === sourceType);
+    return Number(row?.observed ?? 0);
+  }
+  const record = sources as Record<string, any> | undefined;
+  return Number(record?.[sourceType] ?? record?.shadow ?? 0);
+}
+
 // ── QB online badge ───────────────────────────────────────────────────────────
 
 function QBStatus() {
@@ -80,7 +89,7 @@ function QBStatus() {
     refetchInterval: 30_000,
     retry: 1,
   });
-  const online = !isError && data;
+  const online = !isError && Boolean((data as any)?.online ?? data);
   return (
     <div className={`flex items-center gap-1.5 text-[11px] font-mono ${online ? "text-green-400" : "text-red-400"}`}>
       <span className={`w-1.5 h-1.5 rounded-full ${online ? "bg-green-400 animate-pulse" : "bg-red-500"}`} />
@@ -101,7 +110,7 @@ function IALearningStatus() {
   const d = (data as any) ?? {};
   const sampler = d.shadowSampler ?? {};
   const pipeline = d.signalPipeline ?? {};
-  const sources = d.signalSources ?? {};
+  const sources = d.signalSources ?? [];
   const velocity = d.learningVelocity ?? {};
   const available = d.available ?? d.trained ?? false;
   const samples = d.samples ?? d.n_samples ?? 0;
@@ -111,7 +120,7 @@ function IALearningStatus() {
   const cycles = velocity.cycles ?? sampler.cycles ?? 0;
   const pending = pipeline.pending ?? 0;
   const finalized = pipeline.finalized ?? 0;
-  const sourceShadow = sources.shadow_sampler ?? sources.shadow ?? 0;
+  const sourceShadow = sourceObserved(sources, "shadow_sampler");
 
   const items = [
     {
