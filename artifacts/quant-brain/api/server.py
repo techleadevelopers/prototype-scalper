@@ -34,7 +34,7 @@ from core.edge_gate import evaluate_edge_gate
 from core.movement_sniper import evaluate_sniper_window, build_movement_features, classify_btc_commander
 from core.signal_learning import finalize_due_signal_outcomes, score_signal_context
 from core.shadow_model import restore_shadow_model, shadow_model_status, train_shadow_model
-from core.shadow_sampler import shadow_sampler_status, sample_shadow_signals_once
+from core.shadow_sampler import reconcile_shadow_sampler_status, shadow_sampler_status, sample_shadow_signals_once
 from core.exit_intelligence import evaluate_exit
 from core.exit_learning import record_exit_outcome as _record_exit_outcome, record_exit_evaluation, get_exit_stats
 from core.experiment_engine import experiment_status, infer_assignment_for_outcome
@@ -1572,15 +1572,20 @@ async def train_sniper_model_status_endpoint():
 @app.get("/models/sniper/status")
 @cache_response(ttl_seconds=10)
 async def sniper_model_status_endpoint():
-    await finalize_due_signal_outcomes()
-    await restore_shadow_model()
     status = shadow_model_status()
-    progress = await kb.get_signal_training_summary(decision_group=None, source_type=None)
-    pipeline = await kb.get_signal_pipeline_summary()
-    sources = await kb.get_signal_source_summary()
-    recent_shadow = await kb.get_recent_signal_outcomes(limit=10, source_type="shadow_sampler")
+    progress, pipeline, sources, recent_shadow = await asyncio.gather(
+        kb.get_signal_training_summary(decision_group=None, source_type=None),
+        kb.get_signal_pipeline_summary(),
+        kb.get_signal_source_summary(),
+        kb.get_recent_signal_outcomes(limit=10, source_type="shadow_sampler"),
+    )
     samples = int(progress["samples"])
-    sampler_st = shadow_sampler_status()
+    shadow_source = next((item for item in sources if item.get("sourceType") == "shadow_sampler"), None) or {}
+    sampler_st = reconcile_shadow_sampler_status(
+        observed=int(shadow_source.get("observed", 0) or 0),
+        latest_created_at=float(shadow_source.get("latestCreatedAt", 0) or 0),
+        recent=recent_shadow,
+    )
     cycles = int(sampler_st.get("cycles", 0) or 0)
     recorded = int(sampler_st.get("recorded", 0) or 0)
     interval = int(sampler_st.get("intervalSeconds", 60) or 60)
@@ -1615,11 +1620,18 @@ async def sniper_model_status_endpoint():
 
 @app.get("/signals/shadow-sampler/status")
 async def shadow_sampler_status_endpoint():
+    sources = await kb.get_signal_source_summary()
+    recent = await kb.get_recent_signal_outcomes(limit=20, source_type="shadow_sampler")
+    shadow_source = next((item for item in sources if item.get("sourceType") == "shadow_sampler"), None) or {}
     return {
-        "sampler": shadow_sampler_status(),
+        "sampler": reconcile_shadow_sampler_status(
+            observed=int(shadow_source.get("observed", 0) or 0),
+            latest_created_at=float(shadow_source.get("latestCreatedAt", 0) or 0),
+            recent=recent,
+        ),
         "pipeline": await kb.get_signal_pipeline_summary(),
-        "sources": await kb.get_signal_source_summary(),
-        "recent": await kb.get_recent_signal_outcomes(limit=20, source_type="shadow_sampler"),
+        "sources": sources,
+        "recent": recent,
     }
 
 
