@@ -92,8 +92,10 @@ let requestErrorCount = 0;
 let requestTimeoutCount = 0;
 let lastRequestError: string | null = null;
 let lastRequestErrorAt: number | null = null;
-let tradeSummaryCache: { value: QuantTradeSummary | null; expiresAt: number } | null = null;
-const recentTradesCache = new Map<string, { value: TradeOutcome[]; expiresAt: number }>();
+let tradeSummaryCache: { value: QuantTradeSummary | null; expiresAt: number; staleUntil: number } | null = null;
+let tradeSummaryInflight: Promise<void> | null = null;
+const recentTradesCache = new Map<string, { value: TradeOutcome[]; expiresAt: number; staleUntil: number }>();
+const recentTradesInflight = new Map<string, Promise<void>>();
 const intelligenceEdgeCache = new Map<string, { value: QuantBrainEdgeResult; expiresAt: number; staleUntil: number }>();
 const intelligenceEdgeInflight = new Map<string, Promise<QuantBrainEdgeResult>>();
 const sidecarCache = new Map<string, { value: unknown; expiresAt: number; staleUntil: number }>();
@@ -609,13 +611,42 @@ export async function getQuantBrainTradeSummary(): Promise<QuantTradeSummary | n
   if (!quantBrainEnabled()) return null;
   const now = Date.now();
   if (tradeSummaryCache && tradeSummaryCache.expiresAt > now) return tradeSummaryCache.value;
+
+  if (tradeSummaryCache && tradeSummaryCache.staleUntil > now) {
+    if (!tradeSummaryInflight) {
+      tradeSummaryInflight = getJson<QuantTradeSummary>("/kb/trades/summary", SUMMARY_TIMEOUT_MS)
+        .then((value) => {
+          tradeSummaryCache = {
+            value,
+            expiresAt: Date.now() + SUMMARY_CACHE_TTL_MS,
+            staleUntil: Date.now() + INTELLIGENCE_STALE_TTL_MS,
+          };
+        })
+        .catch(() => {
+          // Keep stale cache. Callers already received a bounded local response.
+        })
+        .finally(() => {
+          tradeSummaryInflight = null;
+        });
+    }
+    return tradeSummaryCache.value;
+  }
+
   try {
     const value = await getJson<QuantTradeSummary>("/kb/trades/summary", SUMMARY_TIMEOUT_MS);
-    tradeSummaryCache = { value, expiresAt: now + SUMMARY_CACHE_TTL_MS };
+    tradeSummaryCache = {
+      value,
+      expiresAt: Date.now() + SUMMARY_CACHE_TTL_MS,
+      staleUntil: Date.now() + INTELLIGENCE_STALE_TTL_MS,
+    };
     return value;
   } catch {
     if (tradeSummaryCache) return tradeSummaryCache.value;
-    tradeSummaryCache = { value: null, expiresAt: now + SUMMARY_CACHE_TTL_MS };
+    tradeSummaryCache = {
+      value: null,
+      expiresAt: Date.now() + SUMMARY_CACHE_TTL_MS,
+      staleUntil: Date.now() + INTELLIGENCE_STALE_TTL_MS,
+    };
     return tradeSummaryCache.value;
   }
 }
@@ -630,11 +661,40 @@ export async function getQuantBrainRecentTrades(
   const now = Date.now();
   const cached = recentTradesCache.get(cacheKey);
   if (cached && cached.expiresAt > now) return cached.value;
+
+  const params = new URLSearchParams({ source, limit: String(safeLimit) });
+  const path = `/kb/trades/recent?${params.toString()}`;
+
+  if (cached && cached.staleUntil > now) {
+    if (!recentTradesInflight.has(cacheKey)) {
+      const inflight = getJson<TradeOutcome[]>(path, SUMMARY_TIMEOUT_MS)
+        .then((value) => {
+          evictOldest(recentTradesCache);
+          recentTradesCache.set(cacheKey, {
+            value,
+            expiresAt: Date.now() + SUMMARY_CACHE_TTL_MS,
+            staleUntil: Date.now() + INTELLIGENCE_STALE_TTL_MS,
+          });
+        })
+        .catch(() => {
+          // Keep stale cache.
+        })
+        .finally(() => {
+          recentTradesInflight.delete(cacheKey);
+        });
+      recentTradesInflight.set(cacheKey, inflight);
+    }
+    return cached.value;
+  }
+
   try {
-    const params = new URLSearchParams({ source, limit: String(safeLimit) });
-    const value = await getJson<TradeOutcome[]>(`/kb/trades/recent?${params.toString()}`, SUMMARY_TIMEOUT_MS);
+    const value = await getJson<TradeOutcome[]>(path, SUMMARY_TIMEOUT_MS);
     evictOldest(recentTradesCache);
-    recentTradesCache.set(cacheKey, { value, expiresAt: now + SUMMARY_CACHE_TTL_MS });
+    recentTradesCache.set(cacheKey, {
+      value,
+      expiresAt: Date.now() + SUMMARY_CACHE_TTL_MS,
+      staleUntil: Date.now() + INTELLIGENCE_STALE_TTL_MS,
+    });
     return value;
   } catch {
     return cached?.value ?? [];
