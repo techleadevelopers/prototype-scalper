@@ -1276,18 +1276,7 @@ router.post("/demo/order", async (req: Request, res: Response) => {
     gateRejects.push(`HOUR_REJECT: UTC hour ${currentHour} is blacklisted`);
   }
 
-  if (quantGateMode === "off" && config.btcRegimeRequired && btcChangePct !== undefined) {
-    const absChange = Math.abs(btcChangePct);
-    if (absChange < config.btcRegimeThresholdPct) {
-      gateRejects.push(`REGIME_REJECT: BTC ${btcChangePct.toFixed(2)}% < ±${config.btcRegimeThresholdPct}%`);
-    } else {
-      const btcBull = btcChangePct > 0;
-      const wantLong = positionSide === "LONG";
-      if (!config.allowCounterRegimeScalp && btcBull !== wantLong) {
-        gateRejects.push(`REGIME_DIRECTION: BTC ${btcBull ? "BULL" : "BEAR"} vs ${positionSide}`);
-      }
-    }
-  }
+  // BTC regime is telemetry only. Entry direction is enforced by candle/edge gates.
 
   if (quantGateMode === "off" && config.evMinThreshold > 0 && currentEv !== undefined && currentEv < config.evMinThreshold) {
     gateRejects.push(`EV_REJECT: EV ${currentEv.toFixed(4)} < ${config.evMinThreshold.toFixed(4)}`);
