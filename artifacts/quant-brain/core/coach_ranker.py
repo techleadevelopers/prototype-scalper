@@ -26,6 +26,7 @@ The Coach NEVER blocks. Any situation that warrants blocking is the Judge's job.
 """
 from __future__ import annotations
 
+import os
 from typing import Any
 from core.score_calibration import calibrate_score
 
@@ -39,6 +40,46 @@ def _num(value: Any, fallback: float = 0.0) -> float:
         return float(value) if value is not None else fallback
     except Exception:
         return fallback
+
+
+def _clamp(value: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, value))
+
+
+def _env_float(key: str, fallback: float) -> float:
+    return _num(os.environ.get(key), fallback)
+
+
+def _shadow_ml_authority(shadow_ml: dict) -> float:
+    """
+    Progressive ML authority. Cold/weak models keep the legacy 5% influence;
+    calibrated, profitable models can ramp to 30% without disabling hard gates.
+    """
+    if not shadow_ml.get("available") or shadow_ml.get("calibratedProbability") is None:
+        return 0.05
+
+    min_weight = _clamp(_env_float("COACH_SHADOW_ML_MIN_WEIGHT", 0.05), 0.0, 0.30)
+    max_weight = _clamp(_env_float("COACH_SHADOW_ML_MAX_WEIGHT", 0.30), min_weight, 0.40)
+    samples = max(
+        _num(shadow_ml.get("samples"), 0.0),
+        _num(shadow_ml.get("trainingSamples"), 0.0),
+        _num(shadow_ml.get("trainSamples"), 0.0) + _num(shadow_ml.get("testSamples"), 0.0),
+    )
+    brier = _num(shadow_ml.get("modelBrier"), _num(shadow_ml.get("brier"), 1.0))
+    auc = _num(shadow_ml.get("rocAuc"), 0.5)
+    profitable = bool(shadow_ml.get("profitabilityVerified", False))
+    uncertainty = str(shadow_ml.get("uncertaintyType", "")).upper()
+
+    sample_factor = _clamp((samples - 100.0) / 350.0, 0.0, 1.0)
+    brier_factor = _clamp((0.22 - brier) / 0.10, 0.0, 1.0)
+    auc_factor = _clamp((auc - 0.55) / 0.20, 0.0, 1.0)
+    quality = 0.50 * sample_factor + 0.30 * brier_factor + 0.20 * auc_factor
+    if profitable:
+        quality = max(quality, 0.70)
+    if uncertainty not in {"STRONG_EVIDENCE", "WEAK_EVIDENCE"}:
+        quality *= 0.35
+
+    return _clamp(min_weight + (max_weight - min_weight) * quality, min_weight, max_weight)
 
 
 # ---------------------------------------------------------------------------
@@ -123,15 +164,17 @@ def compute_aggressive_score(
     else:
         shadow_ml_score = 0.50
 
-    raw = (
-        momentum_score       * 0.35
-        + candle_score       * 0.20
-        + volume_oi_score    * 0.15
-        + btc_alignment      * 0.10
-        + fresh_data_score   * 0.10
-        + realized_edge_score * 0.05
-        + shadow_ml_score    * 0.05
+    shadow_ml_weight = _shadow_ml_authority(shadow_ml)
+    traditional_weight = 1.0 - shadow_ml_weight
+    traditional_score = (
+        momentum_score        * 0.35
+        + candle_score        * 0.20
+        + volume_oi_score     * 0.15
+        + btc_alignment       * 0.10
+        + fresh_data_score    * 0.10
+        + realized_edge_score * 0.10
     )
+    raw = traditional_score * traditional_weight + shadow_ml_score * shadow_ml_weight
     playbook_bonus = _num(adjustments.get("rangeBonus"), 0.0)
     return max(0.0, min(1.0, raw + playbook_bonus - score_penalties))
 
