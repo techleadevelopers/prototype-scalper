@@ -1029,6 +1029,8 @@ router.post("/demo/connect", async (req: Request, res: Response) => {
     }
 
     req.session.demoCredentials = credentials;
+    rememberTriggerCredentials(credentials);
+    activateAutonomousTrigger(req.log);
     await reconcileUnresolvedVstOrders(credentials);
 
     const posData = await bingxGet(
@@ -1065,6 +1067,7 @@ router.post("/demo/connect", async (req: Request, res: Response) => {
 router.post("/demo/disconnect", (req: Request, res: Response) => {
   req.session.demoCredentials = undefined;
   req.session.demoOpenTrades = undefined;
+  triggerExecutionCreds = null;
   res.json({ disconnected: true });
 });
 
@@ -1815,6 +1818,45 @@ let demoSkippedMonitorOverlaps = 0;
 const TRIGGER_CYCLE_MS = parseInt(process.env["TRIGGER_CYCLE_MS"] ?? "15000", 10);
 let triggerCycleHandle: NodeJS.Timeout | null = null;
 let triggerCycleFiring = false;
+let triggerExecutionCreds: { apiKey: string; secretKey: string } | null = null;
+let triggerLastCycleAt: number | null = null;
+let triggerLastSkipReason: string | null = null;
+
+function rememberTriggerCredentials(creds: { apiKey: string; secretKey: string }): void {
+  triggerExecutionCreds = { apiKey: creds.apiKey, secretKey: creds.secretKey };
+  triggerLastSkipReason = null;
+}
+
+function startTriggerCycleLoop(): void {
+  if (triggerCycleHandle) return;
+  triggerCycleHandle = setInterval(() => {
+    if (triggerCycleFiring) return;
+    triggerCycleFiring = true;
+    runTriggerCycle().finally(() => { triggerCycleFiring = false; });
+  }, TRIGGER_CYCLE_MS);
+  triggerCycleHandle.unref?.();
+}
+
+function activateAutonomousTrigger(log?: Request["log"]): void {
+  const sniperConfig = getBotConfig();
+  setTriggerConfig({
+    enabled: true,
+    symbols: [],
+    autoResetAfterFireMs: 10 * 60 * 1000,
+  });
+  void (async () => {
+    for (const sym of sniperConfig.allowedSymbols) {
+      try {
+        const price = await fetchDemoLastPrice(sym);
+        if (price && price > 0) snapshotReferencePrice(sym, price);
+      } catch { /* trigger cycle retries on the next iteration */ }
+    }
+    log?.info(
+      { symbols: sniperConfig.allowedSymbols },
+      "[trigger] autonomous engine activated with SCALP_SYMBOLS",
+    );
+  })();
+}
 
 async function runDemoSniperCycleLocked(): Promise<void> {
   if (demoPlacementInFlight) {
@@ -1845,10 +1887,19 @@ async function runDemoSniperMonitorLocked(): Promise<void> {
 // ── Trigger/Gatilho cycle ────────────────────────────────────────────────────
 
 async function runTriggerCycle(): Promise<void> {
-  if (!isTriggerEnabled()) return;
-  if (!demoSniper.creds) return;
+  triggerLastCycleAt = Date.now();
+  if (!isTriggerEnabled()) {
+    triggerLastSkipReason = "TRIGGER_DISABLED";
+    return;
+  }
+  const creds = demoSniper.creds ?? triggerExecutionCreds;
+  if (!creds) {
+    triggerLastSkipReason = "MISSING_DEMO_CREDENTIALS";
+    return;
+  }
+  triggerLastSkipReason = null;
 
-  const { apiKey, secretKey } = demoSniper.creds;
+  const { apiKey, secretKey } = creds;
   const botConfig = getBotConfig();
   const triggerConfig = getTriggerConfig();
   const targetSymbols = triggerConfig.symbols.length > 0
@@ -2880,12 +2931,9 @@ async function runDemoSniperMonitor(): Promise<void> {
 function stopDemoSniper(reason: string): void {
   if (demoSniper.placeHandle) { clearInterval(demoSniper.placeHandle); demoSniper.placeHandle = null; }
   if (demoSniper.monitorHandle) { clearInterval(demoSniper.monitorHandle); demoSniper.monitorHandle = null; }
-  if (triggerCycleHandle) { clearInterval(triggerCycleHandle); triggerCycleHandle = null; }
   demoSniper.running = false;
   demoSniper.creds = null;
   demoSniper.stopReason = reason;
-  // Auto-disable trigger when demo stops
-  setTriggerConfig({ enabled: false });
 }
 
 function getSniperStatus() {
@@ -2905,6 +2953,14 @@ function getSniperStatus() {
     monitorInFlight: demoMonitorInFlight,
     skippedPlacementOverlaps: demoSkippedPlacementOverlaps,
     skippedMonitorOverlaps: demoSkippedMonitorOverlaps,
+    trigger: {
+      loopRunning: Boolean(triggerCycleHandle),
+      enabled: isTriggerEnabled(),
+      cycleMs: TRIGGER_CYCLE_MS,
+      hasExecutionCredentials: Boolean(demoSniper.creds ?? triggerExecutionCreds),
+      lastCycleAt: triggerLastCycleAt,
+      lastSkipReason: triggerLastSkipReason,
+    },
     config: {
       globalMax: DEMO_SNIPER_GLOBAL_MAX,
       perSymbolMax: DEMO_SNIPER_PER_SYMBOL_MAX,
@@ -2913,6 +2969,8 @@ function getSniperStatus() {
     },
   };
 }
+
+startTriggerCycleLoop();
 
 /** POST /api/demo/sniper/start */
 router.post("/demo/sniper/start", (req: Request, res: Response) => {
@@ -2927,6 +2985,7 @@ router.post("/demo/sniper/start", (req: Request, res: Response) => {
   demoSniper.running = true;
   demoSniper.startedAt = Date.now();
   demoSniper.creds = { ...creds };
+  rememberTriggerCredentials(creds);
   demoSniper.cycleCount = 0;
   demoSniper.totalPlaced = 0;
   demoSniper.stopReason = null;
@@ -2962,15 +3021,7 @@ router.post("/demo/sniper/start", (req: Request, res: Response) => {
     })();
   }
 
-  // Start trigger cycle (runs independently; feeds signals into full pipeline)
-  if (!triggerCycleHandle) {
-    triggerCycleHandle = setInterval(() => {
-      if (!triggerCycleFiring) {
-        triggerCycleFiring = true;
-        runTriggerCycle().finally(() => { triggerCycleFiring = false; });
-      }
-    }, TRIGGER_CYCLE_MS);
-  }
+  startTriggerCycleLoop();
 
   req.log.info({ cycleMs: DEMO_SNIPER_CYCLE_MS, globalMax: DEMO_SNIPER_GLOBAL_MAX }, "[demo-sniper] started");
   res.json({ started: true, ...getSniperStatus() });
