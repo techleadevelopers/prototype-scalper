@@ -93,6 +93,7 @@ import {
 } from "../lib/exhaustionTriggerManager";
 import { getSectorCluster } from "../lib/sectorMap";
 import { processGridTrigger, type GridLevel, type GridBrainResponse } from "../lib/gridTriggerManager";
+import { evaluateNativeTrigger } from "../lib/nativeTriggerEngine";
 
 const router = Router();
 
@@ -3294,6 +3295,26 @@ async function executeSingleOrder(
         }).catch(() => {})
       )
     );
+  }
+
+  // ── MOTOR NATIVO DE GATILHOS (fallback independente do Quant Brain) ──────────
+  // Porta a lógica build_sniper_tail_grid do Python diretamente para o backend.
+  // Roda quando o QB não retornou ARM_TRIGGER_GRID (indisponível, timeout, shadow).
+  // QB continua ativo como camada observacional — apenas NÃO bloqueia mais a execução.
+  if (qbDecision !== "ARM_TRIGGER_GRID" || !qbGrid?.length) {
+    try {
+      const nativeResult = await evaluateNativeTrigger(symbol, positionSide);
+      if (nativeResult.fired && nativeResult.brainResponse && nativeResult.grid?.length) {
+        qbDecision   = "ARM_TRIGGER_GRID";
+        qbGrid       = nativeResult.grid;
+        qbGridMetrics = nativeResult.brainResponse.executionMetrics as typeof qbGridMetrics;
+        if (!qbSectorCluster && nativeResult.brainResponse.metadata?.sectorCluster) {
+          qbSectorCluster = nativeResult.brainResponse.metadata.sectorCluster;
+        }
+      }
+    } catch {
+      // Motor nativo é best-effort — falhas silenciosas não bloqueiam execução
+    }
   }
 
   // Observation mode short-circuit
