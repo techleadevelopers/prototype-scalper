@@ -5,3 +5,4 @@
 - [Demo Sniper Validation Loop](demo-sniper-validation.md) — G1–G19 gap fixes; demoTradeStore owns JSONL source-of-truth; campaign-level (not per-entry) QB outcomes; setDataDir enables test isolation
 - [Judge-Coach QB Architecture](judge-coach-architecture.md) — dual-layer QB split; Judge=fatal blocks only (profile-independent); Coach=scoring/ranking/learning (never blocks); demo_learning_aggressive ignores WR/PF/EV/sentiment blocks
 - [Exit Intelligence System](exit-intelligence-system.md) — post-entry layer: evaluateExit fires per open position in monitor; mfe/mae from demoTradeStore in USDT → convert to pct with /marginUsed; CANCEL_STACKING blocks campaign via sniperStackingBlockedCampaigns Set
+- [Autonomous Sniper 24h Pipeline](autonomous-sniper-pipeline.md) — quality filter (ARM_TRIGGER + score≥0.55) in shadow_sampler; offline_learner reads trigger_outcomes.jsonl every 24h; training fires only after ≥20 new outcomes

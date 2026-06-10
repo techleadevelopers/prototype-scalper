@@ -17,28 +17,45 @@
  * Feature 1: Single-Fill Execution Guard (Mux-Lock)
  *   Quando qualquer gatilho é preenchido, o sistema cancela todos os outros
  *   gatilhos pendentes e bloqueia novas entradas por MUX_LOCK_CANDLES velas de 1m.
- *   Isso evita correlação de posições simultâneas no mesmo movimento de mercado.
  *
  * Feature 3: Partial Fill Policy
  *   Quando o TTL dispara e a ordem foi parcialmente preenchida, o remainder
- *   é cancelado e um callback de partial fill é invocado para que o caller
- *   ajuste TP/SL proporcionalmente ao tamanho executado.
+ *   é cancelado e um callback de partial fill é invocado.
+ *
+ * System 2: Sector Cluster Co-Movement Filter
+ *   Antes de armar novo gatilho, cancela gatilhos pendentes do mesmo setor.
+ *   Evita sobre-exposição por correlação de cluster (ex: NEAR+VVV ambos DEFI).
+ *
+ * System 3: Trigger Outcome Tagging (Feedback Loop)
+ *   Persiste o desfecho de cada gatilho em trigger_outcomes.jsonl com tags
+ *   EXPIRED_UNFILLED | PARTIAL_FILL_CANCELLED para retraining offline do QB.
  */
+
+import { appendFileSync } from "node:fs";
 
 const TRIGGER_EXPIRATION_DEFAULT_MS =
   Math.max(5_000, parseInt(process.env["TRIGGER_EXPIRATION_SECONDS"] ?? "45", 10) * 1_000);
 
 // ── Mux-Lock: Single-Fill Execution Guard ────────────────────────────────────
-// Após qualquer fill, bloqueia novas entradas por MUX_LOCK_CANDLES × 60s.
-// Configurável via env MUX_LOCK_CANDLES (padrão: 2).
 const MUX_LOCK_CANDLES = Math.max(1, parseInt(process.env["MUX_LOCK_CANDLES"] ?? "2", 10));
 const MUX_LOCK_MS = MUX_LOCK_CANDLES * 60_000;
 
 let _muxLockedUntil = 0;
 let _muxLockReason = "";
 
-// Internal cancelFn store (not exposed in public record interface)
 const _cancelFns = new Map<string, () => Promise<void>>();
+
+// ── System 2: Sector tracking ────────────────────────────────────────────────
+// sectorCluster → Set<triggerId> — para cancelamento cascata por setor.
+const _sectorTriggers = new Map<string, Set<string>>();
+
+// ── System 3: Outcome tags ───────────────────────────────────────────────────
+export type TriggerOutcomeTag =
+  | "FILLED_AND_WON"
+  | "FILLED_AND_STOPPED"
+  | "EXPIRED_UNFILLED"
+  | "PARTIAL_FILL_CANCELLED"
+  | "SECTOR_CASCADE_CANCELLED";
 
 export type TriggerStatus = "PENDING" | "CANCELLED" | "PRESUMED_FILLED" | "EXPIRED";
 export type TriggerDirection = "LONG" | "SHORT";
@@ -56,19 +73,86 @@ export interface ExhaustionTriggerRecord {
   exhaustionType?: string;
   partialFilledQty?: number;
   origQty?: number;
+  // System 2
+  sectorCluster?: string;
+  // System 3
+  signalId?: string;
+  outcomeTag?: TriggerOutcomeTag;
 }
 
 const _triggers = new Map<string, ExhaustionTriggerRecord>();
 
+// ── System 3: Outcome recording ──────────────────────────────────────────────
+/**
+ * Persiste o desfecho de um gatilho em trigger_outcomes.jsonl.
+ * Usado pelo retraining offline do QB: se EXPIRED_UNFILLED é frequente
+ * em determinado horário, o QB encurta a distância do trigger para aumentar
+ * fill rate.
+ */
+export function recordTriggerOutcome(
+  record: ExhaustionTriggerRecord,
+  tag: TriggerOutcomeTag,
+  meta?: { fillDurationMs?: number },
+): void {
+  try {
+    const entry = JSON.stringify({
+      ts: Date.now(),
+      id: record.id,
+      signalId: record.signalId,
+      symbol: record.symbol,
+      direction: record.direction,
+      sectorCluster: record.sectorCluster,
+      triggerPrice: record.triggerPrice,
+      expiresAt: record.expiresAt,
+      armedAt: record.armedAt,
+      tag,
+      fillDurationMs: meta?.fillDurationMs,
+    });
+    const dir = process.env["TELEMETRY_DIR"] ?? ".";
+    appendFileSync(`${dir}/trigger_outcomes.jsonl`, entry + "\n");
+  } catch {
+    // Non-blocking — telemetry write failure must never affect execution
+  }
+}
+
+/**
+ * System 2: Sector Cluster Co-Movement Filter
+ *
+ * Cancela todos os gatilhos PENDING do mesmo sectorCluster antes de
+ * armar um novo. Evita que o robô tome 3-4 stops simultâneos quando
+ * moedas do mesmo nicho colapsam juntas.
+ *
+ * Regra: máximo 1 gatilho ativo por cluster de correlação.
+ */
+export function cancelSectorCascade(
+  incomingSymbol: string,
+  sectorCluster: string,
+): { cancelled: number; ids: string[] } {
+  const existingIds = _sectorTriggers.get(sectorCluster);
+  if (!existingIds || existingIds.size === 0) return { cancelled: 0, ids: [] };
+
+  const cancelled: string[] = [];
+  for (const id of Array.from(existingIds)) {
+    const t = _triggers.get(id);
+    if (t && t.status === "PENDING" && t.symbol !== incomingSymbol) {
+      t.status = "CANCELLED";
+      t.cancelledReason = `SECTOR_CASCADE_CANCELLED: cluster=${sectorCluster} bloqueado por incoming=${incomingSymbol}`;
+      t.outcomeTag = "SECTOR_CASCADE_CANCELLED";
+      const fn = _cancelFns.get(id);
+      if (fn) {
+        fn().catch(() => {});
+        _cancelFns.delete(id);
+      }
+      recordTriggerOutcome(t, "SECTOR_CASCADE_CANCELLED");
+      cancelled.push(id);
+    }
+  }
+  for (const id of cancelled) existingIds.delete(id);
+  return { cancelled: cancelled.length, ids: cancelled };
+}
+
 /**
  * Registra uma ordem LIMIT recém-colocada e arma um timer de cancelamento.
- *
- * O `cancelFn` deve chamar a API do exchange para cancelar a ordem se ela
- * ainda estiver aberta no momento da expiração.
- *
- * Feature 3: `checkPartialFillFn` (opcional) — chamado quando o TTL dispara.
- * Se retornar filledQty > 0, loga como PARTIAL_FILL_CANCELLED e invoca
- * `onPartialFill` para que o caller ajuste TP/SL proporcionalmente.
  *
  * @returns ID do gatilho registrado
  */
@@ -82,6 +166,10 @@ export function armLimitOrderExpiry(params: {
   cancelFn: () => Promise<void>;
   checkPartialFillFn?: () => Promise<{ filledQty: number; origQty: number } | null>;
   onPartialFill?: (filledQty: number, origQty: number) => void;
+  // System 2
+  sectorCluster?: string;
+  // System 3
+  signalId?: string;
 }): string {
   const expirationMs = params.expirationMs ?? TRIGGER_EXPIRATION_DEFAULT_MS;
   const id = `${params.symbol}-${params.direction}-${params.orderId}`;
@@ -99,18 +187,26 @@ export function armLimitOrderExpiry(params: {
     exhaustionType: params.exhaustionType,
     origQty: undefined,
     partialFilledQty: undefined,
+    sectorCluster: params.sectorCluster,
+    signalId: params.signalId,
   };
 
   _triggers.set(id, record);
   _cancelFns.set(id, params.cancelFn);
+
+  // System 2: Track by sector cluster
+  if (params.sectorCluster) {
+    if (!_sectorTriggers.has(params.sectorCluster)) {
+      _sectorTriggers.set(params.sectorCluster, new Set());
+    }
+    _sectorTriggers.get(params.sectorCluster)!.add(id);
+  }
 
   setTimeout(async () => {
     const t = _triggers.get(id);
     if (!t || t.status !== "PENDING") return;
 
     // ── Feature 3: Partial Fill Policy ─────────────────────────────────────
-    // Antes de expirar, verifica se a ordem foi parcialmente preenchida.
-    // Se sim, cancela o restante e notifica o caller para ajustar TP/SL.
     if (params.checkPartialFillFn) {
       try {
         const fillStatus = await params.checkPartialFillFn();
@@ -119,18 +215,21 @@ export function armLimitOrderExpiry(params: {
           t.partialFilledQty = fillStatus.filledQty;
           t.origQty = fillStatus.origQty;
           t.cancelledReason = `PARTIAL_FILL_CANCELLED: ${fillStatus.filledQty}/${fillStatus.origQty} filled, remainder cancelled after TTL`;
+          t.outcomeTag = "PARTIAL_FILL_CANCELLED";
           try {
             await params.cancelFn();
           } catch {
             // Best-effort
           }
-          // Notify caller to resize TP/SL proportionally
           try {
             params.onPartialFill?.(fillStatus.filledQty, fillStatus.origQty);
           } catch {
             // Non-blocking
           }
           _cancelFns.delete(id);
+          if (t.sectorCluster) _sectorTriggers.get(t.sectorCluster)?.delete(id);
+          // System 3: Record partial fill outcome for QB retraining
+          recordTriggerOutcome(t, "PARTIAL_FILL_CANCELLED");
           return;
         }
       } catch {
@@ -140,12 +239,16 @@ export function armLimitOrderExpiry(params: {
 
     t.status = "EXPIRED";
     t.cancelledReason = `TTL_EXPIRED after ${expirationMs}ms`;
+    t.outcomeTag = "EXPIRED_UNFILLED";
     try {
       await params.cancelFn();
     } catch {
-      // Cancellation best-effort — order may have already filled or been rejected
+      // Cancellation best-effort
     }
     _cancelFns.delete(id);
+    if (t.sectorCluster) _sectorTriggers.get(t.sectorCluster)?.delete(id);
+    // System 3: Record expired outcome for QB retraining feedback loop
+    recordTriggerOutcome(t, "EXPIRED_UNFILLED");
   }, expirationMs);
 
   return id;
@@ -153,20 +256,18 @@ export function armLimitOrderExpiry(params: {
 
 /**
  * Ativa o Mux-Lock: cancela todos os outros gatilhos pendentes e bloqueia
- * novas entradas por MUX_LOCK_MS (padrão: 2 velas de 1m = 2 minutos).
- *
- * Chamado internamente quando um gatilho é marcado como preenchido.
+ * novas entradas por MUX_LOCK_MS.
  */
 export function activateMuxLock(reason: string): void {
   _muxLockedUntil = Date.now() + MUX_LOCK_MS;
   _muxLockReason = reason;
 
-  // Cancel all OTHER pending triggers immediately
   const cancelPromises: Promise<void>[] = [];
   for (const [id, t] of _triggers.entries()) {
     if (t.status === "PENDING") {
       t.status = "CANCELLED";
       t.cancelledReason = `MUX_LOCK: cancelled by single-fill guard (${reason})`;
+      if (t.sectorCluster) _sectorTriggers.get(t.sectorCluster)?.delete(id);
       const fn = _cancelFns.get(id);
       if (fn) {
         cancelPromises.push(fn().catch(() => {}));
@@ -174,38 +275,29 @@ export function activateMuxLock(reason: string): void {
       }
     }
   }
-  // Fire-and-forget cancellations
   Promise.allSettled(cancelPromises).catch(() => {});
 }
 
 /**
- * Retorna true se o Mux-Lock estiver ativo (bloqueando novas entradas).
+ * Retorna true se o Mux-Lock estiver ativo.
  */
 export function isMuxLocked(): { locked: boolean; reason: string; remainingMs: number } {
   const now = Date.now();
   if (_muxLockedUntil > now) {
-    return {
-      locked: true,
-      reason: _muxLockReason,
-      remainingMs: _muxLockedUntil - now,
-    };
+    return { locked: true, reason: _muxLockReason, remainingMs: _muxLockedUntil - now };
   }
   return { locked: false, reason: "", remainingMs: 0 };
 }
 
 /**
- * Marca um gatilho como preenchido (chamado quando a posição é confirmada).
- *
- * Feature 1: Ao marcar como filled, ativa automaticamente o Mux-Lock,
- * cancelando todos os outros gatilhos pendentes e bloqueando novas entradas.
+ * Marca um gatilho como preenchido → ativa automaticamente o Mux-Lock.
  */
 export function markTriggerFilled(id: string): void {
   const t = _triggers.get(id);
   if (t && t.status === "PENDING") {
     t.status = "PRESUMED_FILLED";
     _cancelFns.delete(id);
-    // ── Feature 1: Single-Fill Execution Guard ────────────────────────────
-    // Fill confirmado → ativa mux lock por MUX_LOCK_CANDLES velas de 1m.
+    if (t.sectorCluster) _sectorTriggers.get(t.sectorCluster)?.delete(id);
     activateMuxLock(`filled:${t.symbol}:${t.direction}@${t.triggerPrice}`);
   }
 }
@@ -218,6 +310,7 @@ export function cancelTrigger(id: string, reason: string): void {
   if (t && t.status === "PENDING") {
     t.status = "CANCELLED";
     t.cancelledReason = reason;
+    if (t.sectorCluster) _sectorTriggers.get(t.sectorCluster)?.delete(id);
     const fn = _cancelFns.get(id);
     if (fn) {
       fn().catch(() => {});
@@ -226,7 +319,7 @@ export function cancelTrigger(id: string, reason: string): void {
   }
 }
 
-/** Retorna todos os gatilhos ainda pendentes (não expirados nem preenchidos). */
+/** Retorna todos os gatilhos ainda pendentes. */
 export function getActiveTriggers(): ExhaustionTriggerRecord[] {
   return Array.from(_triggers.values()).filter((t) => t.status === "PENDING");
 }
@@ -239,7 +332,6 @@ export function getTriggerHistory(limit = 50): ExhaustionTriggerRecord[] {
 
 /**
  * Retorna estatísticas agregadas de todos os gatilhos registrados nesta sessão.
- * Usado pelo endpoint /api/sniper/pnl/report para calcular fill rate real.
  */
 export function getTriggerStats(): {
   totalArmed: number;
@@ -247,27 +339,37 @@ export function getTriggerStats(): {
   presumedFilled: number;
   expired: number;
   cancelled: number;
+  sectorCascadeCancelled: number;
   fillRate: number;
   expiryRate: number;
   recentHistory: ExhaustionTriggerRecord[];
   muxLock: { locked: boolean; reason: string; remainingMs: number };
+  activeSectors: Record<string, number>;
 } {
   const all = Array.from(_triggers.values());
   const pending = all.filter((t) => t.status === "PENDING").length;
   const filled = all.filter((t) => t.status === "PRESUMED_FILLED").length;
   const expired = all.filter((t) => t.status === "EXPIRED").length;
   const cancelled = all.filter((t) => t.status === "CANCELLED").length;
+  const sectorCascadeCancelled = all.filter((t) => t.outcomeTag === "SECTOR_CASCADE_CANCELLED").length;
   const resolved = filled + expired + cancelled;
+  // Active sector counts for monitoring
+  const activeSectors: Record<string, number> = {};
+  for (const [sector, ids] of _sectorTriggers.entries()) {
+    if (ids.size > 0) activeSectors[sector] = ids.size;
+  }
   return {
     totalArmed: all.length,
     pending,
     presumedFilled: filled,
     expired,
     cancelled,
+    sectorCascadeCancelled,
     fillRate: resolved > 0 ? filled / resolved : 0,
     expiryRate: resolved > 0 ? expired / resolved : 0,
     recentHistory: all.slice(-20),
     muxLock: isMuxLocked(),
+    activeSectors,
   };
 }
 

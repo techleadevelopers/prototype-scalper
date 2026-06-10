@@ -35,6 +35,7 @@ from core.movement_sniper import evaluate_sniper_window, build_movement_features
 from core.signal_learning import finalize_due_signal_outcomes, score_signal_context
 from core.shadow_model import restore_shadow_model, shadow_model_status, train_shadow_model
 from core.shadow_sampler import reconcile_shadow_sampler_status, shadow_sampler_status, sample_shadow_signals_once
+from core.offline_learner import perform_daily_recalibration, offline_learner_status
 from core.training_serving_skew import skew_status
 from core.exit_intelligence import evaluate_exit
 from core.exit_learning import record_exit_outcome as _record_exit_outcome, record_exit_evaluation, get_exit_stats
@@ -533,6 +534,27 @@ async def _initialize_runtime_services():
         enabled=os.environ.get("SHADOW_SAMPLER_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"},
         run_immediately=True,
     )
+
+    # Offline Learner: pipeline de re-treinamento autônomo 24h.
+    # Lê trigger_outcomes.jsonl escrito pelo Node.js, reconcilia outcomes no
+    # banco do QB, e dispara train_shadow_model() quando há amostras suficientes.
+    _offline_learner_interval = int(float(os.environ.get("OFFLINE_LEARNER_INTERVAL_SECONDS", str(24 * 3600))))
+    _offline_learner_enabled = os.environ.get("OFFLINE_LEARNER_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
+    job_supervisor.register(
+        "offline_learner",
+        perform_daily_recalibration,
+        interval_seconds=max(3600, _offline_learner_interval),
+        timeout_seconds=int(float(os.environ.get("OFFLINE_LEARNER_JOB_TIMEOUT_SECONDS", "120"))),
+        priority="low",
+        enabled=_offline_learner_enabled,
+        run_immediately=False,
+    )
+    log.info(
+        "Offline learner registered (interval=%.0fh enabled=%s)",
+        _offline_learner_interval / 3600,
+        _offline_learner_enabled,
+    )
+
     job_supervisor.start()
     log.info(f"Runtime job supervisor started with {len(job_supervisor.jobs)} jobs")
 
@@ -1757,6 +1779,62 @@ async def run_shadow_sampler_once_endpoint():
         "sampler": shadow_sampler_status(),
         **result,
     }
+
+
+@app.get("/signals/shadow-sampler/intelligence")
+async def shadow_sampler_intelligence_endpoint():
+    """
+    Inteligência sniper filtrada — apenas sinais ARM_TRIGGER com score >= threshold.
+
+    Retorna:
+      - intelligenceAnalyses: últimos sinais que passaram no filtro de qualidade
+      - sniperStats: taxa de aprovação/filtro do ciclo atual
+      - offlineLearner: status do pipeline de re-treinamento autônomo 24h
+    """
+    sampler = shadow_sampler_status()
+    learner = offline_learner_status()
+    sniper_filtered = int(sampler.get("sniperFiltered") or 0)
+    sniper_passed = int(sampler.get("sniperPassed") or 0)
+    total = sniper_filtered + sniper_passed
+    return {
+        "intelligenceAnalyses": sampler.get("lastIntelligenceAnalyses") or [],
+        "sniperStats": {
+            "passed": sniper_passed,
+            "filtered": sniper_filtered,
+            "total": total,
+            "passRate": round(sniper_passed / total, 4) if total > 0 else None,
+            "minScore": float(os.environ.get("SHADOW_SAMPLER_MIN_SCORE", "0.55")),
+            "armOnly": os.environ.get("SHADOW_SAMPLER_ARM_ONLY", "true").strip().lower() not in {"0", "false", "no", "off"},
+        },
+        "offlineLearner": {
+            "enabled": os.environ.get("OFFLINE_LEARNER_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"},
+            "cycles": learner.get("cycles"),
+            "lastRunAt": learner.get("lastRunAt"),
+            "lastError": learner.get("lastError"),
+            "outcomesRecorded": learner.get("outcomesRecorded"),
+            "outcomesSkipped": learner.get("outcomesSkipped"),
+            "trainingsTriggered": learner.get("trainingsTriggered"),
+            "lastTrainingResult": learner.get("lastTrainingResult"),
+            "checkpointTs": learner.get("checkpointTs"),
+            "intervalHours": round(
+                max(3600, int(float(os.environ.get("OFFLINE_LEARNER_INTERVAL_SECONDS", str(24 * 3600))))) / 3600,
+                1,
+            ),
+        },
+    }
+
+
+@app.post("/offline-learner/run")
+async def run_offline_learner_endpoint():
+    """Dispara manualmente um ciclo do offline learner (útil para teste/debug)."""
+    result = await perform_daily_recalibration()
+    return {"ok": True, **result}
+
+
+@app.get("/offline-learner/status")
+async def offline_learner_status_endpoint():
+    """Status completo do pipeline de re-treinamento autônomo."""
+    return offline_learner_status()
 
 
 @app.get("/audit/training-serving-skew")

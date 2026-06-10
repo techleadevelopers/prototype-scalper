@@ -268,6 +268,14 @@ export interface QuantBrainEdgeResult {
   confidence?: number | null;
   expectedValue?: number | null;
   kellyFraction?: number | null;
+  // System 2: Sector cluster para cascade filter (cancelamento de ordens irmãs)
+  sectorCluster?: string;
+  // System 4: Execution metrics — contrato padrão-ouro v4
+  executionMetrics?: {
+    recommendedLeverage: number;
+    minTickDensity1m: number;
+    maxSpreadAllowed: number;
+  };
 }
 
 export interface QuantBrainMlEconomicGate {
@@ -407,6 +415,14 @@ const QuantBrainEdgeResponseSchema = z.object({
   confidence: z.number().min(0).max(1).nullable().optional(),
   expectedValue: z.number().nullable().optional(),
   kellyFraction: z.number().nullable().optional(),
+  // System 2: Sector cluster
+  sectorCluster: z.string().optional(),
+  // System 4: Execution metrics
+  executionMetrics: z.object({
+    recommendedLeverage: z.number().int().min(1).max(50),
+    minTickDensity1m: z.number().int().min(0),
+    maxSpreadAllowed: z.number().positive(),
+  }).optional(),
 }).passthrough();
 
 const OutcomeAckSchema = z.object({

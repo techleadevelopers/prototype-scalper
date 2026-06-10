@@ -46,6 +46,10 @@ _sampler_state: dict[str, Any] = {
     "skippedNoData": 0,
     "bootstrapCycles": 0,
     "lastAnalyses": [],
+    # Sniper Quality Filter (elevação para nível industrial)
+    "sniperFiltered": 0,   # sinais rejeitados por qualidade insuficiente
+    "sniperPassed": 0,     # sinais que passaram no filtro sniper
+    "lastIntelligenceAnalyses": [],  # apenas sinais de qualidade (ARM_TRIGGER + score)
 }
 
 
@@ -80,6 +84,9 @@ def _load_sampler_state() -> None:
             "skippedNoData",
             "bootstrapCycles",
             "lastAnalyses",
+            "sniperFiltered",
+            "sniperPassed",
+            "lastIntelligenceAnalyses",
         ):
             if key in raw:
                 _sampler_state[key] = raw[key]
@@ -87,6 +94,10 @@ def _load_sampler_state() -> None:
             _sampler_state["lastAnalyses"] = _sampler_state["lastAnalyses"][:MAX_LAST_ANALYSES]
         else:
             _sampler_state["lastAnalyses"] = []
+        if isinstance(_sampler_state.get("lastIntelligenceAnalyses"), list):
+            _sampler_state["lastIntelligenceAnalyses"] = _sampler_state["lastIntelligenceAnalyses"][:MAX_LAST_ANALYSES]
+        else:
+            _sampler_state["lastIntelligenceAnalyses"] = []
         _sampler_state["running"] = False
         _sampler_state["enabled"] = _env_bool("SHADOW_SAMPLER_ENABLED", True)
     except Exception as exc:
@@ -112,6 +123,28 @@ def _env_int(name: str, default: int) -> int:
         return int(os.environ.get(name, default))
     except (TypeError, ValueError):
         return default
+
+
+def _sniper_quality_passes(sniper: dict[str, Any]) -> bool:
+    """
+    Filtro de qualidade sniper — salva apenas inteligência, filtra lixo.
+
+    ARM_TRIGGER + score >= SHADOW_SAMPLER_MIN_SCORE → intelligence-grade signal.
+    Sinais WAIT ou score baixo ainda são gravados para treinamento (exemplos negativos),
+    mas são marcados como 'intelligence=False' e ficam fora de lastIntelligenceAnalyses.
+
+    Env vars:
+      SHADOW_SAMPLER_MIN_SCORE  — score mínimo para intelligence (default: 0.55)
+      SHADOW_SAMPLER_ARM_ONLY   — exige ARM_TRIGGER para intelligence (default: true)
+    """
+    decision = str(sniper.get("decision", "WAIT"))
+    score = float(sniper.get("score") or 0.0)
+    min_score = _env_float("SHADOW_SAMPLER_MIN_SCORE", 0.55)
+    arm_only = _env_bool("SHADOW_SAMPLER_ARM_ONLY", True)
+
+    if arm_only and decision != "ARM_TRIGGER":
+        return False
+    return score >= min_score
 
 
 def _sampler_symbols() -> list[str]:
@@ -203,6 +236,7 @@ def _compact_analysis(
     sniper: dict[str, Any],
     recorded: bool,
     record_status: str,
+    intelligence: bool = False,
 ) -> dict[str, Any]:
     alt = sniper.get("altFeatures", {}) or {}
     btc = sniper.get("btcFeatures", {}) or {}
@@ -211,6 +245,7 @@ def _compact_analysis(
         "fallbackSide": fallback_side,
         "recorded": recorded,
         "recordStatus": record_status,
+        "intelligence": intelligence,
         "decision": sniper.get("decision"),
         "score": sniper.get("score"),
         "target": sniper.get("target"),
@@ -260,7 +295,10 @@ async def sample_shadow_signals_once(engine: FeatureEngine) -> dict[str, Any]:
             "rejectedZeroPrice": 0,
             "insertFailed": 0,
             "skippedNoData": 0,
+            "sniperFiltered": 0,
+            "sniperPassed": 0,
             "analyses": [],
+            "intelligenceAnalyses": [],
         }
         sym = symbol if symbol.endswith("-USDT") else f"{symbol}-USDT"
         alt_history = get_snapshot_history(sym, max(window_seconds, 900))
@@ -282,6 +320,26 @@ async def sample_shadow_signals_once(engine: FeatureEngine) -> dict[str, Any]:
         )
         sniper["candleRegime"] = btc_regime
 
+        # ── Sniper Quality Filter ──────────────────────────────────────────────────
+        # Determina se este símbolo possui sinal de inteligência neste ciclo.
+        # Sinais de baixa qualidade ainda são gravados no banco para treinamento
+        # (exemplos negativos são essenciais para o shadow model), mas ficam de
+        # fora de lastIntelligenceAnalyses no dashboard.
+        is_intelligence = _sniper_quality_passes(sniper)
+        if is_intelligence:
+            result["sniperPassed"] += 1
+            log.debug(
+                "Shadow sampler INTELLIGENCE %s: decision=%s score=%.3f",
+                sym, sniper.get("decision"), sniper.get("score") or 0,
+            )
+        else:
+            result["sniperFiltered"] += 1
+            log.debug(
+                "Shadow sampler FILTERED %s: decision=%s score=%.3f (below quality bar)",
+                sym, sniper.get("decision"), sniper.get("score") or 0,
+            )
+        # ─────────────────────────────────────────────────────────────────────────
+
         for fallback_side in ("LONG", "SHORT"):
             result["attempted"] += 1
             signal = await record_signal_from_gate(sym, fallback_side, sniper, config)
@@ -300,7 +358,10 @@ async def sample_shadow_signals_once(engine: FeatureEngine) -> dict[str, Any]:
                     fallback_side,
                     signal.get("signalId"),
                 )
-            result["analyses"].append(_compact_analysis(sym, fallback_side, sniper, was_recorded, record_status))
+            compact = _compact_analysis(sym, fallback_side, sniper, was_recorded, record_status, intelligence=is_intelligence)
+            result["analyses"].append(compact)
+            if is_intelligence and was_recorded:
+                result["intelligenceAnalyses"].append(compact)
             await asyncio.sleep(0)
         return result
 
@@ -315,18 +376,28 @@ async def sample_shadow_signals_once(engine: FeatureEngine) -> dict[str, Any]:
     rejected_zero_price = sum(int(item["rejectedZeroPrice"]) for item in symbol_results)
     insert_failed = sum(int(item["insertFailed"]) for item in symbol_results)
     skipped_no_data = sum(int(item["skippedNoData"]) for item in symbol_results)
+    sniper_filtered = sum(int(item.get("sniperFiltered", 0)) for item in symbol_results)
+    sniper_passed = sum(int(item.get("sniperPassed", 0)) for item in symbol_results)
     analyses = [
         analysis
         for item in symbol_results
         for analysis in item["analyses"]
     ]
+    intelligence_analyses = [
+        analysis
+        for item in symbol_results
+        for analysis in item.get("intelligenceAnalyses", [])
+    ]
 
     log.info(
-        "Shadow sampler cycle=%d done: attempted=%d recorded=%d deduped=%d zero_price=%d insert_failed=%d skipped=%d concurrency=%d",
-        cycle_num, attempted, recorded, deduped, rejected_zero_price, insert_failed, skipped_no_data, symbol_concurrency,
+        "Shadow sampler cycle=%d done: attempted=%d recorded=%d deduped=%d zero_price=%d "
+        "insert_failed=%d skipped=%d intelligence=%d/%d concurrency=%d",
+        cycle_num, attempted, recorded, deduped, rejected_zero_price, insert_failed,
+        skipped_no_data, sniper_passed, sniper_passed + sniper_filtered, symbol_concurrency,
     )
 
     previous_analyses = list(_sampler_state.get("lastAnalyses") or [])
+    previous_intelligence = list(_sampler_state.get("lastIntelligenceAnalyses") or [])
     _sampler_state.update({
         "enabled": _env_bool("SHADOW_SAMPLER_ENABLED", True),
         "running": True,
@@ -339,7 +410,10 @@ async def sample_shadow_signals_once(engine: FeatureEngine) -> dict[str, Any]:
         "rejectedZeroPrice": int(_sampler_state.get("rejectedZeroPrice", 0) or 0) + rejected_zero_price,
         "insertFailed": int(_sampler_state.get("insertFailed", 0) or 0) + insert_failed,
         "skippedNoData": int(_sampler_state["skippedNoData"]) + skipped_no_data,
+        "sniperFiltered": int(_sampler_state.get("sniperFiltered", 0) or 0) + sniper_filtered,
+        "sniperPassed": int(_sampler_state.get("sniperPassed", 0) or 0) + sniper_passed,
         "lastAnalyses": (analyses + previous_analyses)[:MAX_LAST_ANALYSES],
+        "lastIntelligenceAnalyses": (intelligence_analyses + previous_intelligence)[:MAX_LAST_ANALYSES],
     })
     _persist_sampler_state()
 
@@ -350,7 +424,11 @@ async def sample_shadow_signals_once(engine: FeatureEngine) -> dict[str, Any]:
         "rejectedZeroPrice": rejected_zero_price,
         "insertFailed": insert_failed,
         "skippedNoData": skipped_no_data,
+        "sniperFiltered": sniper_filtered,
+        "sniperPassed": sniper_passed,
+        "intelligenceSignals": len(intelligence_analyses),
         "analyses": analyses,
+        "intelligenceAnalyses": intelligence_analyses,
     }
 
 

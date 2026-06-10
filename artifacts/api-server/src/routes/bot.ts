@@ -87,7 +87,10 @@ import {
   getTriggerStats,
   isMuxLocked,
   markTriggerFilled,
+  cancelSectorCascade,
+  recordTriggerOutcome,
 } from "../lib/exhaustionTriggerManager";
+import { getSectorCluster } from "../lib/sectorMap";
 
 const router = Router();
 
@@ -2709,6 +2712,11 @@ async function executeSingleOrder(
   let qbDecision: "ARM_TRIGGER" | "WAIT" | undefined;
   // Spread bid/ask em basis points — capturado do snapshot de mercado do QB.
   let qbSpreadBps = 0;
+  // System 2: Sector cluster para cascade filter
+  let qbSectorCluster: string | undefined = getSectorCluster(symbol);
+  // System 4: Execution metrics do QB (tick density + leverage dinâmica)
+  let qbMinTickDensity1m: number | undefined;
+  let qbExecRecommendedLeverage: number | undefined;
   const expiresAt = Date.now() + 30_000; // 30s — signal must be evaluated before expiry
   if (qbMode === "enforce") {
     try {
@@ -2776,6 +2784,20 @@ async function executeSingleOrder(
       const rawSpread = altFeatures?.spread_bps ?? (sniper?.["spread_bps"]);
       if (typeof rawSpread === "number" && rawSpread > 0) {
         qbSpreadBps = rawSpread;
+      }
+      // System 2: Sector cluster confirmado pelo QB (pode ser mais granular que lookup local)
+      if (qbResult.sectorCluster) {
+        qbSectorCluster = qbResult.sectorCluster;
+      }
+      // System 4: Execution metrics — tick density + leverage ATR-adaptada
+      const execMetrics = qbResult.executionMetrics;
+      if (execMetrics) {
+        if (typeof execMetrics.minTickDensity1m === "number") {
+          qbMinTickDensity1m = execMetrics.minTickDensity1m;
+        }
+        if (typeof execMetrics.recommendedLeverage === "number" && execMetrics.recommendedLeverage > 0) {
+          qbExecRecommendedLeverage = execMetrics.recommendedLeverage;
+        }
       }
     } catch (err) {
       gateRejects.push(`QB_ENFORCE_REJECT: ${err instanceof Error ? err.message : "Quant Brain unavailable"}`);
@@ -2908,6 +2930,27 @@ async function executeSingleOrder(
       gateRejects: [`SPREAD_REJECT: spread ${qbSpreadBps.toFixed(2)} bps > max 2.0 bps`],
       observationMode: false,
       message: `Spread ${qbSpreadBps.toFixed(2)} bps excede o limite Maker de 2 bps. Geometria do alvo comprometida.`,
+      durationMs: Date.now() - t0,
+    };
+  }
+
+  // ── System 4: Minimum Tick Density Gate ────────────────────────────────────
+  // O QB informa quantos ticks (amostras de preço) foram observados no janela 1m.
+  // Se o mercado estiver com livro rarificado, o triggerPrice pode nunca ser
+  // alcançado — o gate descarta a ordem antes de ela ser enviada.
+  // Configurável via env MIN_TICK_DENSITY_1M (padrão: 10).
+  const MIN_TICK_DENSITY_1M = parseInt(process.env["MIN_TICK_DENSITY_1M"] ?? "10", 10);
+  if (
+    qbMinTickDensity1m !== undefined &&
+    qbMinTickDensity1m < MIN_TICK_DENSITY_1M &&
+    qbMode === "enforce"
+  ) {
+    return {
+      index, symbol, side, placed: false, orderId: null,
+      quantity: qty,
+      gateRejects: [`TICK_DENSITY_REJECT: ${qbMinTickDensity1m} ticks < min ${MIN_TICK_DENSITY_1M}/min — livro rarificado`],
+      observationMode: false,
+      message: `Tick density insuficiente: ${qbMinTickDensity1m} < ${MIN_TICK_DENSITY_1M} ticks/min. Microestrutura comprometida.`,
       durationMs: Date.now() - t0,
     };
   }
@@ -3048,6 +3091,19 @@ async function executeSingleOrder(
       // If price never reaches triggerPrice within the TTL window, cancel the
       // open order so it doesn't linger and fill at a stale price.
       if (useTriggerLimit && qbTriggerPrice != null) {
+        // System 2: Sector Cluster Co-Movement Filter
+        // Antes de armar o gatilho, cancela todos os gatilhos pendentes do mesmo
+        // setor de correlação. Evita que 3-4 stops do mesmo cluster explodam juntos.
+        if (qbSectorCluster) {
+          const cascade = cancelSectorCascade(symbol, qbSectorCluster);
+          if (cascade.cancelled > 0) {
+            console.warn(
+              `[sniper] SECTOR_CASCADE_CANCELLED: cluster=${qbSectorCluster}` +
+              ` cancelados ${cascade.cancelled} gatilho(s) por incoming ${symbol}` +
+              ` ids=[${cascade.ids.join(",")}]`,
+            );
+          }
+        }
         const triggerId = armLimitOrderExpiry({
           orderId: placedOrderId,
           symbol,
@@ -3055,6 +3111,9 @@ async function executeSingleOrder(
           triggerPrice: qbTriggerPrice,
           exhaustionType: qbExhaustionType,
           expirationMs: qbTriggerExpirationSeconds * 1_000,
+          // System 2 + System 3: Sector cluster + signalId para outcome tagging
+          sectorCluster: qbSectorCluster,
+          signalId,
           cancelFn: async () => {
             await bingxPost(
               "/openApi/swap/v2/trade/cancel",

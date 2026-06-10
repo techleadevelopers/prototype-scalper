@@ -10,6 +10,41 @@ from datetime import datetime, timezone
 from typing import Any
 
 from core.movement_sniper import MovementFeatures, evaluate_sniper_window
+
+# ── System 2: Sector Cluster map (espelha sectorMap.ts no Node.js) ───────────
+_SECTOR_CLUSTERS: dict[str, str] = {
+    "BTC-USDT":     "LAYER_1",
+    "ETH-USDT":     "LAYER_1",
+    "SOL-USDT":     "LAYER_1",
+    "POL-USDT":     "LAYER_1",
+    "NEAR-USDT":    "AI_INFRA",
+    "VVV-USDT":     "DEFI",
+    "HYPE-USDT":    "DEFI",
+    "TRUMP-USDT":   "MEME",
+    "MELANIA-USDT": "MEME",
+    "BEAT-USDT":    "MEME",
+}
+
+
+def _sector_cluster(sym: str) -> str:
+    return _SECTOR_CLUSTERS.get(sym, "OTHER")
+
+
+def _compute_recommended_leverage(atr_pct_fraction: float) -> int:
+    """ATR-adaptive leverage: volatilidade alta → alavancagem menor.
+
+    Formula: 0.10 / atr_pct_fraction
+      ATR = 0.5% (0.005) → 20x  (default calibrado)
+      ATR = 1.0% (0.010) → 10x
+      ATR = 2.0% (0.020) → 5x
+      ATR = 0.2% (0.002) → 50x (cap)
+    """
+    if atr_pct_fraction <= 0:
+        return 20
+    raw = 0.10 / atr_pct_fraction
+    return max(5, min(50, round(raw)))
+
+
 from core import knowledge_base as kb
 from core.recommendation import recommend_entry
 from core.async_utils import run_edge_blocking
@@ -1096,6 +1131,25 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
                     f"janela de {_funding_block_window_s:.0f}s ativa"
                 )
 
+    # ── System 1: Timestamp Matcher (Clock Precision Sync) ────────────────────
+    # Libera o cálculo do gatilho APENAS se os dados dos 3 timeframes estiverem
+    # sincronizados. Dados com atraso > DATA_SYNC_MAX_STALE_S (padrão 0.5s)
+    # indicam buffer não normalizado — a geometria calculada nasceria errada
+    # porque o preço real já andou desde a última vela capturada.
+    _data_sync_threshold_s = float(os.environ.get("DATA_SYNC_MAX_STALE_S", "0.5"))
+    _frame_stales = {
+        "alt1m":  _num((data_quality.get("alt1m")  or {}).get("staleSeconds"), 0.0),
+        "alt5m":  _num((data_quality.get("alt5m")  or {}).get("staleSeconds"), 0.0),
+        "alt15m": _num((data_quality.get("alt15m") or {}).get("staleSeconds"), 0.0),
+    }
+    _worst_frame_name = max(_frame_stales, key=lambda k: _frame_stales[k])
+    _worst_stale_s = _frame_stales[_worst_frame_name]
+    if _worst_stale_s > _data_sync_threshold_s:
+        universal_blocks.append(
+            f"DATA_SYNC_REJECT: {_worst_frame_name} staleSeconds={_worst_stale_s:.3f}s "
+            f"> threshold={_data_sync_threshold_s:.1f}s — aguardando normalização do buffer de dados"
+        )
+
     all_blocks = judge_result["blocks"] + high_sample_blocks + risk_geometry_blocks + ml_economic_blocks + extra_blocks + universal_blocks
     allow = len(all_blocks) == 0
 
@@ -1338,4 +1392,14 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
         "confidence": _confidence,
         "expectedValue": _ev_pct,
         "kellyFraction": round(_kelly_fraction, 6),
+        # ── System 2: Sector cluster para cascade filter no Node.js ────────────
+        "sectorCluster": _sector_cluster(symbol),
+        # ── System 4: Execution metrics — contrato padrão-ouro ────────────────
+        # Node.js consome estes campos para gate de tick density e alavancagem
+        # dinâmica calculada pelo QB com base na volatilidade ATR real.
+        "executionMetrics": {
+            "recommendedLeverage": _compute_recommended_leverage(_alt_atr_pct_v),
+            "minTickDensity1m": int((data_quality.get("alt1m") or {}).get("samples", 0)),
+            "maxSpreadAllowed": 0.0002,
+        },
     }
