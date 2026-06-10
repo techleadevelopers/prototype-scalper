@@ -846,6 +846,16 @@ export default function TriggerPage() {
             <Badge variant="outline" className="text-[10px] border-violet-500/30 text-violet-400">
               Motor Nativo
             </Badge>
+            {nativeStatus?.config.brutalMode && (
+              <Badge className="text-[9px] bg-rose-500/20 text-rose-300 border-rose-500/30">
+                <Zap className="w-2 h-2 mr-0.5" />BRUTAL · {nativeStatus.config.totalLevels} níveis/símbolo
+              </Badge>
+            )}
+            {nativeStatus?.config && !nativeStatus.config.brutalMode && (
+              <Badge variant="outline" className="text-[9px] text-muted-foreground/50">
+                {nativeStatus.config.totalLevels} níveis/símbolo
+              </Badge>
+            )}
             {muxLocked && (
               <Badge className="text-[9px] bg-amber-500/15 text-amber-400 border-amber-500/25">
                 <Lock className="w-2 h-2 mr-0.5" />MUX LOCK

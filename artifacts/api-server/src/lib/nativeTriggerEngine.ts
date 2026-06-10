@@ -62,9 +62,27 @@ const COOLDOWN_MS = parseInt(
   10,
 );
 
+/**
+ * Modo brutal: ativa grid de 20 níveis por símbolo (10 LONG + 10 SHORT).
+ * Ligado automaticamente quando o Sniper Copilot está ativo.
+ * Pode ser forçado via env: NATIVE_TRIGGER_BRUTAL_MODE=true
+ */
+const BRUTAL_MODE_ENV =
+  (process.env["NATIVE_TRIGGER_BRUTAL_MODE"] ?? "false") === "true";
+
 // ── Estado interno ─────────────────────────────────────────────────────────────
 
 const _lastFiredAt = new Map<string, number>(); // "BTC-USDT:LONG" → timestamp
+let _sniperCopilotActive = BRUTAL_MODE_ENV;
+
+/** Chamado pelo Sniper Copilot ao iniciar/parar para ativar o modo brutal. */
+export function setSniperCopilotActive(active: boolean): void {
+  _sniperCopilotActive = active || BRUTAL_MODE_ENV;
+}
+
+export function isBrutalModeActive(): boolean {
+  return _sniperCopilotActive;
+}
 
 // ── Interfaces públicas ────────────────────────────────────────────────────────
 
@@ -82,18 +100,36 @@ export interface NativeTriggerResult {
 
 // ── Geometria do grid (idêntica ao Python build_sniper_tail_grid) ─────────────
 
+// ── Grid geometry tables ───────────────────────────────────────────────────────
+
+/** Grid padrão: 3 LONG + 4 SHORT = 7 níveis por símbolo */
+const STANDARD_LONG_DROPS   = [0.10, 0.11, 0.12];
+const STANDARD_LONG_WEIGHTS = [0.20, 0.30, 0.50];
+const STANDARD_SHORT_PUMPS   = [0.20, 0.21, 0.22, 0.24];
+const STANDARD_SHORT_WEIGHTS = [0.15, 0.25, 0.30, 0.30];
+
+/**
+ * Grid brutal (Sniper Copilot ativo): 10 LONG + 10 SHORT = 20 níveis por símbolo.
+ * Cobertura ampla: LONG de -10% a -22%, SHORT de +20% a +40%.
+ * Pesos centralizados para cobrir toda a escada de forma eficiente.
+ */
+const BRUTAL_LONG_DROPS   = [0.10, 0.11, 0.12, 0.13, 0.14, 0.15, 0.16, 0.17, 0.19, 0.22];
+const BRUTAL_LONG_WEIGHTS = [0.05, 0.07, 0.08, 0.09, 0.10, 0.11, 0.12, 0.13, 0.13, 0.12];
+const BRUTAL_SHORT_PUMPS   = [0.20, 0.21, 0.22, 0.24, 0.26, 0.28, 0.30, 0.33, 0.36, 0.40];
+const BRUTAL_SHORT_WEIGHTS = [0.07, 0.08, 0.10, 0.12, 0.13, 0.13, 0.12, 0.10, 0.08, 0.07];
+
 /**
  * Gera a escada de gatilhos Tail Hunter.
  *
- * Ancorada no preço atual — os níveis são percentuais absolutos do preço corrente.
- *
- * LONG : 10%, 11%, 12% abaixo → pesos 20/30/50%
- * SHORT: 20%, 21%, 22%, 24% acima → pesos 15/25/30/30%
+ * Modo padrão : 3 LONG (−10/−11/−12%) + 4 SHORT (+20/+21/+22/+24%) = 7 níveis
+ * Modo brutal : 10 LONG (−10%…−22%) + 10 SHORT (+20%…+40%) = 20 níveis
+ *               Ativado quando o Sniper Copilot está rodando.
  */
 function buildTailHunterGrid(
   currentPrice: number,
   side: "LONG" | "SHORT",
   atrPct: number = 0,
+  brutal = _sniperCopilotActive,
 ): GridLevel[] {
   if (currentPrice <= 0) return [];
 
@@ -102,46 +138,47 @@ function buildTailHunterGrid(
   function levelGeometry(triggerP: number): { tpPct: number; slPct: number } {
     let rawTp = (baseTargetUsdt / triggerP) * 100;
     if (atrPct > 0) {
-      rawTp = Math.max(rawTp, atrPct * 0.40); // mínimo 40% do ATR
+      rawTp = Math.max(rawTp, atrPct * 0.40);
     }
     const tp = Math.max(0.08, Math.min(3.00, rawTp));
     return { tpPct: tp, slPct: tp * 2.0 };
   }
 
+  const drops   = side === "LONG"
+    ? (brutal ? BRUTAL_LONG_DROPS   : STANDARD_LONG_DROPS)
+    : (brutal ? BRUTAL_SHORT_PUMPS  : STANDARD_SHORT_PUMPS);
+  const weights = side === "LONG"
+    ? (brutal ? BRUTAL_LONG_WEIGHTS : STANDARD_LONG_WEIGHTS)
+    : (brutal ? BRUTAL_SHORT_WEIGHTS : STANDARD_SHORT_WEIGHTS);
+
   const levels: GridLevel[] = [];
 
-  if (side === "LONG") {
-    const drops   = [0.10, 0.11, 0.12];
-    const weights = [0.20, 0.30, 0.50];
-
-    for (let i = 0; i < drops.length; i++) {
-      const triggerPrice = parseFloat((currentPrice * (1 - drops[i])).toFixed(6));
-      const { tpPct, slPct } = levelGeometry(triggerPrice);
-      levels.push({
-        level:            i + 1,
-        side:             "LONG",
-        triggerPrice,
-        targetPrice:      parseFloat((triggerPrice * (1 + tpPct / 100)).toFixed(6)),
-        stopPrice:        parseFloat((triggerPrice * (1 - slPct / 100)).toFixed(6)),
-        allocationFactor: weights[i],
-      });
-    }
-  } else {
-    const pumps   = [0.20, 0.21, 0.22, 0.24];
-    const weights = [0.15, 0.25, 0.30, 0.30];
-
-    for (let i = 0; i < pumps.length; i++) {
-      const triggerPrice = parseFloat((currentPrice * (1 + pumps[i])).toFixed(6));
-      const { tpPct, slPct } = levelGeometry(triggerPrice);
-      levels.push({
-        level:            i + 1,
-        side:             "SHORT",
-        triggerPrice,
-        targetPrice:      parseFloat((triggerPrice * (1 - tpPct / 100)).toFixed(6)),
-        stopPrice:        parseFloat((triggerPrice * (1 + slPct / 100)).toFixed(6)),
-        allocationFactor: weights[i],
-      });
-    }
+  for (let i = 0; i < drops.length; i++) {
+    const triggerPrice = parseFloat(
+      (side === "LONG"
+        ? currentPrice * (1 - drops[i])
+        : currentPrice * (1 + drops[i])
+      ).toFixed(6),
+    );
+    const { tpPct, slPct } = levelGeometry(triggerPrice);
+    levels.push({
+      level:            i + 1,
+      side,
+      triggerPrice,
+      targetPrice: parseFloat(
+        (side === "LONG"
+          ? triggerPrice * (1 + tpPct / 100)
+          : triggerPrice * (1 - tpPct / 100)
+        ).toFixed(6),
+      ),
+      stopPrice: parseFloat(
+        (side === "LONG"
+          ? triggerPrice * (1 - slPct / 100)
+          : triggerPrice * (1 + slPct / 100)
+        ).toFixed(6),
+      ),
+      allocationFactor: weights[i],
+    });
   }
 
   return levels;
@@ -308,7 +345,11 @@ export function getNativeTriggerConfig(): {
   baseTpPct: number;
   expirationSeconds: number;
   cooldownMs: number;
+  brutalMode: boolean;
+  levelsPerSide: number;
+  totalLevels: number;
 } {
+  const brutal = _sniperCopilotActive;
   return {
     enabled:           NATIVE_TRIGGER_ENABLED,
     longDetectPct:     LONG_DETECT_PCT,
@@ -316,5 +357,23 @@ export function getNativeTriggerConfig(): {
     baseTpPct:         BASE_TP_PCT,
     expirationSeconds: EXPIRATION_SECONDS,
     cooldownMs:        COOLDOWN_MS,
+    brutalMode:        brutal,
+    levelsPerSide:     brutal ? 10 : (3 + 4) / 2,   // informativo
+    totalLevels:       brutal ? 20 : 7,
+  };
+}
+
+/** Retorna as tabelas de drops/pesos para uso externo (endpoint de preview). */
+export function getTailHunterGridTables(brutal = _sniperCopilotActive): {
+  longDrops: number[];
+  longWeights: number[];
+  shortPumps: number[];
+  shortWeights: number[];
+} {
+  return {
+    longDrops:    brutal ? BRUTAL_LONG_DROPS    : STANDARD_LONG_DROPS,
+    longWeights:  brutal ? BRUTAL_LONG_WEIGHTS  : STANDARD_LONG_WEIGHTS,
+    shortPumps:   brutal ? BRUTAL_SHORT_PUMPS   : STANDARD_SHORT_PUMPS,
+    shortWeights: brutal ? BRUTAL_SHORT_WEIGHTS : STANDARD_SHORT_WEIGHTS,
   };
 }

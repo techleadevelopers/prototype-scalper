@@ -93,7 +93,14 @@ import {
 } from "../lib/exhaustionTriggerManager";
 import { getSectorCluster } from "../lib/sectorMap";
 import { processGridTrigger, type GridLevel, type GridBrainResponse } from "../lib/gridTriggerManager";
-import { evaluateNativeTrigger, getNativeTriggerConfig, getNativeTriggerCooldowns } from "../lib/nativeTriggerEngine";
+import {
+  evaluateNativeTrigger,
+  getNativeTriggerConfig,
+  getNativeTriggerCooldowns,
+  getTailHunterGridTables,
+  setSniperCopilotActive,
+  isBrutalModeActive,
+} from "../lib/nativeTriggerEngine";
 
 const router = Router();
 
@@ -1029,6 +1036,7 @@ function stopAutopilot(reason: string): void {
   autopilot.running = false;
   autopilot.creds = null;
   autopilot.stopReason = reason;
+  setSniperCopilotActive(false);
 }
 
 async function runAutopilotCycle(): Promise<void> {
@@ -4275,6 +4283,7 @@ router.post("/bot/sniper/autopilot/start", requireAdminAuthorization, (req: Requ
   autopilot.lastCycle = null;
   autopilot.history = [];
   autopilot.stopReason = null;
+  setSniperCopilotActive(true);
 
   // First cycle fires immediately, then on interval
   runAutopilotCycleLocked().catch((err) => req.log.warn({ err }, "autopilot cycle error"));
@@ -4748,11 +4757,9 @@ router.get("/bot/native-trigger/status", async (_req: Request, res: Response) =>
       ttlRemainingMs: Math.max(0, t.expiresAt - Date.now()),
     }));
 
-  // Preview de grid por símbolo (candles cached 30s — rápido)
-  const LONG_DROPS   = [0.10, 0.11, 0.12];
-  const SHORT_PUMPS  = [0.20, 0.21, 0.22, 0.24];
-  const LONG_WEIGHTS = [0.20, 0.30, 0.50];
-  const SHORT_WEIGHTS = [0.15, 0.25, 0.30, 0.30];
+  // Preview de grid por símbolo — usa tabelas do modo atual (brutal ou padrão)
+  const { longDrops: LONG_DROPS, longWeights: LONG_WEIGHTS, shortPumps: SHORT_PUMPS, shortWeights: SHORT_WEIGHTS } =
+    getTailHunterGridTables(isBrutalModeActive());
   const BASE_TP_PCT   = nativeConfig.baseTpPct;
 
   function buildGrid(currentPrice: number, side: "LONG" | "SHORT", atrPct: number) {

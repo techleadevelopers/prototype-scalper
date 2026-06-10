@@ -188,6 +188,9 @@ export interface NativeTriggerStatus {
     baseTpPct: number;
     expirationSeconds: number;
     cooldownMs: number;
+    brutalMode: boolean;
+    levelsPerSide: number;
+    totalLevels: number;
   };
   muxLock: {
     locked: boolean;
