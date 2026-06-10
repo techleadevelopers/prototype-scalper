@@ -32,6 +32,7 @@ Configuração via ENV:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -228,7 +229,7 @@ async def perform_daily_recalibration() -> dict[str, Any]:
 
     outcomes_path = _outcomes_path()
     last_ts = _load_checkpoint()
-    new_outcomes = _read_outcomes_since(outcomes_path, last_ts)
+    new_outcomes = await asyncio.to_thread(_read_outcomes_since, outcomes_path, last_ts)
 
     if not new_outcomes:
         log.info("[offline_learner] cycle=%d nenhum outcome novo desde ts=%.0f", cycle, last_ts)
@@ -312,15 +313,18 @@ async def perform_daily_recalibration() -> dict[str, Any]:
             _learner_state["trainingsTriggered"] = int(_learner_state.get("trainingsTriggered", 0)) + 1
             _learner_state["lastTrainingResult"] = {
                 "at": time.time(),
-                "savedModel": training_result.get("savedModel", False),
+                "saved": training_result.get("trained", False),
                 "samples": training_result.get("samples"),
-                "brier": training_result.get("brier"),
+                "modelBrier": training_result.get("modelBrier"),
+                "rocAuc": training_result.get("rocAuc"),
                 "profitabilityVerified": training_result.get("profitabilityVerified"),
+                "sniperGridSampleCount": training_result.get("sniperGridSampleCount"),
             }
             log.info(
-                "[offline_learner] treinamento concluído: savedModel=%s samples=%s",
-                training_result.get("savedModel"),
+                "[offline_learner] treinamento concluído: saved=%s samples=%s brier=%s",
+                training_result.get("trained"),
                 training_result.get("samples"),
+                training_result.get("modelBrier"),
             )
         except Exception as exc:
             log.error("[offline_learner] train_shadow_model falhou: %s", exc)

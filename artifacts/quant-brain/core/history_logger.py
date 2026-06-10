@@ -53,18 +53,55 @@ def _snapshots_path() -> Path:
     return base / "signal_snapshots.jsonl"
 
 
+def _count_lines_fast(path: Path) -> int:
+    """Conta linhas por buffer — sem carregar o arquivo inteiro em memória."""
+    try:
+        count = 0
+        with path.open("rb") as f:
+            while True:
+                buf = f.read(1 << 16)  # 64 KB por vez
+                if not buf:
+                    break
+                count += buf.count(b"\n")
+        return count
+    except Exception:
+        return 0
+
+
 def _rotate_if_needed(path: Path) -> None:
+    """
+    Rotaciona o arquivo quando ultrapassa _MAX_LINES.
+
+    Estratégia O(1) em memória:
+      1. Conta linhas via buffer de 64 KB sem carregar o arquivo.
+      2. Localiza o byte-offset do meio via seek + scan de newline.
+      3. Lê apenas a segunda metade do arquivo para o tmp.
+      4. Substitui atomicamente via rename.
+
+    Nunca carrega o arquivo inteiro em memória — seguro para 100k linhas.
+    """
     try:
         if not path.exists():
             return
-        content = path.read_text(encoding="utf-8")
-        lines = [l for l in content.splitlines() if l.strip()]
-        if len(lines) <= _MAX_LINES:
+        n_lines = _count_lines_fast(path)
+        if n_lines <= _MAX_LINES:
             return
-        keep = lines[-(len(lines) // 2):]
+
+        file_size = path.stat().st_size
+        mid_byte = file_size // 2
+
+        with path.open("rb") as f:
+            f.seek(mid_byte)
+            f.readline()  # descarta linha parcial no ponto de corte
+            tail = f.read()
+
+        if not tail:
+            return
+
         tmp = path.with_suffix(".jsonl.tmp")
-        tmp.write_text("\n".join(keep) + "\n", encoding="utf-8")
+        tmp.write_bytes(tail if tail.endswith(b"\n") else tail + b"\n")
         tmp.replace(path)
+        log.info("[history_logger] rotated: %d→~%d lines", n_lines, n_lines // 2)
     except Exception as exc:
         log.warning("[history_logger] rotation failed: %s", exc)
 

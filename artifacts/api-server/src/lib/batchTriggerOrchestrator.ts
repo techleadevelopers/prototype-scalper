@@ -57,6 +57,7 @@ export type CheckOrderStatusFn = (
   orderId: string,
   symbol: string,
 ) => Promise<{ filledQty: number; origQty: number } | null>;
+export type CancelOrderFn = (orderId: string, symbol: string) => Promise<void>;
 
 interface MuxLockState {
   isActive: boolean;
@@ -75,17 +76,20 @@ export class BatchTriggerOrchestrator {
   private readonly placeOrderFn: PlaceOrderFn;
   private readonly getActivePositionsCountFn: GetActivePositionsCountFn;
   private readonly checkOrderStatusFn?: CheckOrderStatusFn;
+  private readonly cancelOrderFn?: CancelOrderFn;
 
   constructor(options: {
     maxConcurrentPositions?: number;
     placeOrderFn: PlaceOrderFn;
     getActivePositionsCountFn: GetActivePositionsCountFn;
     checkOrderStatusFn?: CheckOrderStatusFn;
+    cancelOrderFn?: CancelOrderFn;
   }) {
     this.maxConcurrentPositions = options.maxConcurrentPositions ?? 3;
     this.placeOrderFn = options.placeOrderFn;
     this.getActivePositionsCountFn = options.getActivePositionsCountFn;
     this.checkOrderStatusFn = options.checkOrderStatusFn;
+    this.cancelOrderFn = options.cancelOrderFn;
 
     const lockDurationMs = MUX_LOCK_CANDLES * 60_000;
     logger.info(
@@ -138,7 +142,10 @@ export class BatchTriggerOrchestrator {
 
     // ── PIPELINE QB ──────────────────────────────────────────────────────────
     if (signal.decision !== "ARM_TRIGGER") {
-      logger.debug({ symbol, decision: signal.decision }, "[BATCH] QB retornou WAIT — nenhuma ação");
+      logger.debug(
+        { symbol, decision: signal.decision },
+        "[BATCH] Decisão não é ARM_TRIGGER — nenhuma ação (ARM_TRIGGER_GRID tratado em bot.ts)",
+      );
       return;
     }
 
@@ -213,7 +220,12 @@ export class BatchTriggerOrchestrator {
         sectorCluster: signal.sectorCluster,
         signalId: signal.signalId,
         cancelFn: async () => {
-          logger.info({ symbol, orderId: order.id }, "[BATCH] TTL expirado — cancelando ordem limite");
+          logger.info({ symbol, orderId: order.id }, "[BATCH] TTL expirado — cancelando ordem BingX");
+          if (this.cancelOrderFn) {
+            await this.cancelOrderFn(order.id, symbol);
+          } else {
+            logger.warn({ symbol, orderId: order.id }, "[BATCH] cancelOrderFn não injetada — ordem pode permanecer aberta");
+          }
         },
         checkPartialFillFn: this.checkOrderStatusFn
           ? () => this.checkOrderStatusFn!(order.id, symbol)
@@ -221,7 +233,7 @@ export class BatchTriggerOrchestrator {
         onPartialFill: (filledQty, origQty) => {
           logger.warn(
             { symbol, orderId: order.id, filledQty, origQty },
-            "[BATCH] Preenchimento parcial detectado — remainder cancelado",
+            "[BATCH] Preenchimento parcial detectado — remainder cancelado via cancelFn",
           );
         },
       });
@@ -281,8 +293,15 @@ export class BatchTriggerOrchestrator {
         if (filledQty > 0 && filledQty < origQty) {
           logger.warn(
             { symbol, orderId, triggerId, filledQty, origQty },
-            "[LIFECYCLE] Preenchimento parcial detectado no poll de 5s",
+            "[LIFECYCLE] Preenchimento parcial detectado no poll — cancelando remainder via BingX",
           );
+          // Cancela o remainder imediatamente — não aguarda TTL
+          if (this.cancelOrderFn) {
+            this.cancelOrderFn(orderId, symbol).catch((err) => {
+              logger.warn({ symbol, orderId, err: String(err) }, "[LIFECYCLE] Falha ao cancelar remainder");
+            });
+          }
+          return;
         }
 
         setTimeout(poll, LIFECYCLE_POLL_MS);
