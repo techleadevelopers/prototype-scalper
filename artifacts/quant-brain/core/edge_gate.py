@@ -1256,6 +1256,9 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
     _trigger_px: float | None = float(_raw_trigger) if _raw_trigger and float(_raw_trigger) > 0 else None
     _target_px: float | None = None
     _stop_px: float | None = None
+    _grid_levels: list[dict] = []
+
+    _ENABLE_GRID_SNIPER = os.environ.get("ENABLE_GRID_SNIPER", "false").strip().lower() in ("1", "true", "yes")
 
     if allow and _trigger_px and _microframe.get("executionType") == "TRIGGER_LIMIT":
         # ARM_TRIGGER via ordem limite — geometria ancorada no ponto exato de exaustão
@@ -1266,6 +1269,35 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
             _target_px = round(_trigger_px * (1 - _tp_pct / 100), 6)
             _stop_px   = round(_trigger_px * (1 + _sl_pct / 100), 6)
         _decision = "ARM_TRIGGER"
+
+        # ── Tail Hunter upgrade: escala para ARM_TRIGGER_GRID quando volatilidade
+        # justifica uma escada de gatilhos para caça de pavios.
+        # Condições: ENABLE_GRID_SNIPER=true + regime HIGH/EXTREME + ATR ≥ 0.30%.
+        if _ENABLE_GRID_SNIPER and volatility_regime in ("HIGH", "EXTREME") and _atr_pct_for_scale >= 0.30:
+            _grid_step_pct = max(0.25, _atr_pct_for_scale * 0.45)   # espaço entre níveis
+            _grid_tp_pct   = max(0.10, _atr_pct_for_scale * 0.35)   # alvo por nível (bounce curto)
+            _grid_sl_pct   = _grid_tp_pct * 2.2                       # stop: 2.2× do TP
+            _allocations   = [0.20, 0.30, 0.50]                       # pirâmide: mais fundo = mais pesado
+            for _i, _alloc in enumerate(_allocations):
+                if position_side == "LONG":
+                    _lv_trigger = round(_trigger_px * (1 - (_i * _grid_step_pct / 100)), 6)
+                    _lv_target  = round(_lv_trigger * (1 + _grid_tp_pct / 100), 6)
+                    _lv_stop    = round(_lv_trigger * (1 - _grid_sl_pct / 100), 6)
+                    _lv_side    = "LONG"
+                else:
+                    _lv_trigger = round(_trigger_px * (1 + (_i * _grid_step_pct / 100)), 6)
+                    _lv_target  = round(_lv_trigger * (1 - _grid_tp_pct / 100), 6)
+                    _lv_stop    = round(_lv_trigger * (1 + _grid_sl_pct / 100), 6)
+                    _lv_side    = "SHORT"
+                _grid_levels.append({
+                    "level": _i + 1,
+                    "side": _lv_side,
+                    "triggerPrice": _lv_trigger,
+                    "targetPrice": _lv_target,
+                    "stopPrice": _lv_stop,
+                    "allocationFactor": _alloc,
+                })
+            _decision = "ARM_TRIGGER_GRID"
     elif allow:
         # ARM_TRIGGER com execução a mercado — geometria ancorada no referencePrice
         _ref_px = float(payload.get("referencePrice") or 0)
@@ -1426,7 +1458,12 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
             "calculatedTpPct": round(_tp_pct, 6),
             "calculatedSlPct": round(_sl_pct, 6),
             "appliedFilters": _applied_filters,
+            # ── Grid Sniper — presentes apenas quando decision == ARM_TRIGGER_GRID
+            "gridStrategy": "TAIL_HUNTER" if _decision == "ARM_TRIGGER_GRID" else None,
+            "expirationSeconds": _raw_expiration,
         },
+        # ── Grid Sniper: níveis da escada (null para decisões não-grid) ──────────
+        "grid": _grid_levels if _decision == "ARM_TRIGGER_GRID" else None,
         # ── Objetos estruturados do relatório técnico ─────────────────────────
         # Complementam os campos planos (backward compat mantida).
         # BatchTriggerOrchestrator consome `geometry` e `probabilityModel`.

@@ -130,7 +130,7 @@ def log_arm_trigger_snapshot(response: dict[str, Any]) -> None:
     if not _ENABLED:
         return
 
-    if response.get("decision") != "ARM_TRIGGER":
+    if response.get("decision") not in ("ARM_TRIGGER", "ARM_TRIGGER_GRID"):
         return
 
     geometry = response.get("geometry") or {}

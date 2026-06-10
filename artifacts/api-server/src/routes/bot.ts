@@ -92,6 +92,7 @@ import {
   recordTriggerOutcome,
 } from "../lib/exhaustionTriggerManager";
 import { getSectorCluster } from "../lib/sectorMap";
+import { processGridTrigger, type GridLevel, type GridBrainResponse } from "../lib/gridTriggerManager";
 
 const router = Router();
 
@@ -2707,7 +2708,10 @@ async function executeSingleOrder(
   // O Node.js usa estes preços DIRETAMENTE — proibido recalcular.
   let qbTargetPrice: number | null | undefined;
   let qbStopPrice: number | null | undefined;
-  let qbDecision: "ARM_TRIGGER" | "WAIT" | undefined;
+  let qbDecision: "ARM_TRIGGER" | "ARM_TRIGGER_GRID" | "WAIT" | undefined;
+  // ARM_TRIGGER_GRID: escada de ordens LIMIT para caça de pavios (Tail Hunter)
+  let qbGrid: GridLevel[] | undefined;
+  let qbGridMetrics: GridBrainResponse["executionMetrics"] | undefined;
   // Spread bid/ask em basis points — capturado do snapshot de mercado do QB.
   let qbSpreadBps = 0;
   // System 2: Sector cluster para cascade filter
@@ -2797,6 +2801,14 @@ async function executeSingleOrder(
           qbExecRecommendedLeverage = execMetrics.recommendedLeverage;
         }
       }
+      // ARM_TRIGGER_GRID: captura escada de níveis do QB
+      if (qbResult.decision === "ARM_TRIGGER_GRID") {
+        const rawGrid = qbResult.grid as GridLevel[] | undefined;
+        if (Array.isArray(rawGrid) && rawGrid.length > 0) {
+          qbGrid = rawGrid;
+          qbGridMetrics = execMetrics as GridBrainResponse["executionMetrics"] | undefined;
+        }
+      }
     } catch (err) {
       gateRejects.push(`QB_ENFORCE_REJECT: ${err instanceof Error ? err.message : "Quant Brain unavailable"}`);
     }
@@ -2868,6 +2880,42 @@ async function executeSingleOrder(
       index, symbol, side, placed: false, orderId: null,
       quantity: null, gateRejects, observationMode: false,
       message: `REJECTED: ${gateRejects[0]}`,
+      durationMs: Date.now() - t0,
+    };
+  }
+
+  // ARM_TRIGGER_GRID — Tail Hunter: escada de ordens LIMIT Maker para caça de pavios.
+  // O QB selecionou grid mode — processGridTrigger coloca N ordens e gerencia TTL/fill.
+  if (qbDecision === "ARM_TRIGGER_GRID" && qbGrid && qbGrid.length > 0) {
+    const btcRegimeGrid: import("../lib/adaptiveEngine").BtcRegime =
+      (item.btcChangePct ?? 0) >= config.btcRegimeThresholdPct ? "BULL" :
+      (item.btcChangePct ?? 0) <= -config.btcRegimeThresholdPct ? "BEAR" : "NEUTRAL";
+    const gridResult = await processGridTrigger({
+      symbol,
+      positionSide: positionSide as "LONG" | "SHORT",
+      brainResponse: {
+        decision: "ARM_TRIGGER_GRID",
+        grid: qbGrid,
+        executionMetrics: qbGridMetrics,
+        metadata: { signalId },
+      },
+      totalMargin: orderMargin,
+      leverage: orderLeverage,
+      signalId,
+      sectorCluster: qbSectorCluster,
+      creds,
+      hourUtc: currentHour,
+      btcRegime: btcRegimeGrid,
+    });
+    return {
+      index, symbol, side,
+      placed: gridResult.levelsArmed > 0,
+      orderId: gridResult.orderIds[0] ?? null,
+      quantity: qty ?? null,
+      gateRejects: [],
+      observationMode: false,
+      message: `GRID_TAIL_HUNTER: ${gridResult.levelsArmed}/${qbGrid.length} níveis armados para ${symbol}` +
+        (gridResult.levelsFailed > 0 ? ` (${gridResult.levelsFailed} falha(s))` : ""),
       durationMs: Date.now() - t0,
     };
   }
