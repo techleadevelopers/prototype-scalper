@@ -9,6 +9,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
+from core.history_logger import log_arm_trigger_snapshot
 from core.movement_sniper import MovementFeatures, evaluate_sniper_window
 
 # ── System 2: Sector Cluster map (espelha sectorMap.ts no Node.js) ───────────
@@ -1307,7 +1308,7 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
 
     _recommended_leverage = _compute_recommended_leverage(_alt_atr_pct_v)
 
-    return {
+    _edge_response = {
         "allow": allow,
         "available": True,
         "gateRejects": all_blocks,
@@ -1396,6 +1397,7 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
             "adjustedStopPct": adjusted_stop,
         },
         "mode": "expired" if signal_expired else "judge-coach-dual-layer-v1",
+        "features": payload.get("features") or {},
         # Exhaustion Trigger fields (microframe 1m/5m/15m intelligence)
         "executionType": _microframe.get("executionType", "MARKET"),
         "triggerPrice": _microframe.get("triggerPrice"),
@@ -1448,3 +1450,7 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
             "kellyFraction": round(_kelly_fraction, 6),
         },
     }
+    # Gap 1 — Quality filter: persiste snapshots puros de ARM_TRIGGER para treino offline.
+    # Só grava se decision == ARM_TRIGGER e geometria completa — dado limpo garantido.
+    log_arm_trigger_snapshot(_edge_response)
+    return _edge_response

@@ -7,7 +7,7 @@ import {
   tradeCount,
   getTelemetrySseEmitter,
 } from "../lib/telemetryStore";
-import { getQuantBrainRecentTrades, getQuantBrainTradeSummary, syncQuantBrainOutcome } from "../lib/quantBrainClient";
+import { getQuantBrainRecentTrades, getQuantBrainTradeSummary, getQuantBrainSupervisorStatus, syncQuantBrainOutcome } from "../lib/quantBrainClient";
 import { AdaptiveEngine } from "../lib/adaptiveEngine";
 import type { BtcRegime, ExitReason, PositionSide, TradeOutcome } from "../lib/adaptiveEngine";
 import { requireAdminAuthorization } from "../lib/executionSecurity";
@@ -204,9 +204,10 @@ router.get("/telemetry/state", async (req: Request, res: Response) => {
  */
 router.get("/telemetry/stats", async (_req: Request, res: Response) => {
   const qbDeadlineMs = 500;
-  const [closedDemoTrades, quantSummary] = await Promise.all([
+  const [closedDemoTrades, quantSummary, supervisorStatus] = await Promise.all([
     loadClosedTrades(5_000),
     withDeadline(getQuantBrainTradeSummary(), null, qbDeadlineMs),
+    withDeadline(getQuantBrainSupervisorStatus(), null, qbDeadlineMs),
   ]);
 
   const triggerStats = getTriggerStats();
@@ -254,6 +255,8 @@ router.get("/telemetry/stats", async (_req: Request, res: Response) => {
     muxLock: triggerStats.muxLock,
     activeSectors: triggerStats.activeSectors,
     quantBrain: quantSummary ?? null,
+    // Gap 3 — QB job supervisor + offline learner health for dashboard
+    quantBrainSupervisor: supervisorStatus ?? null,
     generatedAt: Date.now(),
   });
 });

@@ -393,6 +393,45 @@ export function getTriggerHistory(limit = 50): ExhaustionTriggerRecord[] {
 }
 
 /**
+ * Gap 2 — Feedback loop FILLED_AND_WON / FILLED_AND_STOPPED.
+ *
+ * Chamado pelo livePositionWatcher após detectar o fechamento de uma posição live.
+ * Persiste o desfecho real (TP hit → WON, SL/liquidated → STOPPED) em
+ * trigger_outcomes.jsonl para que o offline_learner do QB reconcilie os outcomes
+ * via kb.reconcile_signal_outcome(signalId, won=...).
+ *
+ * Regra de mapeamento:
+ *   exitReason "TP"     → FILLED_AND_WON
+ *   exitReason "SL"     → FILLED_AND_STOPPED
+ *   exitReason "MANUAL" → não registrado (sem outcome de mercado definido)
+ */
+export function recordFillOutcome(
+  signalId: string | undefined,
+  symbol: string,
+  direction: TriggerDirection,
+  exitReason: "TP" | "SL" | "MANUAL",
+  realizedPnl: number,
+): void {
+  if (exitReason === "MANUAL") return;
+  if (!signalId) return;
+
+  const tag: TriggerOutcomeTag = exitReason === "TP" ? "FILLED_AND_WON" : "FILLED_AND_STOPPED";
+  try {
+    const entry = JSON.stringify({
+      ts: Date.now(),
+      signalId,
+      symbol,
+      direction,
+      tag,
+      realizedPnl,
+    });
+    _enqueueOutcomeWrite(entry);
+  } catch {
+    // Non-blocking — telemetry write failure must never affect trade execution
+  }
+}
+
+/**
  * Retorna estatísticas agregadas de todos os gatilhos registrados nesta sessão.
  */
 export function getTriggerStats(): {

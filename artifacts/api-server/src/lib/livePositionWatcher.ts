@@ -23,6 +23,7 @@ import fs from "fs";
 import path from "path";
 import { buildOutcomeFromOrders, recordTradeOutcome } from "./telemetryStore";
 import { syncQuantBrainOutcome } from "./quantBrainClient";
+import { recordFillOutcome } from "./exhaustionTriggerManager";
 import { logger } from "./logger";
 import type { BtcRegime } from "./adaptiveEngine";
 
@@ -531,6 +532,15 @@ async function pollCycle(): Promise<void> {
         outcome.notional = entry.notional;
 
         recordTradeOutcome(outcome);
+        // Gap 2 — feed FILLED_AND_WON / FILLED_AND_STOPPED back to trigger_outcomes.jsonl
+        // so the QB offline_learner can reconcile real trade results via signalId.
+        recordFillOutcome(
+          entry.signalId,
+          entry.symbol,
+          entry.positionSide as "LONG" | "SHORT",
+          exitReason,
+          outcome.realizedPnl,
+        );
         recordedIds.add(entry.entryOrderId);
         tracked.delete(entry.entryOrderId);
         persistWatcherJournal();

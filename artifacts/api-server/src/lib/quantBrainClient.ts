@@ -1004,6 +1004,43 @@ export function getQuantBrainOperationalStats() {
   };
 }
 
+/**
+ * Gap 3 — QB Job Supervisor + Offline Learner status.
+ *
+ * Consulta o QB em /offline-learner/status para expor o estado do pipeline de
+ * re-treinamento autônomo e do job_supervisor no endpoint /api/telemetry/stats.
+ * Timeout curto (400ms) — nunca bloqueia o dashboard.
+ */
+const SUPERVISOR_STATUS_TIMEOUT_MS = 400;
+let _supervisorStatusCache: { value: unknown; expiresAt: number } | null = null;
+
+export async function getQuantBrainSupervisorStatus(): Promise<{
+  enabled: boolean;
+  offlineLearner: unknown;
+  jobs: unknown;
+} | null> {
+  if (!quantBrainEnabled()) return null;
+  const now = Date.now();
+  if (_supervisorStatusCache && _supervisorStatusCache.expiresAt > now) {
+    return _supervisorStatusCache.value as { enabled: boolean; offlineLearner: unknown; jobs: unknown };
+  }
+  try {
+    const [learner, debug] = await Promise.all([
+      getJson<unknown>("/offline-learner/status", SUPERVISOR_STATUS_TIMEOUT_MS).catch(() => null),
+      getJson<{ jobs?: unknown }>("/debug/status", SUPERVISOR_STATUS_TIMEOUT_MS).catch(() => null),
+    ]);
+    const result = {
+      enabled: true,
+      offlineLearner: learner,
+      jobs: (debug as { jobs?: unknown } | null)?.jobs ?? null,
+    };
+    _supervisorStatusCache = { value: result, expiresAt: now + 10_000 };
+    return result;
+  } catch {
+    return null;
+  }
+}
+
 export function _resetQuantBrainOutcomeStateForTesting(): void {
   pendingOutcomes.clear();
   if (outcomeSyncTimer) clearInterval(outcomeSyncTimer);
