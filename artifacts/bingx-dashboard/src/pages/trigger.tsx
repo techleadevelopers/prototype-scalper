@@ -22,8 +22,6 @@ import {
   TrendingUp,
   TrendingDown,
   RefreshCw,
-  Play,
-  Square,
   AlertTriangle,
   Camera,
   RotateCcw,
@@ -31,9 +29,11 @@ import {
   ChevronUp,
   Clock,
   Zap,
-  Info,
   ArrowDown,
   ArrowUp,
+  Activity,
+  Settings,
+  Eye,
 } from "lucide-react";
 
 function fmt(n: number | null | undefined, decimals = 2): string {
@@ -51,160 +51,265 @@ function fmtPrice(n: number | null | undefined): string {
 function fmtAgo(ms: number | null): string {
   if (!ms) return "—";
   const s = Math.round((Date.now() - ms) / 1000);
-  if (s < 60) return `${s}s ago`;
+  if (s < 60) return `${s}s atrás`;
   const m = Math.floor(s / 60);
-  if (m < 60) return `${m}m ago`;
-  return `${Math.floor(m / 60)}h ago`;
+  if (m < 60) return `${m}m atrás`;
+  return `${Math.floor(m / 60)}h atrás`;
 }
 
-function SymbolRow({ s, onReset }: { s: TriggerSymbolState; onReset: (sym: string) => void }) {
-  const [expanded, setExpanded] = useState(false);
-  const deviation = s.dropPct > 0 ? -s.dropPct : s.risePct;
-  const isDown = s.dropPct > 0;
-  const isUp = s.risePct > 0;
-  const longPct = Math.min(100, (s.dropPct / (s.longTpPct || 1)) * 100);
-  const shortPct = Math.min(100, (s.risePct / (s.shortTpPct || 1)) * 100);
+function ArmedCard({ s, side, onReset }: {
+  s: TriggerSymbolState;
+  side: "LONG" | "SHORT";
+  onReset: (sym: string) => void;
+}) {
+  const isLong = side === "LONG";
+  const triggerPrice = isLong ? s.longTriggerPrice : s.shortTriggerPrice;
+  const tpPct = isLong ? s.longTpPct : s.shortTpPct;
+  const deviationPct = isLong ? s.dropPct : s.risePct;
+  const firedAt = isLong ? s.longFiredAt : s.shortFiredAt;
+  const progress = Math.min(100, (deviationPct / (tpPct || 1)) * 100);
+  const token = s.symbol.replace("-USDT", "");
+  const isFired = !!firedAt;
 
   return (
-    <div className="border border-border/20 rounded-lg bg-card/5 overflow-hidden">
-      <div
-        className="flex items-center gap-2 px-3 py-2.5 cursor-pointer hover:bg-muted/10 transition-colors"
-        onClick={() => setExpanded((v) => !v)}
-      >
-        <span className="font-mono text-xs font-semibold text-foreground/90 w-28 shrink-0">
-          {s.symbol.replace("-USDT", "")}
-        </span>
+    <div className={`relative rounded-xl border overflow-hidden ${
+      isFired
+        ? isLong
+          ? "border-emerald-400/40 bg-emerald-950/30"
+          : "border-rose-400/40 bg-rose-950/30"
+        : isLong
+          ? "border-emerald-500/25 bg-emerald-950/20"
+          : "border-rose-500/25 bg-rose-950/20"
+    }`}>
+      {isFired && (
+        <div className={`absolute top-0 left-0 right-0 h-0.5 ${isLong ? "bg-emerald-400" : "bg-rose-400"}`} />
+      )}
 
-        <div className="flex items-center gap-1 shrink-0">
-          <span className={`text-[10px] font-mono ${s.dropPct >= 0.01 ? "text-emerald-400" : "text-muted-foreground/50"}`}>
-            ▼{fmt(s.dropPct)}%
-          </span>
-          <span className="text-[9px] text-muted-foreground/30">/</span>
-          <span className={`text-[10px] font-mono ${s.risePct >= 0.01 ? "text-rose-400" : "text-muted-foreground/50"}`}>
-            ▲{fmt(s.risePct)}%
-          </span>
-        </div>
-
-        <div className="flex-1 min-w-0 flex items-center gap-1">
-          {s.longArmed && (
-            <Badge className="bg-emerald-500/20 text-emerald-400 border-emerald-500/30 text-[9px] px-1.5 py-0">
-              <Zap className="w-2.5 h-2.5 mr-0.5" />LONG ARMED
-            </Badge>
-          )}
-          {s.shortArmed && (
-            <Badge className="bg-rose-500/20 text-rose-400 border-rose-500/30 text-[9px] px-1.5 py-0">
-              <Zap className="w-2.5 h-2.5 mr-0.5" />SHORT ARMED
-            </Badge>
-          )}
-          {!s.longArmed && !s.shortArmed && (
-            <span className="text-[10px] text-muted-foreground/40">monitorando</span>
-          )}
-        </div>
-
-        <span className="text-[10px] text-muted-foreground/50 shrink-0">
-          ref {fmtPrice(s.referencePrice)}
-        </span>
-        <span className="text-[10px] text-muted-foreground/40 shrink-0">
-          {s.secondsSinceSnapshot}s
-        </span>
-
-        {expanded ? <ChevronUp className="w-3 h-3 text-muted-foreground/40" /> : <ChevronDown className="w-3 h-3 text-muted-foreground/40" />}
-      </div>
-
-      {expanded && (
-        <div className="border-t border-border/10 px-3 py-3 grid grid-cols-2 gap-3 bg-card/5">
-          <div className="space-y-1.5">
-            <div className="text-[9px] font-semibold text-muted-foreground/60 uppercase tracking-wider flex items-center gap-1">
-              <TrendingUp className="w-3 h-3 text-emerald-400" />LONG Gate
+      <div className="p-4">
+        <div className="flex items-start justify-between mb-3">
+          <div className="flex items-center gap-2">
+            <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${
+              isLong ? "bg-emerald-500/20" : "bg-rose-500/20"
+            }`}>
+              {isLong
+                ? <TrendingUp className="w-4 h-4 text-emerald-400" />
+                : <TrendingDown className="w-4 h-4 text-rose-400" />
+              }
             </div>
-            <div className="space-y-0.5">
-              <div className="flex justify-between text-[10px]">
-                <span className="text-muted-foreground/60">Gatilho</span>
-                <span className="font-mono text-foreground/80">{fmtPrice(s.longTriggerPrice)}</span>
-              </div>
-              <div className="flex justify-between text-[10px]">
-                <span className="text-muted-foreground/60">TP alvo</span>
-                <span className="font-mono text-emerald-400">{fmtPrice(s.referencePrice)}</span>
-              </div>
-              <div className="flex justify-between text-[10px]">
-                <span className="text-muted-foreground/60">TP %</span>
-                <span className="font-mono text-emerald-400">+{fmt(s.longTpPct)}%</span>
-              </div>
-              <div className="flex justify-between text-[10px]">
-                <span className="text-muted-foreground/60">Progresso</span>
-                <span className="font-mono text-foreground/60">{fmt(longPct, 0)}%</span>
+            <div>
+              <div className="text-base font-bold text-foreground font-mono">{token}</div>
+              <div className={`text-[10px] font-semibold tracking-wider ${isLong ? "text-emerald-400" : "text-rose-400"}`}>
+                {side} {isFired ? "· DISPARADO" : "· ARMADO"}
               </div>
             </div>
-            <div className="h-1 bg-border/20 rounded-full overflow-hidden">
-              <div
-                className="h-full bg-emerald-500/60 transition-all duration-500"
-                style={{ width: `${Math.max(0, longPct)}%` }}
-              />
-            </div>
-            {s.longFiredAt && (
-              <div className="text-[9px] text-muted-foreground/40 flex items-center gap-1">
-                <Clock className="w-2.5 h-2.5" />Disparado {fmtAgo(s.longFiredAt)}
-              </div>
+          </div>
+          <div className="flex items-center gap-1">
+            {isFired ? (
+              <Badge className={`text-[9px] px-1.5 py-0 ${
+                isLong
+                  ? "bg-emerald-400/20 text-emerald-300 border-emerald-400/30"
+                  : "bg-rose-400/20 text-rose-300 border-rose-400/30"
+              }`}>
+                <Zap className="w-2.5 h-2.5 mr-0.5" />DISPARADO
+              </Badge>
+            ) : (
+              <Badge className={`text-[9px] px-1.5 py-0 ${
+                isLong
+                  ? "bg-emerald-500/15 text-emerald-400 border-emerald-500/25"
+                  : "bg-rose-500/15 text-rose-400 border-rose-500/25"
+              }`}>
+                <Activity className="w-2.5 h-2.5 mr-0.5" />ARMADO
+              </Badge>
             )}
           </div>
+        </div>
 
-          <div className="space-y-1.5">
-            <div className="text-[9px] font-semibold text-muted-foreground/60 uppercase tracking-wider flex items-center gap-1">
-              <TrendingDown className="w-3 h-3 text-rose-400" />SHORT Gate
+        <div className="grid grid-cols-2 gap-3 mb-3">
+          <div className="bg-black/20 rounded-lg p-2.5">
+            <div className="text-[9px] text-muted-foreground/60 uppercase tracking-wider mb-1">
+              Preço de Entrada
             </div>
-            <div className="space-y-0.5">
-              <div className="flex justify-between text-[10px]">
-                <span className="text-muted-foreground/60">Gatilho</span>
-                <span className="font-mono text-foreground/80">{fmtPrice(s.shortTriggerPrice)}</span>
-              </div>
-              <div className="flex justify-between text-[10px]">
-                <span className="text-muted-foreground/60">TP alvo</span>
-                <span className="font-mono text-rose-400">{fmtPrice(s.referencePrice)}</span>
-              </div>
-              <div className="flex justify-between text-[10px]">
-                <span className="text-muted-foreground/60">TP %</span>
-                <span className="font-mono text-rose-400">+{fmt(s.shortTpPct)}%</span>
-              </div>
-              <div className="flex justify-between text-[10px]">
-                <span className="text-muted-foreground/60">Progresso</span>
-                <span className="font-mono text-foreground/60">{fmt(shortPct, 0)}%</span>
-              </div>
+            <div className="text-lg font-bold font-mono text-foreground">
+              {fmtPrice(triggerPrice)}
             </div>
-            <div className="h-1 bg-border/20 rounded-full overflow-hidden">
-              <div
-                className="h-full bg-rose-500/60 transition-all duration-500"
-                style={{ width: `${Math.max(0, shortPct)}%` }}
-              />
+            <div className="text-[9px] text-muted-foreground/50">USDT</div>
+          </div>
+          <div className="bg-black/20 rounded-lg p-2.5">
+            <div className="text-[9px] text-muted-foreground/60 uppercase tracking-wider mb-1">
+              Preço Atual
             </div>
-            {s.shortFiredAt && (
-              <div className="text-[9px] text-muted-foreground/40 flex items-center gap-1">
-                <Clock className="w-2.5 h-2.5" />Disparado {fmtAgo(s.shortFiredAt)}
-              </div>
-            )}
+            <div className="text-lg font-bold font-mono text-foreground">
+              {fmtPrice(s.currentPrice)}
+            </div>
+            <div className={`text-[9px] flex items-center gap-0.5 ${isLong ? "text-emerald-400" : "text-rose-400"}`}>
+              {isLong ? <ArrowDown className="w-3 h-3" /> : <ArrowUp className="w-3 h-3" />}
+              {isLong ? "−" : "+"}{fmt(deviationPct)}% do ref
+            </div>
+          </div>
+        </div>
+
+        <div className="space-y-2">
+          <div className="flex justify-between text-[10px]">
+            <span className="text-muted-foreground/60">Referência</span>
+            <span className="font-mono text-foreground/80">{fmtPrice(s.referencePrice)}</span>
+          </div>
+          <div className="flex justify-between text-[10px]">
+            <span className="text-muted-foreground/60">TP alvo</span>
+            <span className={`font-mono font-semibold ${isLong ? "text-emerald-400" : "text-rose-400"}`}>
+              {fmtPrice(s.referencePrice)} (+{fmt(tpPct)}%)
+            </span>
           </div>
 
-          <div className="col-span-2 flex items-center justify-between pt-1 border-t border-border/10">
-            <div className="flex items-center gap-3 text-[10px]">
-              <span className="text-muted-foreground/60">Preço atual</span>
-              <span className="font-mono text-foreground/80">{fmtPrice(s.currentPrice)}</span>
-              {isDown && s.dropPct > 0 && (
-                <span className="text-emerald-400 flex items-center gap-0.5">
-                  <ArrowDown className="w-3 h-3" />−{fmt(s.dropPct)}%
-                </span>
-              )}
-              {isUp && s.risePct > 0 && (
-                <span className="text-rose-400 flex items-center gap-0.5">
-                  <ArrowUp className="w-3 h-3" />+{fmt(s.risePct)}%
-                </span>
-              )}
+          <div className="space-y-1">
+            <div className="flex justify-between text-[9px] text-muted-foreground/50">
+              <span>Progresso ao gatilho</span>
+              <span>{fmt(progress, 0)}%</span>
+            </div>
+            <div className="h-1.5 bg-black/30 rounded-full overflow-hidden">
+              <div
+                className={`h-full rounded-full transition-all duration-500 ${
+                  isFired
+                    ? isLong ? "bg-emerald-400" : "bg-rose-400"
+                    : isLong ? "bg-emerald-500/70" : "bg-rose-500/70"
+                }`}
+                style={{ width: `${Math.max(2, progress)}%` }}
+              />
+            </div>
+          </div>
+        </div>
+
+        {firedAt && (
+          <div className="mt-3 pt-2.5 border-t border-white/5 flex items-center justify-between">
+            <div className={`text-[10px] flex items-center gap-1 ${isLong ? "text-emerald-400/70" : "text-rose-400/70"}`}>
+              <Clock className="w-3 h-3" />Disparado {fmtAgo(firedAt)}
             </div>
             <Button
               size="sm"
               variant="ghost"
-              className="h-6 px-2 text-[10px] text-muted-foreground/60 hover:text-foreground/80"
+              className="h-5 px-2 text-[9px] text-muted-foreground/50 hover:text-foreground/70"
+              onClick={() => onReset(s.symbol)}
+            >
+              <RotateCcw className="w-2.5 h-2.5 mr-1" />Reset
+            </Button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function SymbolRow({ s, onReset }: { s: TriggerSymbolState; onReset: (sym: string) => void }) {
+  const [expanded, setExpanded] = useState(false);
+  const longPct = Math.min(100, (s.dropPct / (s.longTpPct || 1)) * 100);
+  const shortPct = Math.min(100, (s.risePct / (s.shortTpPct || 1)) * 100);
+  const token = s.symbol.replace("-USDT", "");
+
+  return (
+    <div className="border border-border/15 rounded-lg bg-card/5 overflow-hidden">
+      <div
+        className="flex items-center gap-2 px-3 py-2 cursor-pointer hover:bg-muted/8 transition-colors"
+        onClick={() => setExpanded((v) => !v)}
+      >
+        <span className="font-mono text-xs font-semibold text-foreground/85 w-20 shrink-0">{token}</span>
+
+        <div className="flex items-center gap-1.5 shrink-0 w-32">
+          <span className={`text-[10px] font-mono tabular-nums ${s.dropPct >= 0.1 ? "text-emerald-400" : "text-muted-foreground/35"}`}>
+            ▼{fmt(s.dropPct)}%
+          </span>
+          <span className="text-[9px] text-muted-foreground/25">/</span>
+          <span className={`text-[10px] font-mono tabular-nums ${s.risePct >= 0.1 ? "text-rose-400" : "text-muted-foreground/35"}`}>
+            ▲{fmt(s.risePct)}%
+          </span>
+        </div>
+
+        <div className="flex-1 flex items-center gap-1.5">
+          {s.longArmed && (
+            <Badge className="bg-emerald-500/15 text-emerald-400 border-emerald-500/25 text-[9px] px-1.5 py-0 h-4">
+              <Zap className="w-2 h-2 mr-0.5" />LONG
+            </Badge>
+          )}
+          {s.shortArmed && (
+            <Badge className="bg-rose-500/15 text-rose-400 border-rose-500/25 text-[9px] px-1.5 py-0 h-4">
+              <Zap className="w-2 h-2 mr-0.5" />SHORT
+            </Badge>
+          )}
+          {!s.longArmed && !s.shortArmed && (
+            <span className="text-[9px] text-muted-foreground/35">monitorando</span>
+          )}
+        </div>
+
+        <div className="hidden sm:flex items-center gap-3 text-[9px] text-muted-foreground/45 shrink-0">
+          <span>ref <span className="font-mono">{fmtPrice(s.referencePrice)}</span></span>
+          <span>{s.secondsSinceSnapshot}s</span>
+        </div>
+
+        {expanded ? <ChevronUp className="w-3 h-3 text-muted-foreground/30 shrink-0" /> : <ChevronDown className="w-3 h-3 text-muted-foreground/30 shrink-0" />}
+      </div>
+
+      {expanded && (
+        <div className="border-t border-border/10 px-3 py-3 bg-black/10">
+          <div className="grid grid-cols-2 gap-3 mb-3">
+            <div className="space-y-1.5">
+              <div className="text-[9px] font-semibold text-emerald-400/70 uppercase tracking-wider flex items-center gap-1">
+                <TrendingUp className="w-3 h-3" />LONG Gate
+              </div>
+              <div className="space-y-0.5 text-[10px]">
+                <div className="flex justify-between">
+                  <span className="text-muted-foreground/55">Entrada</span>
+                  <span className="font-mono text-foreground/80">{fmtPrice(s.longTriggerPrice)}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-muted-foreground/55">TP alvo</span>
+                  <span className="font-mono text-emerald-400">{fmtPrice(s.referencePrice)} (+{fmt(s.longTpPct)}%)</span>
+                </div>
+              </div>
+              <div className="h-1 bg-border/20 rounded-full overflow-hidden">
+                <div className="h-full bg-emerald-500/60 transition-all duration-500" style={{ width: `${Math.max(0, longPct)}%` }} />
+              </div>
+              {s.longFiredAt && (
+                <div className="text-[9px] text-emerald-400/50 flex items-center gap-1">
+                  <Clock className="w-2.5 h-2.5" />Disparado {fmtAgo(s.longFiredAt)}
+                </div>
+              )}
+            </div>
+
+            <div className="space-y-1.5">
+              <div className="text-[9px] font-semibold text-rose-400/70 uppercase tracking-wider flex items-center gap-1">
+                <TrendingDown className="w-3 h-3" />SHORT Gate
+              </div>
+              <div className="space-y-0.5 text-[10px]">
+                <div className="flex justify-between">
+                  <span className="text-muted-foreground/55">Entrada</span>
+                  <span className="font-mono text-foreground/80">{fmtPrice(s.shortTriggerPrice)}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-muted-foreground/55">TP alvo</span>
+                  <span className="font-mono text-rose-400">{fmtPrice(s.referencePrice)} (+{fmt(s.shortTpPct)}%)</span>
+                </div>
+              </div>
+              <div className="h-1 bg-border/20 rounded-full overflow-hidden">
+                <div className="h-full bg-rose-500/60 transition-all duration-500" style={{ width: `${Math.max(0, shortPct)}%` }} />
+              </div>
+              {s.shortFiredAt && (
+                <div className="text-[9px] text-rose-400/50 flex items-center gap-1">
+                  <Clock className="w-2.5 h-2.5" />Disparado {fmtAgo(s.shortFiredAt)}
+                </div>
+              )}
+            </div>
+          </div>
+
+          <div className="flex items-center justify-between pt-2 border-t border-border/10">
+            <div className="flex items-center gap-2 text-[10px]">
+              <span className="text-muted-foreground/50">Atual</span>
+              <span className="font-mono text-foreground/75">{fmtPrice(s.currentPrice)}</span>
+            </div>
+            <Button
+              size="sm"
+              variant="ghost"
+              className="h-5 px-2 text-[9px] text-muted-foreground/45 hover:text-foreground/70"
               onClick={(e) => { e.stopPropagation(); onReset(s.symbol); }}
             >
-              <RotateCcw className="w-3 h-3 mr-1" />Reset ref
+              <RotateCcw className="w-2.5 h-2.5 mr-1" />Reset ref
             </Button>
           </div>
         </div>
@@ -221,11 +326,12 @@ export default function TriggerPage() {
   const [shortRisePct, setShortRisePct] = useState("3.16");
   const [slPct, setSlPct] = useState("0.55");
   const [cooldownMin, setCooldownMin] = useState("5");
+  const [showConfig, setShowConfig] = useState(false);
 
   const { data: status, isLoading, refetch } = useQuery<TriggerStatus>({
     queryKey: getTriggerStatusQueryKey(),
     queryFn: getTriggerStatus,
-    refetchInterval: 5000,
+    refetchInterval: 3000,
   });
 
   const enableMut = useEnableTrigger({
@@ -274,21 +380,42 @@ export default function TriggerPage() {
   const isEnabled = status?.enabled ?? false;
   const isPending = enableMut.isPending || disableMut.isPending;
 
+  const armedSymbols = (status?.symbols ?? []).filter(s => s.longArmed || s.shortArmed || s.longFiredAt || s.shortFiredAt);
+  const monitoringSymbols = (status?.symbols ?? []).filter(s => !s.longArmed && !s.shortArmed && !s.longFiredAt && !s.shortFiredAt);
+
+  const armedCards: Array<{ s: TriggerSymbolState; side: "LONG" | "SHORT" }> = [];
+  for (const s of (status?.symbols ?? [])) {
+    if (s.longArmed || s.longFiredAt) armedCards.push({ s, side: "LONG" });
+    if (s.shortArmed || s.shortFiredAt) armedCards.push({ s, side: "SHORT" });
+  }
+
   return (
     <AppShell>
       <div className="p-4 md:p-6 space-y-4 max-w-5xl mx-auto">
-        {/* Header */}
+
+        {/* ── Header ── */}
         <div className="flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <Target className="w-5 h-5 text-primary" />
+          <div className="flex items-center gap-2.5">
+            <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${isEnabled ? "bg-emerald-500/20" : "bg-muted/15"}`}>
+              <Target className={`w-4 h-4 ${isEnabled ? "text-emerald-400" : "text-muted-foreground/50"}`} />
+            </div>
             <div>
-              <h1 className="text-lg font-semibold text-foreground">Estratégia Gatilho</h1>
-              <p className="text-[11px] text-muted-foreground/70">
+              <h1 className="text-base font-bold text-foreground flex items-center gap-2">
+                Estratégia Gatilho
+                {isEnabled && (
+                  <span className="inline-flex items-center gap-1 text-[10px] font-normal bg-emerald-500/15 text-emerald-400 border border-emerald-500/25 rounded-full px-2 py-0.5">
+                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                    ATIVO · {status?.symbolCount ?? 0} símbolos
+                  </span>
+                )}
+              </h1>
+              <p className="text-[10px] text-muted-foreground/55">
                 Dispara entrada por desvio de preço do ponto de referência
               </p>
             </div>
           </div>
-          <div className="flex items-center gap-2">
+
+          <div className="flex items-center gap-1.5">
             <Button
               size="sm"
               variant="ghost"
@@ -296,8 +423,7 @@ export default function TriggerPage() {
               onClick={() => refetch()}
               disabled={isLoading}
             >
-              <RefreshCw className={`w-3.5 h-3.5 mr-1 ${isLoading ? "animate-spin" : ""}`} />
-              Atualizar
+              <RefreshCw className={`w-3.5 h-3.5 ${isLoading ? "animate-spin" : ""}`} />
             </Button>
             {isEnabled && (
               <Button
@@ -308,239 +434,203 @@ export default function TriggerPage() {
                 disabled={snapshotMut.isPending}
               >
                 <Camera className="w-3.5 h-3.5 mr-1" />
-                {snapshotMut.isPending ? "Re-capturando..." : "Re-snapshot"}
+                {snapshotMut.isPending ? "Capturando..." : "Re-snapshot"}
               </Button>
             )}
+            <Button
+              size="sm"
+              variant="ghost"
+              className={`h-7 px-2 text-[11px] ${showConfig ? "bg-muted/20" : ""}`}
+              onClick={() => setShowConfig(v => !v)}
+            >
+              <Settings className="w-3.5 h-3.5 mr-1" />Config
+            </Button>
           </div>
         </div>
 
-        {/* Config + Toggle */}
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-          <Card className="border-border/20 bg-card/10 lg:col-span-2">
-            <CardHeader className="pb-2 pt-4 px-4">
-              <CardTitle className="text-sm font-semibold flex items-center gap-2">
-                <Info className="w-4 h-4 text-muted-foreground/60" />
-                Configuração
-              </CardTitle>
-            </CardHeader>
-            <CardContent className="px-4 pb-4">
-              <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+        {/* ── Config (collapsible) ── */}
+        {showConfig && (
+          <Card className="border-border/20 bg-card/8">
+            <CardContent className="px-4 py-4">
+              <div className="grid grid-cols-2 md:grid-cols-5 gap-3 items-end">
                 <div>
-                  <label className="block text-[10px] text-muted-foreground/70 mb-1 uppercase tracking-wider">
-                    <TrendingUp className="w-3 h-3 inline mr-1 text-emerald-400" />
+                  <label className="block text-[9px] text-muted-foreground/60 mb-1 uppercase tracking-wider">
+                    <TrendingUp className="w-2.5 h-2.5 inline mr-0.5 text-emerald-400" />
                     LONG drop %
                   </label>
-                  <input
-                    type="number"
-                    step="0.1"
-                    min="0.1"
-                    max="20"
-                    className="w-full h-8 px-2 text-xs bg-background/50 border border-border/30 rounded text-foreground focus:outline-none focus:border-primary/50"
-                    value={longDropPct}
-                    onChange={(e) => setLongDropPct(e.target.value)}
-                    disabled={isEnabled}
-                  />
-                  <p className="text-[9px] text-muted-foreground/50 mt-0.5">
-                    queda → entrada LONG
-                  </p>
+                  <input type="number" step="0.1" min="0.1" max="20"
+                    className="w-full h-7 px-2 text-xs bg-background/50 border border-border/30 rounded text-foreground focus:outline-none focus:border-primary/50"
+                    value={longDropPct} onChange={(e) => setLongDropPct(e.target.value)} disabled={isEnabled} />
                 </div>
                 <div>
-                  <label className="block text-[10px] text-muted-foreground/70 mb-1 uppercase tracking-wider">
-                    <TrendingDown className="w-3 h-3 inline mr-1 text-rose-400" />
+                  <label className="block text-[9px] text-muted-foreground/60 mb-1 uppercase tracking-wider">
+                    <TrendingDown className="w-2.5 h-2.5 inline mr-0.5 text-rose-400" />
                     SHORT rise %
                   </label>
-                  <input
-                    type="number"
-                    step="0.1"
-                    min="0.1"
-                    max="20"
-                    className="w-full h-8 px-2 text-xs bg-background/50 border border-border/30 rounded text-foreground focus:outline-none focus:border-primary/50"
-                    value={shortRisePct}
-                    onChange={(e) => setShortRisePct(e.target.value)}
-                    disabled={isEnabled}
-                  />
-                  <p className="text-[9px] text-muted-foreground/50 mt-0.5">
-                    alta → entrada SHORT
-                  </p>
+                  <input type="number" step="0.1" min="0.1" max="20"
+                    className="w-full h-7 px-2 text-xs bg-background/50 border border-border/30 rounded text-foreground focus:outline-none focus:border-primary/50"
+                    value={shortRisePct} onChange={(e) => setShortRisePct(e.target.value)} disabled={isEnabled} />
                 </div>
                 <div>
-                  <label className="block text-[10px] text-muted-foreground/70 mb-1 uppercase tracking-wider">
-                    Stop Loss %
-                  </label>
-                  <input
-                    type="number"
-                    step="0.05"
-                    min="0.1"
-                    max="10"
-                    className="w-full h-8 px-2 text-xs bg-background/50 border border-border/30 rounded text-foreground focus:outline-none focus:border-primary/50"
-                    value={slPct}
-                    onChange={(e) => setSlPct(e.target.value)}
-                    disabled={isEnabled}
-                  />
-                  <p className="text-[9px] text-muted-foreground/50 mt-0.5">
-                    % do preço de entrada
-                  </p>
+                  <label className="block text-[9px] text-muted-foreground/60 mb-1 uppercase tracking-wider">Stop Loss %</label>
+                  <input type="number" step="0.05" min="0.1" max="10"
+                    className="w-full h-7 px-2 text-xs bg-background/50 border border-border/30 rounded text-foreground focus:outline-none focus:border-primary/50"
+                    value={slPct} onChange={(e) => setSlPct(e.target.value)} disabled={isEnabled} />
                 </div>
                 <div>
-                  <label className="block text-[10px] text-muted-foreground/70 mb-1 uppercase tracking-wider">
-                    Cooldown (min)
-                  </label>
-                  <input
-                    type="number"
-                    step="1"
-                    min="1"
-                    max="60"
-                    className="w-full h-8 px-2 text-xs bg-background/50 border border-border/30 rounded text-foreground focus:outline-none focus:border-primary/50"
-                    value={cooldownMin}
-                    onChange={(e) => setCooldownMin(e.target.value)}
-                    disabled={isEnabled}
-                  />
-                  <p className="text-[9px] text-muted-foreground/50 mt-0.5">
-                    entre disparos por símbolo
-                  </p>
+                  <label className="block text-[9px] text-muted-foreground/60 mb-1 uppercase tracking-wider">Cooldown (min)</label>
+                  <input type="number" step="1" min="1" max="60"
+                    className="w-full h-7 px-2 text-xs bg-background/50 border border-border/30 rounded text-foreground focus:outline-none focus:border-primary/50"
+                    value={cooldownMin} onChange={(e) => setCooldownMin(e.target.value)} disabled={isEnabled} />
+                </div>
+                <div className="flex flex-col items-center justify-end gap-1.5">
+                  <Switch checked={isEnabled} onCheckedChange={handleToggle} disabled={isPending} />
+                  <span className={`text-[9px] ${isEnabled ? "text-emerald-400" : "text-muted-foreground/50"}`}>
+                    {isEnabled ? "Ativo" : "Inativo"}
+                  </span>
                 </div>
               </div>
-
               {isEnabled && (
                 <div className="mt-3 text-[10px] text-amber-400/70 flex items-center gap-1.5">
-                  <AlertTriangle className="w-3 h-3" />
-                  Desative para alterar parâmetros.
+                  <AlertTriangle className="w-3 h-3" />Desative para alterar parâmetros.
                 </div>
               )}
-            </CardContent>
-          </Card>
-
-          {/* Activation card */}
-          <Card className={`border-border/20 ${isEnabled ? "bg-emerald-950/20 border-emerald-500/20" : "bg-card/10"}`}>
-            <CardContent className="flex flex-col items-center justify-center h-full px-4 py-6 gap-4">
-              <div className={`w-12 h-12 rounded-full flex items-center justify-center ${
-                isEnabled ? "bg-emerald-500/20" : "bg-muted/20"
-              }`}>
-                <Target className={`w-6 h-6 ${isEnabled ? "text-emerald-400" : "text-muted-foreground/50"}`} />
-              </div>
-
-              <div className="text-center">
-                <div className={`text-sm font-semibold ${isEnabled ? "text-emerald-400" : "text-muted-foreground/70"}`}>
-                  {isEnabled ? "Gatilho ATIVO" : "Gatilho inativo"}
-                </div>
-                <div className="text-[10px] text-muted-foreground/50 mt-0.5">
-                  {isEnabled
-                    ? `${status?.symbolCount ?? 0} símbolos monitorados`
-                    : "Ative para começar monitoramento"}
-                </div>
-              </div>
-
-              <div className="flex items-center gap-3">
-                <span className="text-[11px] text-muted-foreground/60">
-                  {isEnabled ? "Ativo" : "Inativo"}
-                </span>
-                <Switch
-                  checked={isEnabled}
-                  onCheckedChange={handleToggle}
-                  disabled={isPending}
-                />
-              </div>
-
-              {isEnabled && (
-                <div className="grid grid-cols-2 gap-2 w-full text-center">
-                  <div className="bg-emerald-500/10 rounded p-1.5">
-                    <div className="text-[9px] text-muted-foreground/60">LONG armed</div>
-                    <div className="text-sm font-bold text-emerald-400">{status?.armedLong ?? 0}</div>
-                  </div>
-                  <div className="bg-rose-500/10 rounded p-1.5">
-                    <div className="text-[9px] text-muted-foreground/60">SHORT armed</div>
-                    <div className="text-sm font-bold text-rose-400">{status?.armedShort ?? 0}</div>
-                  </div>
-                </div>
-              )}
-            </CardContent>
-          </Card>
-        </div>
-
-        {/* How it works */}
-        <Card className="border-border/20 bg-card/5">
-          <CardContent className="px-4 py-3">
-            <div className="flex flex-wrap items-center gap-4 text-[10px] text-muted-foreground/70">
-              <div className="flex items-center gap-1.5">
-                <span className="w-5 h-5 rounded-full bg-primary/20 text-primary text-[10px] font-bold flex items-center justify-center shrink-0">1</span>
-                <span>Snapshot captura o <strong>preço de referência</strong> de cada símbolo</span>
-              </div>
-              <div className="w-3 h-px bg-border/40 hidden sm:block" />
-              <div className="flex items-center gap-1.5">
-                <span className="w-5 h-5 rounded-full bg-emerald-500/20 text-emerald-400 text-[10px] font-bold flex items-center justify-center shrink-0">2</span>
-                <span>Se cair <strong>{longDropPct}%</strong> → <strong className="text-emerald-400">LONG</strong>; TP = volta ao ref</span>
-              </div>
-              <div className="w-3 h-px bg-border/40 hidden sm:block" />
-              <div className="flex items-center gap-1.5">
-                <span className="w-5 h-5 rounded-full bg-rose-500/20 text-rose-400 text-[10px] font-bold flex items-center justify-center shrink-0">3</span>
-                <span>Se subir <strong>{shortRisePct}%</strong> → <strong className="text-rose-400">SHORT</strong>; TP = volta ao ref</span>
-              </div>
-              <div className="w-3 h-px bg-border/40 hidden sm:block" />
-              <div className="flex items-center gap-1.5">
-                <span className="w-5 h-5 rounded-full bg-amber-500/20 text-amber-400 text-[10px] font-bold flex items-center justify-center shrink-0">4</span>
-                <span>Cooldown <strong>{cooldownMin}min</strong> entre disparos por símbolo</span>
-              </div>
-            </div>
-          </CardContent>
-        </Card>
-
-        {/* Symbol states table */}
-        {isEnabled && status && status.symbols.length > 0 && (
-          <Card className="border-border/20 bg-card/10">
-            <CardHeader className="pb-2 pt-4 px-4">
-              <div className="flex items-center justify-between">
-                <CardTitle className="text-sm font-semibold flex items-center gap-2">
-                  <Zap className="w-4 h-4 text-primary" />
-                  Monitor por símbolo
-                  <Badge variant="outline" className="text-[10px]">{status.symbols.length}</Badge>
-                </CardTitle>
-                <div className="flex items-center gap-2 text-[10px] text-muted-foreground/50">
-                  <span className="flex items-center gap-1">
-                    <span className="w-2 h-2 rounded-full bg-emerald-500/60" />
-                    LONG {status.armedLong}
-                  </span>
-                  <span className="flex items-center gap-1">
-                    <span className="w-2 h-2 rounded-full bg-rose-500/60" />
-                    SHORT {status.armedShort}
-                  </span>
-                </div>
-              </div>
-            </CardHeader>
-            <CardContent className="px-4 pb-4 space-y-1.5">
-              {status.symbols.map((s) => (
-                <SymbolRow
-                  key={s.symbol}
-                  s={s}
-                  onReset={(sym) => resetMut.mutate(sym)}
-                />
-              ))}
             </CardContent>
           </Card>
         )}
 
+        {/* ── Inactive state ── */}
         {!isEnabled && (
           <Card className="border-border/20 bg-card/5">
-            <CardContent className="flex flex-col items-center justify-center py-12 gap-3">
-              <Target className="w-10 h-10 text-muted-foreground/20" />
+            <CardContent className="flex flex-col items-center justify-center py-14 gap-4">
+              <div className="w-14 h-14 rounded-full bg-muted/15 flex items-center justify-center">
+                <Target className="w-7 h-7 text-muted-foreground/30" />
+              </div>
               <div className="text-center">
-                <div className="text-sm text-muted-foreground/60 font-medium">Gatilho inativo</div>
+                <div className="text-sm font-semibold text-muted-foreground/60">Gatilho inativo</div>
                 <div className="text-[11px] text-muted-foreground/40 mt-1">
-                  Configure os parâmetros acima e ative para começar o monitoramento.
-                  <br />O sniper VST precisa estar rodando para que as ordens sejam executadas.
+                  Clique em <strong>Config</strong> e ative o switch para iniciar o monitoramento
                 </div>
               </div>
-              <Button
-                size="sm"
-                className="mt-2 h-8 px-4 text-xs"
-                onClick={() => handleToggle(true)}
-                disabled={isPending}
-              >
-                <Play className="w-3.5 h-3.5 mr-1.5" />
-                Ativar Gatilho
-              </Button>
+              <div className="flex items-center gap-3">
+                <Switch checked={false} onCheckedChange={handleToggle} disabled={isPending} />
+                <span className="text-[11px] text-muted-foreground/50">Ativar</span>
+              </div>
             </CardContent>
           </Card>
         )}
+
+        {/* ── Active: gatilhos armados / disparados ── */}
+        {isEnabled && (
+          <>
+            {/* Status bar */}
+            <div className="grid grid-cols-4 gap-3">
+              <Card className="border-border/15 bg-card/8">
+                <CardContent className="px-3 py-2.5 text-center">
+                  <div className="text-[9px] text-muted-foreground/50 uppercase tracking-wider">Monitorando</div>
+                  <div className="text-xl font-bold text-foreground mt-0.5">{status?.symbolCount ?? 0}</div>
+                  <div className="text-[9px] text-muted-foreground/40">símbolos</div>
+                </CardContent>
+              </Card>
+              <Card className="border-emerald-500/20 bg-emerald-950/15">
+                <CardContent className="px-3 py-2.5 text-center">
+                  <div className="text-[9px] text-emerald-400/60 uppercase tracking-wider">LONG armado</div>
+                  <div className="text-xl font-bold text-emerald-400 mt-0.5">{status?.armedLong ?? 0}</div>
+                  <div className="text-[9px] text-emerald-400/40">gatilhos</div>
+                </CardContent>
+              </Card>
+              <Card className="border-rose-500/20 bg-rose-950/15">
+                <CardContent className="px-3 py-2.5 text-center">
+                  <div className="text-[9px] text-rose-400/60 uppercase tracking-wider">SHORT armado</div>
+                  <div className="text-xl font-bold text-rose-400 mt-0.5">{status?.armedShort ?? 0}</div>
+                  <div className="text-[9px] text-rose-400/40">gatilhos</div>
+                </CardContent>
+              </Card>
+              <Card className="border-border/15 bg-card/8">
+                <CardContent className="px-3 py-2.5 text-center">
+                  <div className="text-[9px] text-muted-foreground/50 uppercase tracking-wider">Queda / Alta</div>
+                  <div className="text-sm font-bold text-foreground mt-0.5 tabular-nums">
+                    <span className="text-emerald-400">{longDropPct}%</span>
+                    <span className="text-muted-foreground/30 mx-1">/</span>
+                    <span className="text-rose-400">{shortRisePct}%</span>
+                  </div>
+                  <div className="text-[9px] text-muted-foreground/40">disparo</div>
+                </CardContent>
+              </Card>
+            </div>
+
+            {/* Gatilhos armados / disparados */}
+            {armedCards.length > 0 ? (
+              <div>
+                <div className="flex items-center gap-2 mb-3">
+                  <Zap className="w-4 h-4 text-amber-400" />
+                  <h2 className="text-sm font-semibold text-foreground">Gatilhos Ativos</h2>
+                  <Badge variant="outline" className="text-[10px] border-amber-500/30 text-amber-400">
+                    {armedCards.length}
+                  </Badge>
+                  <div className="flex-1 h-px bg-border/15" />
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                  {armedCards.map(({ s, side }) => (
+                    <ArmedCard
+                      key={`${s.symbol}-${side}`}
+                      s={s}
+                      side={side}
+                      onReset={(sym) => resetMut.mutate(sym)}
+                    />
+                  ))}
+                </div>
+              </div>
+            ) : (
+              <Card className="border-border/15 bg-card/5">
+                <CardContent className="flex items-center justify-center py-8 gap-3">
+                  <Eye className="w-5 h-5 text-muted-foreground/25" />
+                  <div className="text-[12px] text-muted-foreground/45">
+                    Nenhum gatilho armado — monitorando desvios de preço...
+                  </div>
+                </CardContent>
+              </Card>
+            )}
+
+            {/* Monitor por símbolo */}
+            {status && status.symbols.length > 0 && (
+              <Card className="border-border/15 bg-card/8">
+                <CardHeader className="pb-2 pt-3.5 px-4">
+                  <div className="flex items-center justify-between">
+                    <CardTitle className="text-xs font-semibold flex items-center gap-2 text-muted-foreground/70">
+                      <Activity className="w-3.5 h-3.5" />
+                      Monitor por símbolo
+                      <Badge variant="outline" className="text-[9px]">{status.symbols.length}</Badge>
+                    </CardTitle>
+                    <div className="flex items-center gap-3 text-[9px] text-muted-foreground/40">
+                      <span>LONG drop {longDropPct}%</span>
+                      <span>SHORT rise {shortRisePct}%</span>
+                      <span>SL {slPct}%</span>
+                    </div>
+                  </div>
+                </CardHeader>
+                <CardContent className="px-4 pb-4 space-y-1">
+                  {/* Armados primeiro */}
+                  {armedSymbols.map((s) => (
+                    <SymbolRow key={s.symbol} s={s} onReset={(sym) => resetMut.mutate(sym)} />
+                  ))}
+                  {/* Divisor se houver ambos */}
+                  {armedSymbols.length > 0 && monitoringSymbols.length > 0 && (
+                    <div className="flex items-center gap-2 py-1">
+                      <div className="flex-1 h-px bg-border/10" />
+                      <span className="text-[9px] text-muted-foreground/30">aguardando desvio</span>
+                      <div className="flex-1 h-px bg-border/10" />
+                    </div>
+                  )}
+                  {monitoringSymbols.map((s) => (
+                    <SymbolRow key={s.symbol} s={s} onReset={(sym) => resetMut.mutate(sym)} />
+                  ))}
+                </CardContent>
+              </Card>
+            )}
+          </>
+        )}
+
       </div>
     </AppShell>
   );
