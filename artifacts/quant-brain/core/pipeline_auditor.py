@@ -76,8 +76,6 @@ def validate_learning_eligibility(payload: dict[str, Any]) -> LearningEligibilit
 
     if not signal_id:
         reasons.append("missing_signalId")
-    if not market_event_id:
-        reasons.append("missing_marketEventId")
     if not entry_side_matches_position(payload):
         reasons.append("side_mismatch")
     if entry_price is None or entry_price <= 0:

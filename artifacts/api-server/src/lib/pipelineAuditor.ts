@@ -90,7 +90,6 @@ export function validateLearningEligibility(
   const blockedReasons: string[] = [];
 
   if (!outcome.signalId) blockedReasons.push("missing_signalId");
-  if (!outcome.marketEventId) blockedReasons.push("missing_marketEventId");
   if (!isLongShortSideCorrect(outcome.positionSide, outcome.side)) blockedReasons.push("side_mismatch");
   if (!hasPositiveNumber(outcome.entryPrice)) blockedReasons.push("missing_entryPrice");
   if (!hasPositiveNumber(outcome.exitPrice) && !outcome.entryTime) blockedReasons.push("missing_exitPrice_or_firstEvent");

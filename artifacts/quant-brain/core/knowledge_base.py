@@ -2717,8 +2717,52 @@ async def get_learning_metrics(hours: int = 24) -> dict:
             (since,),
         )).fetchone()
 
+        # 7. KB trade totals (total_trades, total_wins, avg_score, score_buckets)
+        kb_summary = await (await db.execute(
+            """SELECT
+                COUNT(*) as total_trades,
+                SUM(win) as total_wins,
+                AVG(COALESCE(coach_score, playbook_score)) as avg_score
+               FROM trade_outcomes
+               WHERE is_demo=1""",
+        )).fetchone()
+        total_trades = int(kb_summary["total_trades"] or 0) if kb_summary else 0
+        total_wins   = int(kb_summary["total_wins"] or 0) if kb_summary else 0
+        avg_score    = float(kb_summary["avg_score"]) if kb_summary and kb_summary["avg_score"] is not None else None
+
+        score_bucket_rows = await (await db.execute(
+            """SELECT
+                CASE
+                    WHEN COALESCE(coach_score, playbook_score) IS NULL THEN 'sem_score'
+                    WHEN COALESCE(coach_score, playbook_score) >= 0.7 THEN 'alto'
+                    WHEN COALESCE(coach_score, playbook_score) >= 0.5 THEN 'medio'
+                    ELSE 'baixo'
+                END as bucket,
+                COUNT(*) as trades,
+                SUM(win) as wins,
+                AVG(pnl_pct) as avg_pnl_pct
+               FROM trade_outcomes
+               WHERE is_demo=1
+               GROUP BY 1
+               ORDER BY avg_pnl_pct DESC""",
+        )).fetchall()
+        score_buckets = [
+            {
+                "bucket": r["bucket"],
+                "trades": int(r["trades"] or 0),
+                "wins": int(r["wins"] or 0),
+                "winRate": round(r["wins"] / r["trades"] * 100, 1) if r["trades"] else 0,
+                "avgPnlPct": round(float(r["avg_pnl_pct"] or 0), 3),
+            }
+            for r in score_bucket_rows
+        ]
+
     return {
         "windowHours": hours,
+        "total_trades": total_trades,
+        "total_wins": total_wins,
+        "avg_score": avg_score,
+        "score_buckets": score_buckets,
         "funnel": {
             "generated": generated,
             "executed": executed,

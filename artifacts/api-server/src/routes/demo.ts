@@ -951,6 +951,9 @@ async function closeTriggeredDemoPositions(
         slippagePctNotional: notional > 0 ? totalSlippage / notional : 0,
         exitReason: closeSignal.exitReason,
         expectedTpProfit: entry.expectedTpProfit,
+        signalId: entry.signalId,
+        marketEventId: entry.marketEventId ?? undefined,
+        campaignId: entry.campaignId,
       });
       const reconciliationQueued = realized.source === "price_estimate" && balanceBefore !== null;
       if (realized.source === "price_estimate") {
@@ -1670,6 +1673,9 @@ router.post("/demo/close", async (req: Request, res: Response) => {
           slippagePctNotional: notional > 0 ? totalSlippage / notional : 0,
           exitReason: "MANUAL",
           expectedTpProfit: entry.expectedTpProfit,
+          signalId: entry.signalId,
+          marketEventId: entry.marketEventId ?? undefined,
+          campaignId: entry.campaignId,
         });
 
         telemetryRecorded = true;
