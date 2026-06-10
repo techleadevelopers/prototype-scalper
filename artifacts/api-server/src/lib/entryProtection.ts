@@ -147,3 +147,40 @@ export function buildAttachedProtection(
     }),
   };
 }
+
+/**
+ * Constrói os parâmetros de proteção usando preços absolutos fornecidos pelo Quant Brain.
+ *
+ * CONTRATO DE ARQUITETURA: O Quant Brain é a ÚNICA entidade que calcula a geometria
+ * da ordem. O backend Node.js usa estes preços diretamente — sem recálculo, sem ajuste.
+ *
+ * @param takeProfitPrice - Preço absoluto do Take Profit (calculado pelo QB)
+ * @param stopPrice       - Preço absoluto do Stop Loss (calculado pelo QB)
+ * @param config          - Config do bot (usado apenas para verificar attachProtectionOrders)
+ */
+export function buildProtectionFromQbPrices(
+  takeProfitPrice: number,
+  stopPrice: number,
+  config: BotConfig,
+): { stopLoss: string; takeProfit: string; stopPrice: number; takeProfitPrice: number } | null {
+  if (!config.attachProtectionOrders) return null;
+  if (!Number.isFinite(takeProfitPrice) || takeProfitPrice <= 0) return null;
+  if (!Number.isFinite(stopPrice) || stopPrice <= 0) return null;
+
+  return {
+    stopPrice,
+    takeProfitPrice,
+    stopLoss: JSON.stringify({
+      type: "STOP_MARKET",
+      stopPrice,
+      workingType: "MARK_PRICE",
+      stopGuaranteed: "false",
+    }),
+    takeProfit: JSON.stringify({
+      type: "TAKE_PROFIT_MARKET",
+      stopPrice: takeProfitPrice,
+      workingType: "MARK_PRICE",
+      stopGuaranteed: "false",
+    }),
+  };
+}

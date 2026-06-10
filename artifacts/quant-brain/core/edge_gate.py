@@ -1119,6 +1119,50 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
     except Exception:
         pass
 
+    # ── Geometria Completa do Gatilho (Contrato de Arquitetura) ────────────────
+    # O Quant Brain é a ÚNICA entidade responsável por toda a geometria da ordem.
+    # O backend Node.js é PROIBIDO de recalcular triggerPrice, targetPrice,
+    # stopPrice ou expirationSeconds. Ele apenas valida risco e executa.
+    _tp_pct = float(regime_playbook.get("recommendedTpPct") or configured_target_pct or 0.22)
+    _sl_pct = float(regime_playbook.get("recommendedSlPct") or stop_move_pct or 0.55)
+    _raw_trigger = _microframe.get("triggerPrice")
+    _raw_expiration = int(_microframe.get("triggerExpirationSeconds") or 30)
+
+    _trigger_px: float | None = float(_raw_trigger) if _raw_trigger and float(_raw_trigger) > 0 else None
+    _target_px: float | None = None
+    _stop_px: float | None = None
+
+    if allow and _trigger_px and _microframe.get("executionType") == "TRIGGER_LIMIT":
+        # ARM_TRIGGER via ordem limite — geometria ancorada no ponto exato de exaustão
+        if position_side == "LONG":
+            _target_px = round(_trigger_px * (1 + _tp_pct / 100), 6)
+            _stop_px   = round(_trigger_px * (1 - _sl_pct / 100), 6)
+        else:
+            _target_px = round(_trigger_px * (1 - _tp_pct / 100), 6)
+            _stop_px   = round(_trigger_px * (1 + _sl_pct / 100), 6)
+        _decision = "ARM_TRIGGER"
+    elif allow:
+        # ARM_TRIGGER com execução a mercado — geometria ancorada no referencePrice
+        _ref_px = float(payload.get("referencePrice") or 0)
+        if _ref_px > 0:
+            if position_side == "LONG":
+                _target_px = round(_ref_px * (1 + _tp_pct / 100), 6)
+                _stop_px   = round(_ref_px * (1 - _sl_pct / 100), 6)
+            else:
+                _target_px = round(_ref_px * (1 - _tp_pct / 100), 6)
+                _stop_px   = round(_ref_px * (1 + _sl_pct / 100), 6)
+        _trigger_px = None  # MARKET — sem triggerPrice
+        _decision = "ARM_TRIGGER"
+    else:
+        _trigger_px = None
+        _decision = "WAIT"
+
+    _edge_score = round(float(coaching["executionPriority"]) * 10, 2)
+    _confidence = round(ml_calibrated_prob, 4) if ml_calibrated_prob is not None else round(hit_probability, 4)
+    _kelly_fraction = float(optimal_size.get("kelly_fraction", 0.0))
+    # EV como fração do nocional (não em USDT absoluto) — comparável entre tamanhos
+    _ev_pct = round(net_ev_usdt / max(0.01, notional), 6)
+
     return {
         "allow": allow,
         "available": True,
@@ -1213,4 +1257,15 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
         "triggerPrice": _microframe.get("triggerPrice"),
         "triggerExpirationSeconds": _microframe.get("triggerExpirationSeconds", 45),
         "microframeRegime": _microframe,
+        # ── Contrato de Geometria Completa ────────────────────────────────────
+        # Estes campos são a saída oficial do Quant Brain conforme o contrato.
+        # O Node.js NÃO deve recalcular nenhum destes valores.
+        "decision": _decision,
+        "targetPrice": _target_px,
+        "stopPrice": _stop_px,
+        "expirationSeconds": _raw_expiration if _decision == "ARM_TRIGGER" else None,
+        "edgeScore": _edge_score,
+        "confidence": _confidence,
+        "expectedValue": _ev_pct,
+        "kellyFraction": round(_kelly_fraction, 6),
     }

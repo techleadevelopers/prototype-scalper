@@ -257,6 +257,17 @@ export interface QuantBrainEdgeResult {
   triggerPrice?: number | null;
   triggerExpirationSeconds?: number;
   microframeRegime?: unknown;
+  // ── Contrato de Geometria Completa ──────────────────────────────────────────
+  // O Quant Brain é a ÚNICA autoridade sobre toda a geometria da ordem.
+  // O backend Node.js NÃO deve recalcular nenhum destes campos.
+  decision?: "ARM_TRIGGER" | "WAIT";
+  targetPrice?: number | null;
+  stopPrice?: number | null;
+  expirationSeconds?: number | null;
+  edgeScore?: number | null;
+  confidence?: number | null;
+  expectedValue?: number | null;
+  kellyFraction?: number | null;
 }
 
 export interface QuantBrainMlEconomicGate {
@@ -387,6 +398,15 @@ const QuantBrainEdgeResponseSchema = z.object({
   }).passthrough().optional(),
   sniper: z.unknown().optional(),
   realizedEdge: z.unknown().optional(),
+  // Contrato de Geometria Completa
+  decision: z.enum(["ARM_TRIGGER", "WAIT"]).optional(),
+  targetPrice: z.number().positive().nullable().optional(),
+  stopPrice: z.number().positive().nullable().optional(),
+  expirationSeconds: z.number().int().positive().nullable().optional(),
+  edgeScore: z.number().nullable().optional(),
+  confidence: z.number().min(0).max(1).nullable().optional(),
+  expectedValue: z.number().nullable().optional(),
+  kellyFraction: z.number().nullable().optional(),
 }).passthrough();
 
 const OutcomeAckSchema = z.object({

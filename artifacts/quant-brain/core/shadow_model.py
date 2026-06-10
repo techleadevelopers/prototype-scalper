@@ -70,6 +70,15 @@ NUMERICAL_FEATURES = [
     "btc_4h_move_pct",
     "btc_1h_volume_ratio",
     "btc_4h_volatility_pct",
+    # ── Features de Gatilho (Contrato de Arquitetura) ──────────────────────────
+    # O modelo aprende a relação entre distância do gatilho e taxa de fill,
+    # e o expirationSeconds ótimo para maximizar EV líquido pós-custos.
+    # Distância do gatilho: |trigger - referencePrice| / referencePrice * 100
+    # Controla o tradeoff "mais longe = mais seguro mas fill rate cai".
+    "trigger_distance_pct",
+    # TTL do gatilho em segundos: o modelo aprende que triggers > 45s que
+    # ficam abertos tendem a dar loss quando finalmente executam.
+    "expiration_seconds",
 ]
 
 # Feature importance tracking
@@ -135,6 +144,15 @@ def _feature_dict(row: dict[str, Any]) -> dict[str, Any]:
         (row.get("side", "") == "LONG" and result["btc_candle_bias"] == "LONG") or
         (row.get("side", "") == "SHORT" and result["btc_candle_bias"] == "SHORT")
     ) else 0
+
+    # Features de geometria do gatilho — aprendizado de distância ótima
+    # trigger_distance_pct: quão longe o gatilho está do preço atual.
+    # O modelo aprende que distâncias muito pequenas = fill rápido mas ruído,
+    # distâncias grandes = fill seletivo mas quando executa é em pontos reais.
+    result["trigger_distance_pct"] = float(row.get("trigger_distance_pct") or 0)
+    # expiration_seconds: o modelo aprende que triggers com TTL > 45s que
+    # ficam esperando tendem a executar em condições de mercado degradadas.
+    result["expiration_seconds"] = float(row.get("expiration_seconds") or 30)
 
     return result
 

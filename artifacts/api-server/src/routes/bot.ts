@@ -24,6 +24,7 @@ import { recordPredictionExecutionAge } from "../lib/runtimeMetrics";
 import { getMarketSentiment, getMarketSentimentBulk, type SentimentResult } from "../lib/sentimentEngine";
 import {
   buildAttachedProtection,
+  buildProtectionFromQbPrices,
   candleConfirmationRejects,
   recentPerformanceRejects,
   summarizeRecentPerformance,
@@ -100,8 +101,15 @@ function withEntryProtection(
   referencePrice: number,
   positionSide: "LONG" | "SHORT",
   config: ReturnType<typeof getBotConfig>,
+  // Geometria absoluta fornecida pelo Quant Brain — usa diretamente sem recálculo.
+  // CONTRATO: o Node.js é PROIBIDO de recalcular TP/SL quando QB os fornece.
+  qbAbsoluteGeometry?: { targetPrice: number; stopPrice: number } | null,
 ): ProtectionBuildResult {
-  const protection = buildAttachedProtection(referencePrice, positionSide, config);
+  // Se o QB forneceu preços absolutos, usar diretamente (contrato de arquitetura).
+  const protection = qbAbsoluteGeometry?.targetPrice && qbAbsoluteGeometry?.stopPrice
+    ? buildProtectionFromQbPrices(qbAbsoluteGeometry.targetPrice, qbAbsoluteGeometry.stopPrice, config)
+    : buildAttachedProtection(referencePrice, positionSide, config);
+
   if (!protection) {
     return {
       orderParams,
@@ -2674,6 +2682,13 @@ async function executeSingleOrder(
   let qbTriggerPrice: number | null | undefined;
   let qbTriggerExpirationSeconds = parseInt(process.env["TRIGGER_EXPIRATION_SECONDS"] ?? "45", 10);
   let qbExhaustionType: string | undefined;
+  // Geometria completa do Quant Brain (Contrato de Arquitetura)
+  // O Node.js usa estes preços DIRETAMENTE — proibido recalcular.
+  let qbTargetPrice: number | null | undefined;
+  let qbStopPrice: number | null | undefined;
+  let qbDecision: "ARM_TRIGGER" | "WAIT" | undefined;
+  // Spread bid/ask em basis points — capturado do snapshot de mercado do QB.
+  let qbSpreadBps = 0;
   const expiresAt = Date.now() + 30_000; // 30s — signal must be evaluated before expiry
   if (qbMode === "enforce") {
     try {
@@ -2725,6 +2740,22 @@ async function executeSingleOrder(
         qbTriggerExpirationSeconds = qbResult.triggerExpirationSeconds ?? qbTriggerExpirationSeconds;
         const regime = qbResult.microframeRegime as Record<string, unknown> | undefined;
         qbExhaustionType = regime?.exhaustionType as string | undefined;
+      }
+      // Captura geometria completa do QB (Contrato de Arquitetura)
+      // O Quant Brain é a ÚNICA autoridade — backend usa preços absolutos diretamente.
+      qbDecision = qbResult.decision;
+      if (typeof qbResult.targetPrice === "number" && qbResult.targetPrice > 0) {
+        qbTargetPrice = qbResult.targetPrice;
+      }
+      if (typeof qbResult.stopPrice === "number" && qbResult.stopPrice > 0) {
+        qbStopPrice = qbResult.stopPrice;
+      }
+      // Spread capturado do snapshot de mercado do QB (segundos atrás — fresco o suficiente)
+      const sniper = qbResult.sniper as Record<string, unknown> | undefined;
+      const altFeatures = sniper?.altFeatures as Record<string, unknown> | undefined;
+      const rawSpread = altFeatures?.spread_bps ?? (sniper?.["spread_bps"]);
+      if (typeof rawSpread === "number" && rawSpread > 0) {
+        qbSpreadBps = rawSpread;
       }
     } catch (err) {
       gateRejects.push(`QB_ENFORCE_REJECT: ${err instanceof Error ? err.message : "Quant Brain unavailable"}`);
@@ -2846,6 +2877,21 @@ async function executeSingleOrder(
     };
   }
 
+  // ── Validação de Spread (Contrato de Arquitetura) ──────────────────────────
+  // Se o spread bid/ask superar 0.02% (2 bps), abortar o envio para proteger
+  // a matemática do alvo curto. Usa spread_bps capturado do snapshot do QB.
+  // Nota: modo shadow registra mas não bloqueia; apenas modo enforce rejeita.
+  if (qbSpreadBps > 2.0 && qbMode === "enforce") {
+    return {
+      index, symbol, side, placed: false, orderId: null,
+      quantity: qty,
+      gateRejects: [`SPREAD_REJECT: spread ${qbSpreadBps.toFixed(2)} bps > max 2.0 bps`],
+      observationMode: false,
+      message: `Spread ${qbSpreadBps.toFixed(2)} bps excede o limite Maker de 2 bps. Geometria do alvo comprometida.`,
+      durationMs: Date.now() - t0,
+    };
+  }
+
   // Place order
   const clientOrderId = deterministicClientOrderId({ symbol, side, positionSide, marketEventId });
   try {
@@ -2865,7 +2911,12 @@ async function executeSingleOrder(
       clientOrderID: clientOrderId,
       ...(useTriggerLimit && qbTriggerPrice != null ? { price: qbTriggerPrice } : {}),
     };
-    const protection = withEntryProtection(baseOrderParams, expectedEntryPrice, positionSide, config);
+    // CONTRATO DE ARQUITETURA: Se o QB forneceu targetPrice e stopPrice absolutos,
+    // eles são usados DIRETAMENTE. O Node.js não recalcula geometria.
+    const qbGeometry = qbTargetPrice && qbStopPrice
+      ? { targetPrice: qbTargetPrice, stopPrice: qbStopPrice }
+      : null;
+    const protection = withEntryProtection(baseOrderParams, expectedEntryPrice, positionSide, config, qbGeometry);
     const data = await bingxPost(
       "/openApi/swap/v2/trade/order",
       protection.orderParams,
