@@ -27,6 +27,7 @@ import {
   buildProtectionFromQbPrices,
   candleConfirmationRejects,
   recentPerformanceRejects,
+  recentPerformanceRejectsForSymbol,
   summarizeRecentPerformance,
 } from "../lib/entryProtection";
 import {
@@ -1063,11 +1064,8 @@ router.post("/bot/order", async (req: Request, res: Response) => {
   // ── Gate evaluation pipeline ────────────────────────────────────────────────
   const gateRejects: string[] = [];
   const currentHour = new Date().getUTCHours();
-  const recentPerformance = summarizeRecentPerformance(
-    getEngine().rawOutcomes().filter((outcome) => !isDemoOutcome(outcome)),
-    config,
-  );
-  gateRejects.push(...recentPerformanceRejects(recentPerformance, config));
+  const liveOutcomes = getEngine().rawOutcomes().filter((outcome) => !isDemoOutcome(outcome));
+  gateRejects.push(...recentPerformanceRejectsForSymbol(liveOutcomes, symbol, config));
   const candle = await computeCandleEdge(symbol, "5m");
   gateRejects.push(...candleConfirmationRejects(candle, positionSide, config));
   const killSwitch = evaluateLiveKillSwitch({

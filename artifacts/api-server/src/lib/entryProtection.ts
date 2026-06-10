@@ -66,6 +66,68 @@ export function recentPerformanceRejects(summary: RecentPerformanceSummary, conf
   return rejects;
 }
 
+/**
+ * Fix 3 — RECENT_EDGE_REJECT: per-symbol first, global fallback with doubled threshold.
+ *
+ * Evaluates the recent-edge gate using symbol-specific outcomes when the symbol has
+ * at least `recentEdgeMinTrades` trades in the window. If the symbol has fewer trades,
+ * falls back to the global pool but requires 2× the threshold before triggering —
+ * avoiding one symbol's cold run from blocking the entire fleet.
+ */
+export function recentPerformanceRejectsForSymbol(
+  allOutcomes: TradeOutcome[],
+  symbol: string,
+  config: BotConfig,
+  now = Date.now(),
+): string[] {
+  const since = now - config.recentEdgeWindowHours * 60 * 60 * 1000;
+  const inWindow = allOutcomes.filter((o) => o.exitTime >= since);
+
+  const symbolOutcomes = inWindow.filter((o) => o.symbol === symbol);
+
+  if (symbolOutcomes.length >= config.recentEdgeMinTrades) {
+    const symbolSummary = summarizeRecentPerformance(symbolOutcomes, config, now);
+    const rejects: string[] = [];
+    if (symbolSummary.consecutiveLosses >= config.recentEdgeMaxConsecutiveLosses) {
+      rejects.push(
+        `RECENT_LOSS_STREAK_REJECT[${symbol}]: ${symbolSummary.consecutiveLosses} consecutive losses in ${config.recentEdgeWindowHours}h`,
+      );
+    }
+    if (
+      symbolSummary.netPnl < 0
+      && symbolSummary.profitFactor < config.recentEdgeMinProfitFactor
+    ) {
+      rejects.push(
+        `RECENT_EDGE_REJECT[${symbol}]: ${config.recentEdgeWindowHours}h PnL ${symbolSummary.netPnl.toFixed(4)}, PF ${symbolSummary.profitFactor.toFixed(2)}`,
+      );
+    }
+    return rejects;
+  }
+
+  const globalMinTrades = config.recentEdgeMinTrades * 2;
+  if (inWindow.length < globalMinTrades) {
+    return [];
+  }
+
+  const globalSummary = summarizeRecentPerformance(inWindow, config, now);
+  const rejects: string[] = [];
+  if (globalSummary.consecutiveLosses >= config.recentEdgeMaxConsecutiveLosses) {
+    rejects.push(
+      `RECENT_LOSS_STREAK_REJECT[global]: ${globalSummary.consecutiveLosses} consecutive losses in ${config.recentEdgeWindowHours}h`,
+    );
+  }
+  if (
+    globalSummary.trades >= globalMinTrades
+    && globalSummary.netPnl < 0
+    && globalSummary.profitFactor < config.recentEdgeMinProfitFactor
+  ) {
+    rejects.push(
+      `RECENT_EDGE_REJECT[global]: ${config.recentEdgeWindowHours}h PnL ${globalSummary.netPnl.toFixed(4)}, PF ${globalSummary.profitFactor.toFixed(2)}`,
+    );
+  }
+  return rejects;
+}
+
 export function candleConfirmationRejects(
   candle: CandleEdge,
   positionSide: "LONG" | "SHORT",
@@ -88,15 +150,22 @@ export function candleConfirmationRejects(
   const oppositeScore = positionSide === "LONG" ? candle.shortScore : candle.longScore;
   const rejects: string[] = [];
 
-  if (candle.suggestedSide !== positionSide) {
-    rejects.push(`CANDLE_DIRECTION_REJECT: 5m suggests ${candle.suggestedSide}, entry is ${positionSide}`);
+  // Fix 1 — CANDLE_DIRECTION_REJECT: only block when the opposite side is strongly
+  // dominant (margin ≥ candleDirectionRejectMargin). A bare suggestedSide mismatch
+  // with a margin of 0.01 is noise, not a structural rejection signal.
+  if (oppositeScore - sideScore >= config.candleDirectionRejectMargin) {
+    rejects.push(
+      `CANDLE_DIRECTION_REJECT: opposite dominates by ${(oppositeScore - sideScore).toFixed(3)} ≥ ${config.candleDirectionRejectMargin.toFixed(3)} (${candle.suggestedSide} vs ${positionSide})`,
+    );
   }
   if (sideScore < config.candleMinScore) {
     rejects.push(`CANDLE_SCORE_REJECT: ${sideScore.toFixed(3)} < ${config.candleMinScore.toFixed(3)}`);
   }
-  if (sideScore - oppositeScore < config.candleMinSeparation) {
+  // Fix 2 — CANDLE_CHOP_REJECT: a strong absolute score (≥ candleMinScore) overrides
+  // weak separation. Only fire when both the spread is narrow AND the score is soft.
+  if (sideScore - oppositeScore < config.candleMinSeparation && sideScore < config.candleMinScore) {
     rejects.push(
-      `CANDLE_CHOP_REJECT: score separation ${(sideScore - oppositeScore).toFixed(3)} < ${config.candleMinSeparation.toFixed(3)}`,
+      `CANDLE_CHOP_REJECT: score separation ${(sideScore - oppositeScore).toFixed(3)} < ${config.candleMinSeparation.toFixed(3)} with weak score ${sideScore.toFixed(3)}`,
     );
   }
   if (candle.emaCross === "FLAT" && candle.volumeRatio < 1.1) {
