@@ -11,11 +11,12 @@ import os
 import time
 import asyncio
 import hashlib
+import gzip
 from collections import OrderedDict
 from dataclasses import dataclass, asdict
 from typing import Optional, Any
 from pathlib import Path
-from core.database import IntegrityError, Row, connect, table_columns
+from core.database import IntegrityError, Row, connect, table_columns, using_postgres
 
 DB_PATH = Path(__file__).parent.parent / "data" / "knowledge.db"
 DB_PATH.parent.mkdir(exist_ok=True)
@@ -322,6 +323,24 @@ CREATE TABLE IF NOT EXISTS rolling_edge (
 );
 
 -- Tabela de execução quality (slippage real)
+CREATE TABLE IF NOT EXISTS sniper_performance_windows (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol TEXT NOT NULL,
+    side TEXT NOT NULL,
+    window_start REAL NOT NULL,
+    window_minutes INTEGER NOT NULL,
+    samples INTEGER DEFAULT 0,
+    wins INTEGER DEFAULT 0,
+    win_rate REAL DEFAULT 0,
+    profit_factor REAL DEFAULT 0,
+    avg_edge REAL DEFAULT 0,
+    avg_latency_ms REAL DEFAULT 0,
+    brier_score REAL DEFAULT NULL,
+    drawdown REAL DEFAULT 0,
+    updated_at REAL NOT NULL,
+    UNIQUE(symbol, side, window_start, window_minutes)
+);
+
 CREATE TABLE IF NOT EXISTS execution_quality (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     symbol TEXT NOT NULL,
@@ -378,6 +397,7 @@ CREATE INDEX IF NOT EXISTS idx_regime_performance ON regime_performance(btc_regi
 CREATE INDEX IF NOT EXISTS idx_hour_toxicity ON hour_toxicity(symbol, hour_utc, toxicity_score DESC);
 
 CREATE INDEX IF NOT EXISTS idx_rolling_edge ON rolling_edge(symbol, side, computed_at);
+CREATE INDEX IF NOT EXISTS idx_sniper_windows_symbol_side ON sniper_performance_windows(symbol, side, window_start);
 
 CREATE INDEX IF NOT EXISTS idx_execution_quality ON execution_quality(symbol, timestamp);
 CREATE INDEX IF NOT EXISTS idx_execution_slippage ON execution_quality(slippage_bps DESC);
@@ -1746,7 +1766,195 @@ async def get_model_artifact(name: str) -> dict | None:
     }
 
 
-async def cleanup_retention(now: float | None = None) -> dict[str, int]:
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off", ""}
+
+
+def _cold_archive_dir() -> Path:
+    return Path(os.environ.get("COLD_ARCHIVE_DIR", "/data/archive")).expanduser()
+
+
+def _row_to_plain_dict(row: Any) -> dict[str, Any]:
+    try:
+        return dict(row)
+    except Exception:
+        keys = getattr(row, "keys", lambda: [])()
+        return {str(key): row[key] for key in keys}
+
+
+def _archive_path_for(table: str, cutoff: float, now: float) -> Path:
+    day = time.strftime("%Y-%m-%d", time.gmtime(cutoff))
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(now))
+    path = _cold_archive_dir() / table / f"{day}-{stamp}.jsonl.gz"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+async def _archive_and_delete_old_rows(
+    db: Any,
+    *,
+    table: str,
+    column: str,
+    cutoff: float,
+    now: float,
+    batch_size: int,
+) -> dict[str, Any]:
+    archived = 0
+    deleted = 0
+    files: list[str] = []
+    while True:
+        rows = await (await db.execute(
+            f"SELECT * FROM {table} WHERE {column} < ? ORDER BY {column} ASC LIMIT ?",
+            (cutoff, batch_size),
+        )).fetchall()
+        if not rows:
+            break
+
+        plain_rows = [_row_to_plain_dict(row) for row in rows]
+        ids = [row.get("id") for row in plain_rows if row.get("id") is not None]
+        if not ids:
+            break
+
+        archive_path = _archive_path_for(table, cutoff, now)
+        with gzip.open(archive_path, "at", encoding="utf-8") as fh:
+            for row in plain_rows:
+                row["_archive"] = {
+                    "table": table,
+                    "cutoff": cutoff,
+                    "archived_at": now,
+                    "database_backend": "postgresql" if using_postgres() else "sqlite",
+                }
+                fh.write(json.dumps(row, ensure_ascii=False, default=str, separators=(",", ":")) + "\n")
+        if str(archive_path) not in files:
+            files.append(str(archive_path))
+        archived += len(ids)
+
+        placeholders = ",".join("?" for _ in ids)
+        cursor = await db.execute(f"DELETE FROM {table} WHERE id IN ({placeholders})", tuple(ids))
+        deleted += int(getattr(cursor, "rowcount", 0) or 0)
+        if len(rows) < batch_size:
+            break
+    return {"archived": archived, "deleted": deleted, "files": files}
+
+
+async def refresh_sniper_performance_windows(now: float | None = None, days: int | None = None) -> dict[str, int]:
+    current = now or time.time()
+    history_days = max(1, int(days or os.environ.get("AGGREGATE_WINDOW_HISTORY_DAYS", "30")))
+    window_minutes = max(15, int(os.environ.get("AGGREGATE_WINDOW_MINUTES", "1440")))
+    window_seconds = window_minutes * 60
+    since = current - history_days * 86400
+    rows_written = 0
+
+    async with connect(DB_PATH) as db:
+        db.row_factory = Row
+        rows = await (await db.execute(
+            """SELECT symbol, side, timestamp, win, pnl_pct,
+                      COALESCE(slippage_bps, 0) AS slippage_bps
+               FROM trade_outcomes
+               WHERE timestamp >= ?
+               ORDER BY timestamp ASC""",
+            (since,),
+        )).fetchall()
+        buckets: dict[tuple[str, str, float], list[dict[str, Any]]] = {}
+        for row in rows:
+            item = _row_to_plain_dict(row)
+            ts = float(item.get("timestamp") or 0)
+            if ts <= 0:
+                continue
+            window_start = ts - (ts % window_seconds)
+            key = (str(item.get("symbol") or "").upper(), str(item.get("side") or "").upper(), window_start)
+            buckets.setdefault(key, []).append(item)
+
+        cutoff_window = current - history_days * 86400
+        await db.execute("DELETE FROM sniper_performance_windows WHERE window_start >= ?", (cutoff_window,))
+        for (symbol, side, window_start), items in buckets.items():
+            if not symbol or not side:
+                continue
+            samples = len(items)
+            wins = sum(1 for item in items if int(item.get("win") or 0) == 1)
+            gains = sum(max(0.0, float(item.get("pnl_pct") or 0)) for item in items)
+            losses = abs(sum(min(0.0, float(item.get("pnl_pct") or 0)) for item in items))
+            pnl_values = [float(item.get("pnl_pct") or 0) for item in items]
+            running = 0.0
+            peak = 0.0
+            drawdown = 0.0
+            for pnl in pnl_values:
+                running += pnl
+                peak = max(peak, running)
+                drawdown = min(drawdown, running - peak)
+            await db.execute(
+                """INSERT INTO sniper_performance_windows
+                   (symbol, side, window_start, window_minutes, samples, wins,
+                    win_rate, profit_factor, avg_edge, avg_latency_ms, brier_score,
+                    drawdown, updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    symbol,
+                    side,
+                    window_start,
+                    window_minutes,
+                    samples,
+                    wins,
+                    wins / samples if samples else 0.0,
+                    gains / losses if losses > 0 else (gains if gains > 0 else 0.0),
+                    sum(pnl_values) / samples if samples else 0.0,
+                    sum(float(item.get("slippage_bps") or 0) for item in items) / samples if samples else 0.0,
+                    None,
+                    abs(drawdown),
+                    current,
+                ),
+            )
+            rows_written += 1
+        await db.commit()
+    _query_cache.clear()
+    return {"windowsWritten": rows_written, "historyDays": history_days}
+
+
+async def get_storage_health() -> dict[str, Any]:
+    tables = [
+        ("feature_snapshots", "timestamp"),
+        ("signal_outcomes", "created_at"),
+        ("trade_outcomes", "timestamp"),
+        ("observations", "timestamp"),
+        ("execution_quality", "timestamp"),
+        ("sniper_performance_windows", "window_start"),
+    ]
+    result: list[dict[str, Any]] = []
+    async with connect(DB_PATH) as db:
+        for table, column in tables:
+            row = await (await db.execute(
+                f"SELECT COUNT(*) AS rows, MIN({column}) AS oldest, MAX({column}) AS newest FROM {table}"
+            )).fetchone()
+            count = int(row[0] or 0) if row else 0
+            result.append({
+                "table": table,
+                "rows": count,
+                "oldest": float(row[1] or 0) if row else 0,
+                "newest": float(row[2] or 0) if row else 0,
+                "risk": "critical" if count >= int(os.environ.get("STORAGE_TABLE_CRITICAL_ROWS", "500000")) else
+                        "warning" if count >= int(os.environ.get("STORAGE_TABLE_WARN_ROWS", "100000")) else "ok",
+            })
+    archive_root = _cold_archive_dir()
+    archive_files = list(archive_root.glob("**/*.jsonl.gz")) if archive_root.exists() else []
+    return {
+        "databaseBackend": "postgresql" if using_postgres() else "sqlite",
+        "tables": result,
+        "archive": {
+            "enabled": _env_bool("COLD_ARCHIVE_ENABLED", True),
+            "dir": str(archive_root),
+            "files": len(archive_files),
+            "bytes": sum(path.stat().st_size for path in archive_files if path.exists()),
+        },
+        "risk": "critical" if any(item["risk"] == "critical" for item in result) else
+                "warning" if any(item["risk"] == "warning" for item in result) else "ok",
+        "timestamp": time.time(),
+    }
+
+
+async def cleanup_retention(now: float | None = None) -> dict[str, Any]:
     current = now or time.time()
     policies = {
         "feature_snapshots": (
@@ -1773,15 +1981,39 @@ async def cleanup_retention(now: float | None = None) -> dict[str, int]:
     trade_days = int(os.environ.get("RETENTION_TRADE_OUTCOMES_DAYS", "0"))
     if trade_days > 0:
         policies["trade_outcomes"] = ("timestamp", trade_days * 86400)
-    deleted: dict[str, int] = {}
+    deleted: dict[str, Any] = {}
+    archive_enabled = _env_bool("COLD_ARCHIVE_ENABLED", True)
+    archive_tables = {
+        table.strip()
+        for table in os.environ.get(
+            "COLD_ARCHIVE_TABLES",
+            "feature_snapshots,signal_outcomes,observations,execution_quality,trade_outcomes",
+        ).split(",")
+        if table.strip()
+    }
+    batch_size = max(100, min(int(os.environ.get("COLD_ARCHIVE_BATCH_ROWS", "5000")), 50000))
+    aggregate_result = await refresh_sniper_performance_windows(current)
+    deleted["_aggregates"] = aggregate_result
     async with connect(DB_PATH) as db:
+        db.row_factory = Row
         for table, (column, age_seconds) in policies.items():
             cutoff = current - age_seconds
-            cursor = await db.execute(
-                f"DELETE FROM {table} WHERE {column} < ?",
-                (cutoff,),
-            )
-            deleted[table] = int(getattr(cursor, "rowcount", 0) or 0)
+            if archive_enabled and table in archive_tables:
+                result = await _archive_and_delete_old_rows(
+                    db,
+                    table=table,
+                    column=column,
+                    cutoff=cutoff,
+                    now=current,
+                    batch_size=batch_size,
+                )
+                deleted[table] = result
+            else:
+                cursor = await db.execute(
+                    f"DELETE FROM {table} WHERE {column} < ?",
+                    (cutoff,),
+                )
+                deleted[table] = {"archived": 0, "deleted": int(getattr(cursor, "rowcount", 0) or 0), "files": []}
         await db.commit()
     _query_cache.clear()
     return deleted
@@ -2589,6 +2821,9 @@ async def get_rolling_win_rate(symbol: str, side: str, window_hours: int = 24) -
 async def vacuum_db():
     """Otimiza o banco de dados - agendado semanalmente."""
     async with connect(DB_PATH) as db:
+        if using_postgres():
+            await db.execute("ANALYZE")
+            return
         await db.execute("VACUUM")
         await db.execute("ANALYZE")
 
