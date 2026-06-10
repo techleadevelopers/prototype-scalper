@@ -37,6 +37,7 @@ class MovementFeatures:
     direction: str
     movement_state: str
     # NOVOS CAMPOS PARA NÍVEL MÁXIMO DE EXCELÊNCIA
+    next_funding_time_ms: float = 0.0  # Feature 4: Funding Rate Front-Running
     vwap_distance_pct: float = 0.0
     volume_trend: str = "flat"
     tick_imbalance: float = 0.0
@@ -338,6 +339,7 @@ def build_movement_features(symbol: str, history: list[dict], window_seconds: in
     volume_ratio = _avg([float(x.get("volume_ratio", 1) or 1) for x in history], 1.0)
     oi_change_pct = _last_float(history, "oi_change_pct")
     funding_rate = _last_float(history, "funding_rate")
+    next_funding_time_ms = _last_float(history, "next_funding_time_ms")
     rsi = _last_float(history, "rsi", 50.0)
     atr_pct = _last_float(history, "atr_pct")
     btc_regime = str(history[-1].get("btc_regime", "NEUTRAL"))
@@ -434,6 +436,7 @@ def build_movement_features(symbol: str, history: list[dict], window_seconds: in
         volume_ratio=round(volume_ratio, 4),
         oi_change_pct=round(oi_change_pct, 4),
         funding_rate=round(funding_rate, 8),
+        next_funding_time_ms=next_funding_time_ms,
         rsi=round(rsi, 2),
         atr_pct=round(atr_pct, 4),
         btc_regime=btc_regime,

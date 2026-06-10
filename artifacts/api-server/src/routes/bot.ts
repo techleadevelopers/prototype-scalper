@@ -82,7 +82,12 @@ import {
 } from "../lib/live_readiness";
 import { loadClosedTrades } from "../lib/demoTradeStore";
 import { getPolicyStatus } from "../lib/policyManifest";
-import { armLimitOrderExpiry, getTriggerStats } from "../lib/exhaustionTriggerManager";
+import {
+  armLimitOrderExpiry,
+  getTriggerStats,
+  isMuxLocked,
+  markTriggerFilled,
+} from "../lib/exhaustionTriggerManager";
 
 const router = Router();
 
@@ -1145,6 +1150,20 @@ router.post("/bot/order", async (req: Request, res: Response) => {
     marginUtilization = capitalData.marginUtilization;
   } else if (config.allowExecution) {
     gateRejects.push("CAPITAL_CONTEXT_REJECT: live capital snapshot unavailable");
+  }
+
+  // ── Feature 1: Single-Fill Execution Guard (Mux-Lock) ────────────────────
+  // Após qualquer fill de gatilho TRIGGER_LIMIT, bloqueia novas entradas por
+  // MUX_LOCK_CANDLES velas de 1m (padrão: 2 min). Evita que múltiplos ativos
+  // ativem simultaneamente contra o mesmo movimento de mercado (correlação fatal).
+  {
+    const muxLock = isMuxLocked();
+    if (muxLock.locked) {
+      const remainingSec = Math.ceil(muxLock.remainingMs / 1000);
+      gateRejects.push(
+        `MUX_LOCK_ACTIVE: single-fill guard ativo — cooldown ${remainingSec}s. Gatilho: ${muxLock.reason}`,
+      );
+    }
   }
 
   // QB edge gate — called after capital gate (sentiment already fetched in parallel above)
@@ -3029,7 +3048,7 @@ async function executeSingleOrder(
       // If price never reaches triggerPrice within the TTL window, cancel the
       // open order so it doesn't linger and fill at a stale price.
       if (useTriggerLimit && qbTriggerPrice != null) {
-        armLimitOrderExpiry({
+        const triggerId = armLimitOrderExpiry({
           orderId: placedOrderId,
           symbol,
           direction: positionSide as "LONG" | "SHORT",
@@ -3044,7 +3063,73 @@ async function executeSingleOrder(
               creds.secretKey,
             ).catch(() => {});
           },
+          // ── Feature 3: Partial Fill Policy ────────────────────────────────
+          // Quando o TTL dispara, verifica se a ordem foi parcialmente executada.
+          // Se sim, o restante é cancelado e onPartialFill é invocado para
+          // que o caller ajuste TP/SL proporcionalmente ao tamanho executado.
+          checkPartialFillFn: async () => {
+            try {
+              const r = await bingxGet(
+                "/openApi/swap/v2/trade/queryOrder",
+                { symbol, orderId: placedOrderId },
+                creds.apiKey,
+                creds.secretKey,
+              );
+              const orderData = (r as Record<string, unknown>)["data"] as Record<string, unknown> | undefined;
+              const o = orderData?.["order"] as Record<string, unknown> | undefined;
+              if (o) {
+                return {
+                  filledQty: parseFloat(String(o["executedQty"] ?? "0")),
+                  origQty: parseFloat(String(o["origQty"] ?? "0")),
+                };
+              }
+            } catch { /* best-effort */ }
+            return null;
+          },
+          onPartialFill: (filledQty: number, origQty: number) => {
+            // req is not in scope in async callbacks — use console for fire-and-forget logging
+            console.warn(
+              `[sniper] PARTIAL_FILL_POLICY: ${symbol} ${positionSide} orderId=${placedOrderId}` +
+              ` filledQty=${filledQty} origQty=${origQty}` +
+              ` ratio=${(filledQty / origQty).toFixed(3)}` +
+              ` — remainder cancelled, TP/SL should be resized to filled qty`,
+            );
+          },
         });
+
+        // ── Feature 1: Mux-Lock — Background Fill Detector ────────────────
+        // Sem WebSocket para fills, o background poller detecta quando a posição
+        // abriu (a cada 5s durante o TTL). Ao detectar: markTriggerFilled →
+        // ativa mux-lock e cancela outros gatilhos pendentes automaticamente.
+        const fillCheckDeadlineMs = Date.now() + qbTriggerExpirationSeconds * 1_000;
+        const fillCheckIntervalMs = 5_000;
+        void (async () => {
+          while (Date.now() < fillCheckDeadlineMs) {
+            await new Promise<void>((r) => setTimeout(r, fillCheckIntervalMs));
+            try {
+              const positions = await bingxGet(
+                "/openApi/swap/v2/user/positions",
+                {},
+                creds.apiKey,
+                creds.secretKey,
+              );
+              const positionList = ((positions["data"] as Record<string, unknown>)?.["positions"] as unknown[]) ?? [];
+              const isOpen = positionList.some((p) => {
+                const pos = p as Record<string, unknown>;
+                const amt = parseFloat(String(pos["positionAmt"] ?? "0"));
+                return (
+                  String(pos["symbol"] ?? "").toUpperCase() === symbol.toUpperCase() &&
+                  String(pos["positionSide"] ?? "").toUpperCase() === positionSide.toUpperCase() &&
+                  amt !== 0
+                );
+              });
+              if (isOpen) {
+                markTriggerFilled(triggerId);
+                break; // Position confirmed — mux lock activated
+              }
+            } catch { /* best-effort — polling continues */ }
+          }
+        })();
       }
     }
 

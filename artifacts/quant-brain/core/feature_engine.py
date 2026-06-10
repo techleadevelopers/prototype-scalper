@@ -51,6 +51,7 @@ class MarketSnapshot:
     anomalies: list[str] = field(default_factory=list)
 
     # NOVOS CAMPOS PARA NÍVEL MÁXIMO DE EXCELÊNCIA
+    next_funding_time_ms: float = 0.0  # Feature 4: Funding Front-Run — nextFundingTime from BingX
     bid_depth_5: float = 0.0       # soma das 5 primeiras bids
     ask_depth_5: float = 0.0       # soma das 5 primeiras asks
     bid_ask_imbalance: float = 0.0 # (bid_depth - ask_depth) / (bid_depth + ask_depth)
@@ -132,15 +133,20 @@ class FeatureEngine:
             return r.get("data", {})
         return {}
 
-    async def fetch_funding(self, symbol: str) -> float:
+    async def fetch_funding(self, symbol: str) -> tuple[float, float]:
+        """Returns (lastFundingRate, nextFundingTimeMs).
+        nextFundingTimeMs = 0 when unavailable.
+        """
         r = await self._get("/openApi/swap/v2/quote/premiumIndex", {"symbol": symbol})
         if r.get("code") == 0:
             data = r.get("data", {})
             try:
-                return float(data.get("lastFundingRate", 0))
+                rate = float(data.get("lastFundingRate", 0))
+                next_ts = float(data.get("nextFundingTime", 0) or 0)
+                return rate, next_ts
             except Exception:
-                return 0.0
-        return 0.0
+                return 0.0, 0.0
+        return 0.0, 0.0
 
     async def fetch_oi(self, symbol: str) -> float:
         r = await self._get("/openApi/swap/v2/quote/openInterest", {"symbol": symbol})
@@ -473,7 +479,7 @@ class FeatureEngine:
 
         # Busca dados com timeout e retry
         try:
-            ticker, funding, oi, (bid, ask, bid_depth, ask_depth, book_imbalance, mid_price) = await asyncio.gather(
+            ticker, (funding, next_funding_ms), oi, (bid, ask, bid_depth, ask_depth, book_imbalance, mid_price) = await asyncio.gather(
                 self.fetch_ticker(symbol),
                 self.fetch_funding(symbol),
                 self.fetch_oi(symbol),
@@ -602,6 +608,7 @@ class FeatureEngine:
             oi=oi,
             oi_change_pct=oi_change_pct,
             funding_rate=funding,
+            next_funding_time_ms=next_funding_ms,
             bid=bid,
             ask=ask,
             spread_bps=spread_bps,
@@ -684,6 +691,7 @@ class FeatureEngine:
             "oi": snap.oi,
             "oi_change_pct": snap.oi_change_pct,
             "funding_rate": snap.funding_rate,
+            "next_funding_time_ms": snap.next_funding_time_ms,
             "spread_bps": snap.spread_bps,
             "atr_pct": snap.atr_pct,
             "rsi": snap.rsi_approx,

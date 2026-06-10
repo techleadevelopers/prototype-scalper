@@ -1052,7 +1052,51 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
                 "COST_EDGE_REJECT: target does not clear execution costs + noise margin"
             )
 
-    all_blocks = judge_result["blocks"] + high_sample_blocks + risk_geometry_blocks + ml_economic_blocks + extra_blocks
+    # ── Universal Filters: aplicados a TODOS os perfis de risco ──────────────
+    # Estes bloqueios independem do risco_profile. São filtros de microestrutura
+    # e timing macro que protegem a geometria do gatilho em qualquer contexto.
+    universal_blocks: list[str] = []
+
+    # ── Feature 2: ATR Shadow Filter — "Volatilidade Fantasma" ────────────────
+    # Detecta moedas de baixa liquidez que se movem por gaps (pulos de preço)
+    # em vez de flow contínuo. Isso quebra a matemática do triggerPrice.
+    # Critério: spread > 50% do range ATR E volume muito abaixo da média.
+    _alt_atr_pct_v = _num(alt_features.get("atr_pct"), 0.0)
+    _alt_volume_ratio_v = _num(alt_features.get("volume_ratio"), 1.0)
+    if _alt_atr_pct_v > 0 and spread_bps > 0:
+        # atr_pct como fração (ex: 0.005 = 0.5%) → em bps: * 10_000
+        _atr_bps = _alt_atr_pct_v * 10_000
+        _spread_vs_atr = spread_bps / _atr_bps if _atr_bps > 0 else 0
+        if _spread_vs_atr > 0.50 and _alt_volume_ratio_v < 0.30:
+            universal_blocks.append(
+                f"ATR_SHADOW_UNTRADABLE: spread {spread_bps:.1f}bps vs ATR "
+                f"{_atr_bps:.1f}bps (ratio {_spread_vs_atr:.2f}x), "
+                f"vol_ratio {_alt_volume_ratio_v:.2f} — ghost volatility / gappy price action"
+            )
+
+    # ── Feature 4: Funding Rate Front-Running ─────────────────────────────────
+    # Se faltam < FUNDING_BLOCK_WINDOW_SEC para o próximo funding E a taxa é
+    # adversária à direção do trade → WAIT.
+    # Melhor ficar de fora 3 minutos do que começar o scalp devendo taxa macro.
+    _funding_rate_val = _num(alt_features.get("funding_rate"), 0.0)
+    _next_funding_ms = _num(alt_features.get("next_funding_time_ms"), 0.0)
+    if _next_funding_ms > 0:
+        _time_to_funding_s = (_next_funding_ms - time.time() * 1000) / 1000
+        _funding_block_window_s = float(os.environ.get("FUNDING_BLOCK_WINDOW_SEC", "180"))
+        if 0 < _time_to_funding_s < _funding_block_window_s:
+            # Taxa adversária: positiva + LONG (paga funding) ou negativa + SHORT (paga funding)
+            _funding_adversarial = (
+                (position_side == "LONG" and _funding_rate_val > 0.0001) or
+                (position_side == "SHORT" and _funding_rate_val < -0.0001)
+            )
+            if _funding_adversarial:
+                universal_blocks.append(
+                    f"FUNDING_WINDOW_REJECT: {_time_to_funding_s:.0f}s para próximo funding "
+                    f"(rate {_funding_rate_val:.4%}, side {position_side}) — "
+                    f"janela de {_funding_block_window_s:.0f}s ativa"
+                )
+
+    all_blocks = judge_result["blocks"] + high_sample_blocks + risk_geometry_blocks + ml_economic_blocks + extra_blocks + universal_blocks
     allow = len(all_blocks) == 0
 
     # ── LAYER 2: Coach Ranker — scoring, soft penalties, ranking ────────────
@@ -1123,8 +1167,34 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
     # O Quant Brain é a ÚNICA entidade responsável por toda a geometria da ordem.
     # O backend Node.js é PROIBIDO de recalcular triggerPrice, targetPrice,
     # stopPrice ou expirationSeconds. Ele apenas valida risco e executa.
-    _tp_pct = float(regime_playbook.get("recommendedTpPct") or configured_target_pct or 0.22)
-    _sl_pct = float(regime_playbook.get("recommendedSlPct") or stop_move_pct or 0.55)
+    #
+    # Feature 5: Dynamic Target Scaler
+    # Converte $BASE_TARGET_USDT (padrão $0.50) para percentual geométrico dinâmico
+    # baseado no preço real do ativo. Mantém assimetria 2:1 (TP:SL) rigorosa
+    # independente de o ativo custar $2.00 ou $150.00.
+    _base_target_usdt = float(os.environ.get("BASE_TARGET_USDT", "0.50"))
+    _ref_price_for_scale = float(payload.get("referencePrice") or 0)
+    # Fallback: usar triggerPrice se referencePrice indisponível
+    if _ref_price_for_scale <= 0:
+        _raw_for_scale = _microframe.get("triggerPrice")
+        if _raw_for_scale:
+            _ref_price_for_scale = float(_raw_for_scale)
+
+    if _ref_price_for_scale > 0:
+        # Percentual dinâmico: $0.50 / preço_atual → % de movimento necessário
+        _dynamic_tp_pct = (_base_target_usdt / _ref_price_for_scale) * 100
+        # Scaling baseado em ATR: alvo mínimo = 40% do ATR para ser atingível
+        _atr_pct_for_scale = _num(alt_features.get("atr_pct"), 0.0)
+        if _atr_pct_for_scale > 0:
+            _dynamic_tp_pct = max(_dynamic_tp_pct, _atr_pct_for_scale * 0.40)
+        # Clamp: 0.08% mínimo (protege margens), 3.0% máximo (não ser ganancioso)
+        _tp_pct = max(0.08, min(3.00, _dynamic_tp_pct))
+        # Stop = TP / 2 → 2:1 reward/risk matemático rigoroso
+        _sl_pct = max(0.04, _tp_pct / 2.0)
+    else:
+        # Fallback estático ao regime playbook se preço indisponível
+        _tp_pct = float(regime_playbook.get("recommendedTpPct") or configured_target_pct or 0.22)
+        _sl_pct = float(regime_playbook.get("recommendedSlPct") or stop_move_pct or 0.55)
     _raw_trigger = _microframe.get("triggerPrice")
     _raw_expiration = int(_microframe.get("triggerExpirationSeconds") or 30)
 

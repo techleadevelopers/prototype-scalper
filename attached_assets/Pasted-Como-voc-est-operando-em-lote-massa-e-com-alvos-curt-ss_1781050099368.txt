@@ -1,0 +1,120 @@
+Como você está operando em lote (massa) e com alvos curtíssimos, você não pode deixar o banco de dados e a UI perdidos enquanto o trade acontece. Se a BingX executar o seu Take Profit na velocidade do milissegundo, o Node.js precisa avisar o Python instantaneamente para computar a recompensa do aprendizado.
+
+Aqui está o documento de especificação técnica para a Integração do Loop de Feedback e Telemetria de Produção:
+
+📑 RELATÓRIO TÉCNICO: TELEMETRIA DE SINAL E INTEGRAÇÃO DO BANCO DE DADOS (OUTCOMES)
+📡 I. Ciclo de Vida do Sinal no Banco de Dados (PostgreSQL / MongoDB)
+Para que o offline_learner.py consiga rodar o seu ciclo de 24 horas perfeitamente, cada oportunidade gerada no /edge/evaluate deve nascer com o status de ciclo de vida mapeado no banco através de uma única tabela/coleção chamada trade_signals.
+
+O Esquema do Documento/Tabela (trade_signals):
+_id ou signalId: String única gerada no UUID do Quant Brain (ex: sig_20260609_eth_042).
+
+symbol: Ativo operado (ex: ETH-USDT).
+
+multiframe_features: O objeto/vetor completo de variáveis dos candles de 1m, 5m, 15m e BTC salvos no momento exato do cálculo.
+
+geometry: O bloco enviado pela IA (triggerPrice, targetPrice, stopPrice).
+
+status: O estado atual do sinal: ["PENDING_TRIGGER", "ACTIVE_POSITION", "RESOLVED"].
+
+outcome: O veredito de infraestrutura: ["FILLED_AND_WON", "FILLED_AND_STOPPED", "EXPIRED_UNFILLED"].
+
+🛠️ II. Implementação no Node.js: Capturando o Fim do Trade na BingX
+O backend Node.js utiliza o stream de eventos privados via WebSocket da BingX para atualizar o banco de dados em tempo real sem causar lentidão no dashboard.
+
+TypeScript
+// backend/src/lib/orderResultListener.ts
+import { db } from "./database";
+
+interface BingXExecutionPayload {
+  orderId: string;
+  symbol: string;
+  signalId: string;
+  executionStatus: "FILLED" | "CANCELLED" | "EXPIRED";
+  pnl?: number; 
+}
+
+export async function handleBingXWebsocketUpdate(payload: BingXExecutionPayload) {
+  const { signalId, symbol, executionStatus, pnl } = payload;
+
+  // 1. Caso o gatilho limite tenha expirado sem ser preenchido (Stale Expiry)
+  if (executionStatus === "CANCELLED" || executionStatus === "EXPIRED") {
+    await db.tradeSignals.update(signalId, {
+      status: "RESOLVED",
+      outcome: "EXPIRED_UNFILLED",
+      resolvedAt: new Date()
+    });
+    return;
+  }
+
+  // 2. Caso a ordem tenha sido preenchida e liquidada (Fechamento da posição)
+  if (executionStatus === "FILLED" && pnl !== undefined) {
+    const finalOutcome = pnl > 0 ? "FILLED_AND_WON" : "FILLED_AND_STOPPED";
+    
+    await db.tradeSignals.update(signalId, {
+      status: "RESOLVED",
+      outcome: finalOutcome,
+      netPnL: pnl,
+      resolvedAt: new Date()
+    });
+
+    console.log(`[📊 TELEMETRIA] Sinal ${signalId} resolvido como: ${finalOutcome}. PnL: $${pnl}`);
+  }
+}
+🛡️ III. O Guardrail de Sanidade do Modelo (Python side)
+Para evitar o maior pesadelo dos sistemas na Cloud — a IA atualizar o arquivo .pkl ou .onnx com pesos corrompidos que zeram a conta no dia seguinte —, implementamos o Mecanismo de Validação Estatística Estrita.
+
+Substitua a função temporária do offline_learner.py por esta regra matemática rígida de aprovação:
+
+Python
+# quant-brain/core/offline_learner.py (Atualização do Guardrail)
+
+def validate_model_safety(self, new_model, X_test, y_test) -> bool:
+    """
+    Roda um teste clínico rigoroso no novo cérebro gerado.
+    Impede que modelos viciados ou sem vantagem estatística assumam a Cloud.
+    """
+    from sklearn.metrics import accuracy_score
+    
+    # 1. Calcula a acurácia de acertos de gatilho do novo modelo
+    predictions = new_model.predict(X_test)
+    model_accuracy = accuracy_score(y_test, predictions)
+    
+    # 2. Calcula a Taxa de Falsos Positivos (Gatilhos que dão STOP)
+    # Em scalping de massa, um falso positivo que causa STOP é altamente destrutivo
+    from sklearn.metrics import confusion_matrix
+    tn, fp, fn, tp = confusion_matrix(y_test, predictions).ravel()
+    false_positive_rate = fp / (fp + tn + 1e-6)
+
+    print(f"[🔬 GUARDRAIL] Acurácia Geométrica do Novo Modelo: {model_accuracy:.2%}")
+    print(f"[🔬 GUARDRAIL] Taxa de Falsos Positivos (Risco de Atropelamento): {false_positive_rate:.2%}")
+
+    # CRITÉRIOS DE ACEITAÇÃO:
+    # A acurácia histórica mínima de conversão lucrativa precisa ser > 58%
+    # A taxa de gatilhos que resultam em stop estrito não pode ultrapassar 35%
+    if model_accuracy > 0.58 and false_positive_rate < 0.35:
+        return True
+    
+    print("[🚫 CRITICAL] Novo modelo falhou nos testes de estresse matemático. Descartando atualização.")
+    return False
+📈 IV. Payload da Telemetria para o Dashboard UI
+Para alimentar o gráfico de pizza do seu painel e acompanhar a eficiência dos gatilhos em massa na nuvem, o backend Node.js deve expor um endpoint /api/telemetry/stats que consolida as métricas do banco de dados coletadas pelo feedback loop:
+
+JSON
+{
+  "summary": {
+    "totalSignalsGenerated": 1420,
+    "totalTradesExecuted": 482,
+    "globalWinRate": 0.6420
+  },
+  "outcomeDistribution": {
+    "FILLED_AND_WON": 310,
+    "FILLED_AND_STOPPED": 172,
+    "EXPIRED_UNFILLED": 938
+  },
+  "efficiencyMetrics": {
+    "fillRatePct": 33.94,
+    "makerTaxEfficiencyPct": 100.00,
+    "averageHoldTimeSeconds": 18.5
+  }
+}
