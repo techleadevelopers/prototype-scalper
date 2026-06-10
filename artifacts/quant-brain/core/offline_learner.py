@@ -135,6 +135,53 @@ def offline_learner_status() -> dict[str, Any]:
     return dict(_learner_state)
 
 
+async def query_purified_samples_count() -> int:
+    """
+    Elevação 2: Conta amostras purificadas diretamente no banco de dados.
+
+    "Purificadas" = sinais que:
+      1. Passaram pelo gate (signal_outcomes.allowed = 1)
+      2. Viraram trades reais (existem em trade_outcomes)
+      3. Têm PnL registrado (pnl_usdt IS NOT NULL)
+
+    Essa contagem é a matéria-prima limpa para o retreino do shadow model.
+    Inclui um path secundário por setup_type = 'SNIPER_GRID_VALIDATED' para
+    rastrear especificamente os ARM_TRIGGER_GRID que passaram pelo quality gate.
+    """
+    try:
+        async with kb.connect(kb.DB_PATH) as db:
+            cursor = await db.execute(
+                """
+                SELECT COUNT(*)
+                FROM signal_outcomes s
+                JOIN trade_outcomes t ON s.source_id = t.outcome_source_id
+                WHERE s.allowed = 1
+                  AND t.pnl_usdt IS NOT NULL
+                """
+            )
+            row = await cursor.fetchone()
+            total = int(row[0]) if row else 0
+
+            cursor2 = await db.execute(
+                """
+                SELECT COUNT(*)
+                FROM signal_outcomes s
+                JOIN trade_outcomes t ON s.source_id = t.outcome_source_id
+                WHERE s.setup_type = 'SNIPER_GRID_VALIDATED'
+                  AND t.pnl_usdt IS NOT NULL
+                """
+            )
+            row2 = await cursor2.fetchone()
+            sniper_grid = int(row2[0]) if row2 else 0
+
+        _learner_state["purifiedSamplesCount"] = total
+        _learner_state["sniperGridValidatedCount"] = sniper_grid
+        return total
+    except Exception as exc:
+        log.debug("query_purified_samples_count falhou: %s", exc)
+        return int(_learner_state.get("purifiedSamplesCount") or 0)
+
+
 def _read_outcomes_since(path: Path, since_ts: float) -> list[dict[str, Any]]:
     """Lê entradas do JSONL com ts > since_ts (checkpoint)."""
     entries: list[dict[str, Any]] = []

@@ -1352,6 +1352,19 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
             )
             if _grid_levels:
                 _decision = "ARM_TRIGGER_GRID"
+                # ── Elevação 1: Marcar sinal no DB como SNIPER_QUALITY_VALIDATED ──
+                # Sobrescreve o setup_type do audit para identificar amostras puras
+                # de ARM_TRIGGER_GRID no treino offline (signal_outcomes.setup_type).
+                if not intelligence_only:
+                    try:
+                        await kb.update_signal_decision_audit(
+                            memory_signal_id,
+                            allowed=True,
+                            reject_reasons=[],
+                            setup_type="SNIPER_GRID_VALIDATED",
+                        )
+                    except Exception:
+                        pass  # best-effort — não bloqueia a resposta
     elif allow:
         # ARM_TRIGGER com execução a mercado — geometria ancorada no referencePrice
         _ref_px = float(payload.get("referencePrice") or 0)
@@ -1526,6 +1539,9 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
             "symbol": symbol,
             "timestamp": int(time.time() * 1000),
             "sectorCluster": _sector_cluster(symbol),
+            # Elevação 1: flag de qualidade sniper — True apenas quando o sinal
+            # passou pelo filtro de score ≥ 0.65 E gerou escada de gatilhos.
+            "sniperQualityValidated": _decision == "ARM_TRIGGER_GRID",
         },
         "geometry": {
             "side": position_side,

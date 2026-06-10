@@ -35,7 +35,7 @@ from core.movement_sniper import evaluate_sniper_window, build_movement_features
 from core.signal_learning import finalize_due_signal_outcomes, score_signal_context
 from core.shadow_model import restore_shadow_model, shadow_model_status, train_shadow_model
 from core.shadow_sampler import reconcile_shadow_sampler_status, shadow_sampler_status, sample_shadow_signals_once
-from core.offline_learner import perform_daily_recalibration, offline_learner_status
+from core.offline_learner import perform_daily_recalibration, offline_learner_status, query_purified_samples_count
 from core.training_serving_skew import skew_status
 from core.exit_intelligence import evaluate_exit
 from core.exit_learning import record_exit_outcome as _record_exit_outcome, record_exit_evaluation, get_exit_stats
@@ -1852,6 +1852,60 @@ async def run_offline_learner_endpoint():
 async def offline_learner_status_endpoint():
     """Status completo do pipeline de re-treinamento autônomo."""
     return offline_learner_status()
+
+
+@app.get("/sniper/telemetry/stats")
+async def sniper_telemetry_stats_endpoint():
+    """
+    Elevação 3: Telemetria consolidada do Sniper Real.
+
+    Retorna visão unificada do ecossistema de qualidade sniper:
+      - purifiedSamplesCount: amostras puras do banco (signal_outcomes JOIN trade_outcomes)
+      - sniperGridValidatedCount: ARM_TRIGGER_GRID que passaram pelo quality gate
+      - activeModelInfo: estado atual do shadow model (accuracy, features, artifacts)
+      - offlineLearner: ciclos, outcomes processados, treinos disparados
+      - jobSupervisorMetrics: estado do job "offline_learner" no supervisor de 24h
+    """
+    purified_count = await query_purified_samples_count()
+    model_meta = shadow_model_status()
+    learner = offline_learner_status()
+    sup_status = job_supervisor.status()
+    learner_job = sup_status.get("jobs", {}).get("offline_learner", {})
+
+    return {
+        "status": "OPERATIONAL",
+        "timestamp": time.time(),
+        "telemetry": {
+            "purifiedSamplesCount": purified_count,
+            "sniperGridValidatedCount": int(learner.get("sniperGridValidatedCount") or 0),
+            "activeModelInfo": model_meta,
+            "databaseEngine": "SQLite (knowledge.db)",
+            "dbPath": str(kb.DB_PATH),
+        },
+        "offlineLearner": {
+            "enabled": learner.get("enabled"),
+            "cycles": learner.get("cycles"),
+            "outcomesRecorded": learner.get("outcomesRecorded"),
+            "outcomesSkipped": learner.get("outcomesSkipped"),
+            "outcomesAlreadyProcessed": learner.get("outcomesAlreadyProcessed"),
+            "trainingsTriggered": learner.get("trainingsTriggered"),
+            "lastRunAt": learner.get("lastRunAt"),
+            "lastError": learner.get("lastError"),
+            "lastTrainingResult": learner.get("lastTrainingResult"),
+            "checkpointTs": learner.get("checkpointTs"),
+        },
+        "jobSupervisorMetrics": {
+            "name": "offline_learner",
+            "running": learner_job.get("running", False),
+            "totalRuns": learner_job.get("runs", 0),
+            "consecutiveFailures": learner_job.get("consecutiveFailures", 0),
+            "lastStartedAt": learner_job.get("lastStartedAt", 0.0),
+            "lastFinishedAt": learner_job.get("lastFinishedAt", 0.0),
+            "lastDurationMs": learner_job.get("lastDurationMs", 0.0),
+            "intervalSeconds": learner_job.get("intervalSeconds"),
+            "priority": learner_job.get("priority"),
+        },
+    }
 
 
 @app.get("/audit/training-serving-skew")
