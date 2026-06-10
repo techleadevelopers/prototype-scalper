@@ -414,6 +414,19 @@ async def init_db():
     """Inicializa banco com todas as tabelas e migrações."""
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     async with connect(DB_PATH) as db:
+        # Fix 3 (WAL + Busy Timeout): ativa WAL mode antes de criar tabelas.
+        # WAL permite leituras concorrentes sem bloquear escritas — essencial para
+        # shadow_sampler.py + Node.js consumindo o banco simultaneamente.
+        # busy_timeout=5000 ms evita "database is locked" silencioso sob carga.
+        # synchronous=NORMAL: seguro com WAL (garante durabilidade sem fsync excessivo).
+        # cache_size=-32000 → 32 MB de cache em memória por conexão.
+        from core.database import using_postgres
+        if not using_postgres():
+            await db.execute("PRAGMA journal_mode=WAL")
+            await db.execute("PRAGMA busy_timeout=5000")
+            await db.execute("PRAGMA synchronous=NORMAL")
+            await db.execute("PRAGMA cache_size=-32000")
+            await db.commit()
         await db.executescript(CREATE_TABLES)
 
         # Migrações para tabelas existentes

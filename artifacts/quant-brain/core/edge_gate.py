@@ -765,6 +765,25 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
         except (TypeError, ValueError):
             pass
 
+    # Fix 4 (Early Expiry Fast-Path): shortcircuit ANTES de qualquer I/O de mercado.
+    # O judge_entry verificaria o mesmo em check #1, mas só após centenas de ms de
+    # computação cara: evaluate_sniper_window, feature extraction, ML inference, etc.
+    # intelligence_only não sofre shortcircuit pois serve para análise estática
+    # de contexto onde a expiração não é relevante para o caller.
+    if signal_expired and not intelligence_only:
+        return {
+            "decision": "WAIT",
+            "blocks": ["SIGNAL_EXPIRED: signal expired before pipeline evaluation"],
+            "mode": "expired",
+            "symbol": symbol,
+            "positionSide": position_side,
+            "expiresAt": expires_at_ms,
+            "signalId": request_signal_id,
+            "executionPriority": 0.0,
+            "aggressiveScore": 0.0,
+            "learningScore": 0.0,
+        }
+
     # ── Sentiment context ────────────────────────────────────────────────────
     sentiment_ctx = payload.get("sentimentContext") or {}
     sentiment_direction = str(sentiment_ctx.get("direction", "NEUTRAL")).upper()

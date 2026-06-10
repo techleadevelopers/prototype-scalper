@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 import time
-from collections import defaultdict
+from collections import defaultdict, Counter
 from typing import Any
 
 
@@ -193,7 +193,71 @@ def _thresholds(buckets: list[dict[str, Any]], strength: dict[str, Any]) -> dict
     }
 
 
-def _segment_penalties(rows: list[dict[str, Any]], key: str, min_rows: int, strength: dict[str, Any]) -> dict[str, float]:
+def _detect_regime_shift(rows: list[dict[str, Any]], recent_window: int = 30) -> dict[str, Any]:
+    """
+    Fix 5 (Regime-Aware Calibration): detecta mudança de regime comparando
+    a distribuição de regime nas últimas N amostras vs. o histórico completo.
+
+    Quando o regime mudou recentemente, penalidades geradas em regime anterior
+    (ex: consolidação) não devem punir entradas no novo regime (ex: tendência).
+
+    Retorna:
+      - in_transition: bool — regime recente difere do histórico dominante
+      - recent_regime: str — regime dominante nas últimas N amostras
+      - historical_regime: str — regime dominante em todo o histórico
+      - transition_factor: float — 0.35 se em transição, 1.0 se estável
+    """
+    if len(rows) < recent_window + 10:
+        return {"in_transition": False, "transition_factor": 1.0,
+                "recent_regime": "UNKNOWN", "historical_regime": "UNKNOWN"}
+
+    sorted_rows = sorted(rows, key=lambda r: float(r.get("timestamp") or r.get("createdAt") or 0))
+    recent_rows = sorted_rows[-recent_window:]
+
+    recent_counts: Counter = Counter(
+        str(r.get("regime") or "UNKNOWN").upper() for r in recent_rows
+    )
+    historical_counts: Counter = Counter(
+        str(r.get("regime") or "UNKNOWN").upper() for r in sorted_rows
+    )
+
+    recent_regime = recent_counts.most_common(1)[0][0] if recent_counts else "UNKNOWN"
+    historical_regime = historical_counts.most_common(1)[0][0] if historical_counts else "UNKNOWN"
+
+    # Considera transição quando: (a) regimes são diferentes E (b) o regime recente
+    # representa ≥ 60% das últimas N amostras (sinal sólido, não flutuação de ruído)
+    recent_dominant_pct = recent_counts.get(recent_regime, 0) / max(1, len(recent_rows))
+    in_transition = (
+        recent_regime != historical_regime
+        and recent_dominant_pct >= 0.60
+        and historical_regime != "UNKNOWN"
+    )
+
+    # Fator de suavização: 0.35 em transição (penalidade 65% menor),
+    # escalando de volta para 1.0 conforme histórico convergir.
+    transition_factor = 0.35 if in_transition else 1.0
+
+    return {
+        "in_transition": in_transition,
+        "transition_factor": transition_factor,
+        "recent_regime": recent_regime,
+        "historical_regime": historical_regime,
+        "recent_dominant_pct": _round(recent_dominant_pct, 4),
+    }
+
+
+def _segment_penalties(
+    rows: list[dict[str, Any]],
+    key: str,
+    min_rows: int,
+    strength: dict[str, Any],
+    transition_factor: float = 1.0,
+) -> dict[str, float]:
+    """
+    Fix 5: penalidades por segmento com fator de transição de regime.
+    Quando o regime mudou recentemente, `transition_factor` (< 1.0) suaviza
+    as penalidades para não matar entradas no início de tendências macro.
+    """
     grouped: dict[str, list[float]] = defaultdict(list)
     for row in rows:
         value = str(row.get(key) or "UNKNOWN").upper()
@@ -206,7 +270,9 @@ def _segment_penalties(rows: list[dict[str, Any]], key: str, min_rows: int, stre
         pf = _profit_factor(pnl) or 0.0
         avg = sum(pnl) / len(pnl)
         if avg < 0 or pf < 0.85:
-            penalties[value] = _round(min(0.20, (0.05 + abs(avg) * 0.02) * scale), 4) or 0.0
+            raw_penalty = min(0.20, (0.05 + abs(avg) * 0.02) * scale)
+            # Aplica fator de transição: suaviza penalidade quando regime mudou
+            penalties[value] = _round(raw_penalty * transition_factor, 4) or 0.0
     return penalties
 
 
@@ -300,6 +366,12 @@ def run_score_calibration(rows: list[dict[str, Any]]) -> dict[str, Any]:
     best_bucket, toxic_bucket = best_model["bestBucket"], best_model["toxicBucket"]
     recommended_min = thresholds["minAggressiveScore"]
     recommended_boost = thresholds["minBoostScore"]
+
+    # Fix 5 (Regime-Aware Calibration): detecta mudança de regime para suavizar
+    # penalidades geradas sob regime anterior (ex: consolidação que se tornou tendência).
+    regime_shift = _detect_regime_shift(normalized)
+    transition_factor = float(regime_shift["transition_factor"])
+
     score_truth = {
         "isMonotonic": float(best_model["monotonicityScore"] or 0) >= 0.70,
         "calibrationQuality": best_model["calibrationQuality"],
@@ -309,6 +381,11 @@ def run_score_calibration(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "toxicBucket": toxic_bucket,
         "recommendedMinScore": recommended_min,
         "recommendedBoostScore": recommended_boost,
+        # Fix 5: expõe estado de transição para calibrate_score e callers externos
+        "recentRegimeShift": regime_shift["in_transition"],
+        "recentRegime": regime_shift["recent_regime"],
+        "historicalRegime": regime_shift["historical_regime"],
+        "regimeTransitionFactor": transition_factor,
     }
     warnings = []
     if best_model["overconfidence"]:
@@ -317,6 +394,12 @@ def run_score_calibration(rows: list[dict[str, Any]]) -> dict[str, Any]:
         warnings.append(f"negative_expectancy_bucket:{toxic_bucket}")
     if len(normalized) < 50:
         warnings.append("learning_safety_observe_only")
+    if regime_shift["in_transition"]:
+        warnings.append(
+            f"regime_transition_detected:{regime_shift['historical_regime']}"
+            f"→{regime_shift['recent_regime']}"
+            f"(penalties×{transition_factor:.2f})"
+        )
 
     return {
         "generatedAt": time.time(),
@@ -327,13 +410,21 @@ def run_score_calibration(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "bestScoringModel": best_model["scoreField"],
         "recommendedThresholds": {
             **thresholds,
-            "scorePenaltyBySymbol": _segment_penalties(normalized, "symbol", 10, strength),
-            "scorePenaltyByPlaybook": _segment_penalties(normalized, "playbook", 10, strength),
-            "scorePenaltyByRegime": _segment_penalties(normalized, "regime", 10, strength),
+            # Fix 5: transition_factor reduz penalidades quando regime mudou
+            "scorePenaltyBySymbol": _segment_penalties(
+                normalized, "symbol", 10, strength, transition_factor
+            ),
+            "scorePenaltyByPlaybook": _segment_penalties(
+                normalized, "playbook", 10, strength, transition_factor
+            ),
+            "scorePenaltyByRegime": _segment_penalties(
+                normalized, "regime", 10, strength, transition_factor
+            ),
         },
         "overconfidenceWarnings": warnings,
         "scoreVsActualPnlChartData": _chart_data(best_model["buckets"]),
         "experiments": _experiment_quality(normalized, str(best_model["scoreField"])),
+        "regimeShift": regime_shift,
     }
 
 
@@ -341,7 +432,18 @@ def calibrate_score(raw_score: float, status: dict[str, Any]) -> float:
     truth = status.get("scoreTruth") or {}
     thresholds = status.get("recommendedThresholds") or {}
     ece = _num((status.get("models") or {}).get(status.get("bestScoringModel"), {}).get("expectedCalibrationError"), 0.0)
-    score = _clamp(raw_score - max(0.0, ece * 0.5))
+
+    # Fix 5 (Regime-Aware Calibration): quando em transição de regime, reduz o
+    # deságio ECE para não suprimir entradas no início de grandes movimentos macro.
+    # Fundamento: calibração feita em regime de consolidação não é válida
+    # para um bull/bear market nascente — ECE de buckets extremos sobe
+    # artificialmente por falta de dados naquele regime.
+    regime_shifting = bool(truth.get("recentRegimeShift", False))
+    ece_factor = 0.20 if regime_shifting else 0.50  # 0.20: deságio mínimo em transição
+    score = _clamp(raw_score - max(0.0, ece * ece_factor))
+
     if truth.get("overconfidence") and score >= _num(thresholds.get("minBoostScore"), 0.76):
-        score -= 0.06
+        # Fix 5: overconfidence penalty também suavizada em transição de regime
+        overconfidence_cut = 0.03 if regime_shifting else 0.06
+        score -= overconfidence_cut
     return _clamp(score)

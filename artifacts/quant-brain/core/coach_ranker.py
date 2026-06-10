@@ -220,6 +220,10 @@ def _soft_penalties(
         add(p, "sentiment_counter")
 
     # EV: 0-49 samples = pure learning, 50-149 = small penalty, 150+ = larger penalty
+    # Fix 1 (Cold Start Protection): penalidade proporcional à confiança estatística.
+    # Rampa suave: a(n) = min(1, (n-50)/100) → a=0 em n=50, a=1 em n≥150.
+    # Evita que sequências ruins iniciais destruam ativos promissores antes dos
+    # 150 samples necessários para evidência estatisticamente sólida.
     eff_stats = (
         signal_edge.get("context", {})
         if int((signal_edge.get("context") or {}).get("samples", 0)) >= int(signal_edge.get("minSamples", 8))
@@ -227,26 +231,30 @@ def _soft_penalties(
     )
     ev_samples = int(eff_stats.get("samples", 0))
     if 50 <= ev_samples < 150 and net_ev_usdt < 0:
-        p = min(0.12, abs(net_ev_usdt) * 0.30)
-        if p > 0:
-            add(p, f"ev_negative_emerging(n={ev_samples})")
+        _ev_confidence = min(1.0, (ev_samples - 50) / 100.0)  # 0→1 rampa
+        p = min(0.12, abs(net_ev_usdt) * 0.30) * _ev_confidence
+        if p > 0.005:  # threshold mínimo para evitar ruído
+            add(p, f"ev_negative_emerging(n={ev_samples},conf={_ev_confidence:.2f})")
     # 150+ samples is handled by judge_high_sample_context (hard block there)
 
     # Signal context quality degraded
+    # Fix 1: mínimo 50 samples (era 30) para declarar contexto tóxico com penalidade cheia
     se_samples = int((signal_edge.get("symbolSide") or {}).get("samples", 0))
     if signal_edge.get("verdict") == "toxic_context":
-        if se_samples >= 30 and float(signal_edge.get("score", 1.0)) < 0.20:
+        if se_samples >= 50 and float(signal_edge.get("score", 1.0)) < 0.20:
             add(0.12, f"signal_context_toxic(n={se_samples})")
-        else:
-            add(0.05, "signal_context_weak")
+        elif se_samples >= 15:
+            add(0.05, f"signal_context_weak(n={se_samples})")
+        # < 15 samples: sem penalidade — insuficiente para determinar toxicidade
 
     # Realized edge degraded (50-149 samples range; 150+ is handled by Judge)
     rec_samples = int((recommendation.get("stats", {}).get("symbolSide", {}) or {}).get("samples", 0))
     if 50 <= rec_samples < 150 and not recommendation.get("shadowRecommendation"):
         realized_score = float(recommendation.get("score", 0.5))
-        p = max(0.0, (0.5 - realized_score) * 0.20)
-        if p > 0:
-            add(p, f"realized_edge_weak(n={rec_samples})")
+        _rec_confidence = min(1.0, (rec_samples - 50) / 100.0)  # rampa 0→1
+        p = max(0.0, (0.5 - realized_score) * 0.20) * _rec_confidence
+        if p > 0.005:
+            add(p, f"realized_edge_weak(n={rec_samples},conf={_rec_confidence:.2f})")
 
     # Low Sharpe — only meaningful after 25+ real trades
     if len(recommendation.get("returns", [])) >= 25 and realized_sharpe < 0.3:
@@ -371,8 +379,13 @@ def score_candidate(
     rec_score = float(recommendation.get("score", 0.5))
 
     if rec_samples < 50:
-        learning_score = aggressive_score
-        blend = "learning_phase(n<50)"
+        # Fix 1: Bayesian smoothing toward neutral prior (0.50) at cold start.
+        # Evita que sequências ruins iniciais destruam ativos antes de atingir
+        # 50 amostras. À medida que amostras crescem, o peso do prior cai para 0.
+        # prior_weight = (1 - n/50) * 0.25  → max 25% prior em n=0, zero em n≥50.
+        _cold_start_prior_w = max(0.0, (1.0 - rec_samples / 50.0) * 0.25)
+        learning_score = (1.0 - _cold_start_prior_w) * aggressive_score + _cold_start_prior_w * 0.50
+        blend = f"cold_start_bayesian(n={rec_samples},prior={_cold_start_prior_w:.2f})"
     elif rec_samples < 150:
         w_real = 0.30
         learning_score = (1 - w_real) * aggressive_score + w_real * rec_score

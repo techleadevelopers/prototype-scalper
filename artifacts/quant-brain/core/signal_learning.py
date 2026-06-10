@@ -19,6 +19,10 @@ from layers.tactical import get_snapshot_history
 
 
 TARGETS_USDT = (0.5, 1.0, 2.0)
+# Fix 2 (ATR-Normalized Targets): multiplicadores do ATR para geração dinâmica
+# de targets por ativo. Substitui targets absolutos em USDT por percentuais
+# proporcionais à volatilidade real do ativo (0.30×ATR, 0.60×ATR, 1.00×ATR).
+ATR_TARGET_MULTIPLIERS = (0.30, 0.60, 1.00)
 OUTCOME_SECONDS = (30, 60, 120, 300)
 MIN_CONTEXT_SAMPLES = 12
 STRATEGY_VERSION = "sniper-v2"
@@ -71,6 +75,32 @@ def _side_from_decision(decision: str, fallback: str) -> str:
     if "SHORT" in upper:
         return "SHORT"
     return fallback.upper() if fallback else "UNKNOWN"
+
+
+def _atr_normalized_targets(
+    alt: "MovementFeatures",
+    margin_usdt: float,
+    leverage: float,
+) -> list[float]:
+    """
+    Fix 2 (ATR-Normalized Targets): gera targets adaptativos em USDT
+    proporcionais à volatilidade real do ativo via ATR.
+
+    BTC ($100k) com ATR de 0.8% → notional $100 → targets [0.24, 0.48, 0.80] USDT
+    TRUMP ($10) com ATR de 5.0% → notional $100  → targets [1.50, 3.00, 5.00] USDT
+
+    Substitui os targets fixos (0.5, 1.0, 2.0) por alvos proporcionais à
+    volatilidade do ativo, eliminando métricas de acerto artificialmente
+    infladas em ativos de micro-preço.
+
+    Garante floor de 0.02 USDT para evitar targets menores que o spread.
+    """
+    notional = max(1.0, margin_usdt * leverage)
+    atr_pct = max(0.10, float(getattr(alt, "atr_pct", None) or 0.50))
+    return [
+        max(0.02, (atr_pct * mult / 100.0) * notional)
+        for mult in ATR_TARGET_MULTIPLIERS
+    ]
 
 
 def _target_move_pct(
@@ -300,15 +330,28 @@ async def record_signal_from_gate(
     estimated_cost_pct = _estimated_cost_pct(alt, config)
     context_key = build_context_key(alt, btc)
 
-    # Target moves com otimização
+    # Fix 2 (ATR-Normalized Targets): usa targets dinâmicos baseados no ATR
+    # do ativo quando disponível; cai para TARGETS_USDT fixos como fallback.
+    atr_pct = float(getattr(alt, "atr_pct", None) or 0.0)
+    if atr_pct > 0.05:
+        # ATR disponível — targets adaptativos (elimina viés cross-asset)
+        active_targets = tuple(_atr_normalized_targets(alt, margin, leverage))
+        target_basis = "atr_normalized"
+    else:
+        # ATR indisponível — mantém targets fixos como fallback seguro
+        active_targets = TARGETS_USDT
+        target_basis = "usdt_fixed"
+
     target_moves = {
-        str(t): _target_move_pct(t, margin, leverage, estimated_cost_pct)
-        for t in TARGETS_USDT
+        str(round(t, 4)): _target_move_pct(t, margin, leverage, estimated_cost_pct)
+        for t in active_targets
     }
+    target_moves["_targetBasis"] = target_basis
+    target_moves["_atrPct"] = round(atr_pct, 4)
 
     # Target ótimo baseado em contexto
     optimal_target, optimal_score = _calculate_optimal_target(
-        alt, btc, list(TARGETS_USDT), margin, leverage
+        alt, btc, list(active_targets), margin, leverage
     )
     target_moves["optimal"] = _target_move_pct(optimal_target, margin, leverage, estimated_cost_pct)
     target_moves["optimal_target_usdt"] = optimal_target
