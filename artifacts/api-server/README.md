@@ -39,8 +39,9 @@ taxa de acerto ou PnL bruto.
 - Demo Lab reutiliza as credenciais da sessão de login e testa acesso somente em
   `https://open-api-vst.bingx.com`;
 - chamadas live usam somente `https://open-api.bingx.com`;
-- rotas de ordem real validam ambiente, confirmação explícita e identidade da
-  conta antes do envio;
+- rotas de ordem real validam ambiente e confirmação explícita antes do envio;
+- `LIVE_ACCOUNT_ID` é uma allowlist opcional de conta; quando vazio, a sessão
+  live verificada por API Key/Secret é a autoridade;
 - `SCALP_ALLOW_EXECUTION=false` mantém as rotas live em observação;
 - Demo Sniper possui loop server-side, monitor, campanhas e stacking controlado;
 - ordens VST usam `clientOrderId` determinístico, journal persistente e
@@ -125,14 +126,17 @@ As credenciais são copiadas para um campo de sessão separado com ambiente
 
 ### Administração
 
-`X-Admin-Token` protege operações administrativas, como:
+Operações administrativas aceitam uma sessão live verificada. `X-Admin-Token`
+é opcional e serve como fallback para automação server-to-server, como:
 
 - override/reset de configuração;
 - seleção/reset de modo;
 - pausa/reset da máquina de estado;
 - leitura do audit log de configuração.
 
-O token administrativo não deve ser colocado no bundle público do frontend.
+O token administrativo, quando usado, não deve ser colocado no bundle público do
+frontend. Fluxos normais do dashboard devem operar pela sessão Express criada em
+`/api/bingx/connect`.
 
 ## Barreiras De Execução Real
 
@@ -148,17 +152,24 @@ ADMIN_API_TOKEN=<token-operacional>
 SCALP_ALLOW_EXECUTION=false
 ```
 
+`LIVE_ACCOUNT_ID` e `ADMIN_API_TOKEN` são opcionais. Use `LIVE_ACCOUNT_ID`
+quando quiser travar o deploy em uma única identidade de conta declarada. Use
+`ADMIN_API_TOKEN` quando precisar controlar rotas administrativas sem sessão de
+navegador. Sem esses dois campos, uma sessão live verificada continua podendo
+administrar e operar.
+
 O startup é recusado quando:
 
 - `EXECUTION_ENV` não é `demo` ou `live`;
 - ambiente de credencial diverge do ambiente de execução;
 - demo tenta iniciar com `REAL_EXECUTION_ENABLED=true`;
-- live não possui confirmação, conta ou token;
+- live não possui confirmação explícita;
+- `ADMIN_API_TOKEN`, quando definido, tem menos de 32 caracteres;
 - live tenta carregar configuração persistida.
 
-Mesmo em deployment live, cada ordem chama `assertLiveExecutionAllowed()` e
-confere `LIVE_ACCOUNT_ID`. Ative `SCALP_ALLOW_EXECUTION=true` somente após
-validação operacional independente.
+Mesmo em deployment live, cada ordem chama `assertLiveExecutionAllowed()`. Se
+`LIVE_ACCOUNT_ID` estiver configurado, ele também é conferido. Ative
+`SCALP_ALLOW_EXECUTION=true` somente após validação operacional independente.
 
 ## Pipeline De Entrada
 
@@ -248,6 +259,28 @@ DEMO_STACKING_COOLDOWN_MS=60000
 DEMO_STACKING_MAX_CAMPAIGN_DRAWDOWN_PCT=5
 ```
 
+Perfil agressivo de laboratório restrito a VST/V-USDT:
+
+```env
+EXECUTION_ENV=demo
+BINGX_CREDENTIAL_ENV=demo
+REAL_EXECUTION_ENABLED=false
+SCALP_ALLOW_EXECUTION=true
+SCALP_SYMBOLS=V-USDT
+SCALP_POSITION_STACKING_ENABLED=true
+SCALP_MAX_POSITIONS_PER_SYMBOL=10
+SCALP_AUTOPILOT_INTERVAL_SEC=15
+SCALP_AUTOPILOT_MAX_CANDIDATES=12
+DEMO_SNIPER_GLOBAL_MAX=20
+DEMO_SNIPER_PER_SYMBOL_MAX=10
+DEMO_SNIPER_CYCLE_MS=15000
+DEMO_SNIPER_MONITOR_MS=6000
+EXPERIMENT_ARM=demo_learning_aggressive_vusdt
+```
+
+O formato de símbolo esperado pelo backend é o formato BingX com hífen, por
+exemplo `V-USDT`.
+
 Cada campanha recebe deterministicamente um cap de controle `1`, `3`, `5` ou
 `10`. Entradas de profundidade 2+ exigem:
 
@@ -329,7 +362,7 @@ retornar `502`, timeout ou não estiver escutando em `$PORT`.
 
 ## Telemetria E Persistência
 
-`telemetry.jsonl` contém outcomes operacionais. O motor adaptativo reconstrói:
+`telemetry.jsonl` contém outcomes operacionais por default. O motor adaptativo reconstrói:
 
 ```text
 symbol + side + hourUtc + btcRegime
@@ -337,11 +370,28 @@ symbol + side + hourUtc + btcRegime
 ```
 
 Dados VST adicionais ficam sob `data/`, incluindo journal de ordens, campanhas
-e outbox do Quant. Escritas críticas usam arquivo temporário + rename e/ou fila
-serializada.
+e outbox do Quant. Para campanhas, configure `DEMO_TRADE_DATA_DIR` ou
+`RUNTIME_DATA_DIR` para apontar esse ledger para um volume persistente.
+Escritas críticas usam arquivo temporário + rename e/ou fila serializada.
 
 Em cloud, use volume persistente. Sem volume, deploy/restart pode perder dados
 locais que ainda não foram enviados ao PostgreSQL/Quant Brain.
+
+```env
+RUNTIME_DATA_DIR=/data
+DEMO_TRADE_DATA_DIR=/data/demo-trades
+```
+
+O backend também possui store SQLite opcional para outcomes:
+
+```env
+OUTCOME_STORE=jsonl
+OUTCOME_SQLITE_PATH=
+```
+
+`OUTCOME_STORE=sqlite` só deve ser usado quando o driver `better-sqlite3` for
+instalado no ambiente. O runtime faz fallback seguro para JSONL quando o driver
+não existe.
 
 ## Variáveis Principais
 
@@ -383,11 +433,11 @@ não prova segurança para capital real.
 
 ```env
 POSITION_SIZING_ENABLED=true
-BASE_RISK_PCT=0.25
-MAX_RISK_PCT_PER_TRADE=0.75
-MAX_TOTAL_RISK_PCT=3
-MAX_SYMBOL_RISK_PCT=1
-MIN_MARGIN=1
+BASE_RISK_PCT=0.005
+MAX_RISK_PCT_PER_TRADE=0.015
+MAX_TOTAL_RISK_PCT=0.08
+MAX_SYMBOL_RISK_PCT=0.03
+MIN_MARGIN=5
 ```
 
 O sizing combina score calibrado, rotação, qualidade de execução, drawdown,
@@ -492,6 +542,19 @@ Build Command: pnpm run build
 Start Command: pnpm run start
 Healthcheck Path: /api/healthz
 ```
+
+Se o Railway estiver apontado para a raiz do repositório, os scripts raiz também
+funcionam:
+
+```text
+Root Directory: .
+Build Command: pnpm run build
+Start Command: pnpm run start
+Healthcheck Path: /api/healthz
+```
+
+Nesse modo, `backend` precisa permanecer listado no `pnpm-workspace.yaml` e o
+pacote deve manter o nome `@workspace/api-server`.
 
 Configure `SESSION_SECRET`, CORS e todos os segredos no gerenciador da cloud.
 `CORS_ORIGIN` aceita uma lista separada por vírgulas. Sem configuração, o
