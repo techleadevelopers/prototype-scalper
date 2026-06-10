@@ -6,6 +6,7 @@ Nível Excelência: cointegração, qualidade de dados, esgotamento de vol, liqu
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 import logging
 import math
@@ -1011,6 +1012,8 @@ def compute_mass_entry_zones(
     current = history[-1].get("price", 0)
     if current <= 0:
         return None
+    tp_pct = max(0.01, float(os.environ.get("SHADOW_SAMPLER_TAKE_PROFIT_PCT", "0.22")))
+    sl_pct = max(0.01, float(os.environ.get("SHADOW_SAMPLER_STOP_LOSS_PCT", "0.55")))
 
     weight_map = {1: [1.0], 2: [0.55, 0.45], 3: [0.40, 0.35, 0.25]}
     label_map  = {1: ["IMMEDIATE"], 2: ["IMMEDIATE", "LIMIT_1"],
@@ -1023,13 +1026,22 @@ def compute_mass_entry_zones(
         deviation = i * step_pct
         if side == "LONG":
             price = current * (1 - deviation / 100)
+            target_price = price * (1 + tp_pct / 100)
+            stop_price = price * (1 - sl_pct / 100)
         else:
             price = current * (1 + deviation / 100)
+            target_price = price * (1 - tp_pct / 100)
+            stop_price = price * (1 + sl_pct / 100)
         levels.append({
             "index": i,
+            "level": i + 1,
             "label": lbl,
             "price": round(price, 6),
+            "triggerPrice": round(price, 6),
+            "targetPrice": round(target_price, 6),
+            "stopPrice": round(stop_price, 6),
             "position_weight_pct": round(w * 100, 1),
+            "allocationFactor": round(w, 6),
             "trigger_deviation_pct": round(deviation, 2),
         })
 
