@@ -12,6 +12,7 @@ import { AdaptiveEngine } from "../lib/adaptiveEngine";
 import type { BtcRegime, ExitReason, PositionSide, TradeOutcome } from "../lib/adaptiveEngine";
 import { requireAdminAuthorization } from "../lib/executionSecurity";
 import { loadClosedTrades, type DemoClosedTrade } from "../lib/demoTradeStore";
+import { getTriggerStats } from "../lib/exhaustionTriggerManager";
 
 const router = Router();
 
@@ -190,6 +191,71 @@ export async function buildTelemetryState(source: TelemetrySourceFilter = "all")
 /** GET /api/telemetry/state — full adaptive engine state for dashboard */
 router.get("/telemetry/state", async (req: Request, res: Response) => {
   res.json(await buildTelemetryState(normalizeTelemetrySource(req.query.source)));
+});
+
+/**
+ * GET /api/telemetry/stats — métricas consolidadas de produção para o dashboard.
+ *
+ * Agrega: distribuição de outcomes, fill/expiry rate, win rate global,
+ * hold time médio, e estado do mux-lock.
+ *
+ * Nunca bloqueia: usa deadline de 500ms para o QB, falha silenciosa para
+ * dados não críticos.
+ */
+router.get("/telemetry/stats", async (_req: Request, res: Response) => {
+  const qbDeadlineMs = 500;
+  const [closedDemoTrades, quantSummary] = await Promise.all([
+    loadClosedTrades(5_000),
+    withDeadline(getQuantBrainTradeSummary(), null, qbDeadlineMs),
+  ]);
+
+  const triggerStats = getTriggerStats();
+  const localOutcomes = exportAllOutcomes();
+  const demoOutcomes = closedDemoTrades.map(demoClosedTradeToOutcome);
+  const allOutcomes = mergeOutcomes(demoOutcomes, localOutcomes);
+
+  // Distribuição de outcomes por PnL realizado
+  const won = allOutcomes.filter((o) => (o.realizedPnl ?? 0) > 0).length;
+  const stopped = allOutcomes.filter((o) => (o.realizedPnl ?? 0) <= 0 && o.exitTime).length;
+  const totalResolved = won + stopped;
+
+  // Hold time médio (ms → segundos)
+  const avgHoldMs =
+    allOutcomes.length > 0
+      ? allOutcomes.reduce((s, o) => s + (o.holdDurationMs ?? 0), 0) / allOutcomes.length
+      : 0;
+
+  // Taxa de maker (ordens que foram filled como maker, não taker)
+  const makerCount = allOutcomes.filter((o) => (o.entrySlippage ?? 0) <= 0).length;
+  const makerTaxEfficiencyPct =
+    allOutcomes.length > 0 ? Math.round((makerCount / allOutcomes.length) * 10000) / 100 : 0;
+
+  res.json({
+    summary: {
+      totalSignalsGenerated: triggerStats.totalArmed,
+      totalTradesExecuted: triggerStats.presumedFilled,
+      totalOutcomesClosed: totalResolved,
+      globalWinRate:
+        totalResolved > 0 ? Math.round((won / totalResolved) * 10000) / 10000 : null,
+    },
+    outcomeDistribution: {
+      FILLED_AND_WON: won,
+      FILLED_AND_STOPPED: stopped,
+      EXPIRED_UNFILLED: triggerStats.expired,
+      SECTOR_CASCADE_CANCELLED: triggerStats.sectorCascadeCancelled,
+      PENDING: triggerStats.pending,
+    },
+    efficiencyMetrics: {
+      fillRatePct: Math.round(triggerStats.fillRate * 10000) / 100,
+      expiryRatePct: Math.round(triggerStats.expiryRate * 10000) / 100,
+      makerTaxEfficiencyPct,
+      averageHoldTimeSeconds: Math.round(avgHoldMs / 100) / 10,
+    },
+    muxLock: triggerStats.muxLock,
+    activeSectors: triggerStats.activeSectors,
+    quantBrain: quantSummary ?? null,
+    generatedAt: Date.now(),
+  });
 });
 
 /** GET /api/telemetry/recommendation — adaptive gate recommendation only */

@@ -31,7 +31,69 @@
  *   EXPIRED_UNFILLED | PARTIAL_FILL_CANCELLED para retraining offline do QB.
  */
 
-import { appendFileSync } from "node:fs";
+import * as nodeFs from "node:fs";
+
+// ── System 3: Non-blocking async write queue for trigger_outcomes.jsonl ──────
+// PRODUÇÃO: appendFileSync bloquearia o event loop durante execução de trades.
+// A fila assíncrona garante que escritas em disco NUNCA atrasem ordens.
+const TRIGGER_OUTCOMES_MAX_LINES = Math.max(
+  1_000,
+  parseInt(process.env["TRIGGER_OUTCOMES_MAX_LINES"] ?? "50000", 10),
+);
+
+const _outcomesQueue: string[] = [];
+let _outcomesFlushing = false;
+let _outcomesTotalWritten = 0;
+
+function _enqueueOutcomeWrite(line: string): void {
+  _outcomesQueue.push(line);
+  _outcomesTotalWritten++;
+  if (!_outcomesFlushing) {
+    _outcomesFlushing = true;
+    setImmediate(_flushOutcomesQueue);
+  }
+}
+
+async function _flushOutcomesQueue(): Promise<void> {
+  const batch = _outcomesQueue.splice(0);
+  try {
+    if (batch.length === 0) return;
+    const dir = process.env["TELEMETRY_DIR"] ?? ".";
+    const path = `${dir}/trigger_outcomes.jsonl`;
+    await nodeFs.promises.appendFile(path, batch.join("\n") + "\n", "utf-8");
+    // Rotação: verifica a cada 500 linhas escritas para evitar leituras frequentes
+    if (_outcomesTotalWritten > 0 && _outcomesTotalWritten % 500 === 0) {
+      await _maybeRotateOutcomesFile(path);
+    }
+  } catch {
+    // Non-blocking — telemetry write failure must never affect trade execution
+  } finally {
+    _outcomesFlushing = false;
+    if (_outcomesQueue.length > 0) {
+      _outcomesFlushing = true;
+      setImmediate(_flushOutcomesQueue);
+    }
+  }
+}
+
+async function _maybeRotateOutcomesFile(path: string): Promise<void> {
+  try {
+    // Só lê o arquivo se ele ultrapassou ~5MB (≈50k linhas de ~100 bytes)
+    const stat = await nodeFs.promises.stat(path).catch(() => null);
+    if (!stat || stat.size < 5 * 1024 * 1024) return;
+    const content = await nodeFs.promises.readFile(path, "utf-8");
+    const lines = content.split("\n").filter((l) => l.trim().length > 0);
+    if (lines.length <= TRIGGER_OUTCOMES_MAX_LINES) return;
+    // Mantém as últimas MAX_LINES/2 entradas (comportamento de buffer circular)
+    const keepLines = Math.floor(TRIGGER_OUTCOMES_MAX_LINES / 2);
+    const trimmed = lines.slice(-keepLines).join("\n") + "\n";
+    const tmp = `${path}.rot.tmp`;
+    await nodeFs.promises.writeFile(tmp, trimmed, "utf-8");
+    await nodeFs.promises.rename(tmp, path);
+  } catch {
+    // Rotation failure is non-fatal
+  }
+}
 
 const TRIGGER_EXPIRATION_DEFAULT_MS =
   Math.max(5_000, parseInt(process.env["TRIGGER_EXPIRATION_SECONDS"] ?? "45", 10) * 1_000);
@@ -108,8 +170,8 @@ export function recordTriggerOutcome(
       tag,
       fillDurationMs: meta?.fillDurationMs,
     });
-    const dir = process.env["TELEMETRY_DIR"] ?? ".";
-    appendFileSync(`${dir}/trigger_outcomes.jsonl`, entry + "\n");
+    // Enfileira escrita assíncrona — nunca bloqueia o event loop durante execução de trades
+    _enqueueOutcomeWrite(entry);
   } catch {
     // Non-blocking — telemetry write failure must never affect execution
   }

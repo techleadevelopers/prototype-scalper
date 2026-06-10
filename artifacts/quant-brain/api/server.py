@@ -93,8 +93,10 @@ job_supervisor = JobSupervisor(
 _RETENTION_MAINTENANCE_SECONDS = float(
     os.environ.get("RETENTION_MAINTENANCE_SECONDS", "3600")
 )
+_VACUUM_INTERVAL_SECONDS = float(os.environ.get("VACUUM_INTERVAL_SECONDS", str(7 * 24 * 3600)))
 _last_model_training_attempt_samples = 0
 _last_retention_maintenance_at = 0.0
+_last_vacuum_at = 0.0
 _training_lock = asyncio.Lock()
 _training_task: asyncio.Task | None = None
 _training_status: dict[str, Any] = {
@@ -401,8 +403,17 @@ def cache_response(ttl_seconds: int = None):
 
 # ========== LIFESPAN ==========
 
+async def _background_vacuum():
+    """VACUUM SQLite em background — libera espaço físico após cleanup_retention."""
+    try:
+        await kb.vacuum_db()
+        log.info("DB VACUUM completed — espaço físico liberado")
+    except Exception as exc:
+        log.warning("DB VACUUM failed (non-critical): %s", exc)
+
+
 async def _run_model_maintenance_once():
-    global _last_model_training_attempt_samples, _last_retention_maintenance_at
+    global _last_model_training_attempt_samples, _last_retention_maintenance_at, _last_vacuum_at
 
     await restore_shadow_model()
     summary = await kb.get_signal_training_summary(decision_group=None, source_type=None)
@@ -431,8 +442,14 @@ async def _run_model_maintenance_once():
     if time.time() - _last_retention_maintenance_at >= _RETENTION_MAINTENANCE_SECONDS:
         deleted = await kb.cleanup_retention()
         _last_retention_maintenance_at = time.time()
+        total_deleted = sum(deleted.values())
         if any(deleted.values()):
-            log.info("Retention cleanup completed: %s", deleted)
+            log.info("Retention cleanup completed: %s (total=%d rows)", deleted, total_deleted)
+        # VACUUM: roda em background se houve deleção significativa E intervalo decorrido
+        # Intervalo padrão: 7 dias (VACUUM_INTERVAL_SECONDS). Não bloqueia endpoint algum.
+        if total_deleted >= 50 and time.time() - _last_vacuum_at >= _VACUUM_INTERVAL_SECONDS:
+            _last_vacuum_at = time.time()
+            asyncio.create_task(_background_vacuum())
 
 
 async def _run_signal_finalizer_once():
