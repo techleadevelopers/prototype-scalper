@@ -32,6 +32,7 @@
  */
 
 import * as nodeFs from "node:fs";
+import { syncQuantBrainTriggerOutcome } from "./quantBrainClient";
 
 // ── System 3: Non-blocking async write queue for trigger_outcomes.jsonl ──────
 // PRODUÇÃO: appendFileSync bloquearia o event loop durante execução de trades.
@@ -45,9 +46,11 @@ const _outcomesQueue: string[] = [];
 let _outcomesFlushing = false;
 let _outcomesTotalWritten = 0;
 
-function _enqueueOutcomeWrite(line: string): void {
+function _enqueueOutcomeWrite(outcome: Record<string, unknown>): void {
+  const line = JSON.stringify(outcome);
   _outcomesQueue.push(line);
   _outcomesTotalWritten++;
+  void syncQuantBrainTriggerOutcome(outcome);
   if (!_outcomesFlushing) {
     _outcomesFlushing = true;
     setImmediate(_flushOutcomesQueue);
@@ -157,7 +160,7 @@ export function recordTriggerOutcome(
   meta?: { fillDurationMs?: number },
 ): void {
   try {
-    const entry = JSON.stringify({
+    const entry = {
       ts: Date.now(),
       id: record.id,
       signalId: record.signalId,
@@ -169,7 +172,7 @@ export function recordTriggerOutcome(
       armedAt: record.armedAt,
       tag,
       fillDurationMs: meta?.fillDurationMs,
-    });
+    };
     // Enfileira escrita assíncrona — nunca bloqueia o event loop durante execução de trades
     _enqueueOutcomeWrite(entry);
   } catch {
@@ -417,14 +420,14 @@ export function recordFillOutcome(
 
   const tag: TriggerOutcomeTag = exitReason === "TP" ? "FILLED_AND_WON" : "FILLED_AND_STOPPED";
   try {
-    const entry = JSON.stringify({
+    const entry = {
       ts: Date.now(),
       signalId,
       symbol,
       direction,
       tag,
       realizedPnl,
-    });
+    };
     _enqueueOutcomeWrite(entry);
   } catch {
     // Non-blocking — telemetry write failure must never affect trade execution
