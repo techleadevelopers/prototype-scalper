@@ -10,7 +10,7 @@ import { logger } from "./logger";
 
 export const QUANT_BRAIN_CONTRACT_VERSION = "edge-v3";
 export const DEFAULT_FEATURE_VERSION = "sniper-v1";
-const SUPPORTED_FEATURE_VERSIONS = new Set(["sniper-v1", "candle-edge-v1"]);
+const SUPPORTED_FEATURE_VERSIONS = new Set(["sniper-v1", "candle-edge-v1", "trigger-deviation-v1"]);
 const MAX_PREDICTION_AGE_MS = Math.max(
   1_000,
   Number(process.env["QUANT_BRAIN_MAX_PREDICTION_AGE_MS"] ?? 15_000),
