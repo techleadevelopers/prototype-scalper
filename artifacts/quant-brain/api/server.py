@@ -537,9 +537,22 @@ async def _initialize_runtime_services():
         lambda: analyze_macro_candle_regime(engine, SYMBOLS),
         interval_seconds=_MACRO_CANDLE_ANALYSIS_SECONDS,
         timeout_seconds=_MACRO_CANDLE_JOB_TIMEOUT_SECONDS,
-        priority="low",
-        run_immediately=False,
+        priority="normal",
+        run_immediately=True,
     )
+
+    # Warm-up: run macro candle analysis immediately in the background so the
+    # Neural / Monitor BTC panel shows real data from the first request instead
+    # of waiting for the 900s job cycle or a skipped low-priority slot.
+    async def _warmup_macro_candle():
+        await asyncio.sleep(3)
+        try:
+            await analyze_macro_candle_regime(engine, SYMBOLS)
+            log.info("Macro candle warm-up completed")
+        except Exception as exc:
+            log.warning("Macro candle warm-up failed: %s", exc)
+
+    _tasks.append(asyncio.create_task(_warmup_macro_candle()))
 
     sampler_interval = max(15, int(float(os.environ.get("SHADOW_SAMPLER_INTERVAL_SECONDS", "60"))))
     job_supervisor.register(
@@ -874,7 +887,42 @@ async def get_anomalies():
 @cache_response(ttl_seconds=15)
 async def get_macro_candle_regime():
     """15m heavy candle regime: 1h/4h/1d bias and correction risk."""
-    return candle_regime_status()
+    status = candle_regime_status()
+    # Flatten BTC-USDT fields so the Monitor BTC dashboard panel can read them
+    # without parsing the nested symbols dict.
+    btc = (status.get("symbols") or {}).get("BTC-USDT", {})
+    frames = btc.get("frames") or {}
+    f1h = frames.get("1h", {})
+    f4h = frames.get("4h", {})
+    f1d = frames.get("1d", {})
+    cr_raw = btc.get("correctionRisk", 0.0)
+    try:
+        cr_float = float(cr_raw)
+    except Exception:
+        cr_float = 0.0
+    if cr_float >= 0.75:
+        correction_risk_label = "CRITICAL"
+    elif cr_float >= 0.55:
+        correction_risk_label = "HIGH"
+    elif cr_float >= 0.35:
+        correction_risk_label = "MEDIUM"
+    else:
+        correction_risk_label = "LOW"
+    return {
+        **status,
+        # Flat BTC-specific aliases consumed by the Neural / Monitor BTC panel
+        "bias_1h": f1h.get("trend", "—"),
+        "hourBias": f1h.get("trend", "—"),
+        "bias_4h": f4h.get("trend", "—"),
+        "h4Bias": f4h.get("trend", "—"),
+        "bias_1d": f1d.get("trend", "—"),
+        "dailyBias": f1d.get("trend", "—"),
+        "correction_risk": correction_risk_label,
+        "correctionRisk": correction_risk_label,
+        "regime": btc.get("action", "—"),
+        "candleRegime": btc.get("action", "—"),
+        "btcBias": btc.get("bias", "—"),
+    }
 
 
 # ========== SNIPER ==========
@@ -890,11 +938,19 @@ async def get_btc_commander(window_seconds: int = Query(int(os.environ.get("SNIP
         history,
         window_seconds,
     )
+    cmd = classify_btc_commander(features)
+    # Add aliases so the dashboard can read both field names
+    cmd["classification"] = cmd.get("state", "—")
+    cmd["class"] = cmd.get("state", "—")
+    feat = dict(features.__dict__)
+    # momentum_5m alias for price_change_pct (used by Monitor BTC panel)
+    feat["momentum_5m"] = feat.get("price_change_pct")
+    feat["momentumPct"] = feat.get("price_change_pct")
     return {
         "timestamp": time.time(),
         "windowSeconds": window_seconds,
-        "commander": classify_btc_commander(features),
-        "features": features.__dict__,
+        "commander": cmd,
+        "features": feat,
     }
 
 
@@ -1708,10 +1764,22 @@ async def train_sniper_model_status_endpoint():
     }
 
 
+def _sanitize_floats(obj: Any) -> Any:
+    """Recursively replace inf/nan float values with None for JSON compliance."""
+    import math
+    if isinstance(obj, float):
+        return None if (math.isnan(obj) or math.isinf(obj)) else obj
+    if isinstance(obj, dict):
+        return {k: _sanitize_floats(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize_floats(v) for v in obj]
+    return obj
+
+
 @app.get("/models/sniper/status")
 @cache_response(ttl_seconds=10)
 async def sniper_model_status_endpoint():
-    status = shadow_model_status()
+    status = _sanitize_floats(shadow_model_status())
     progress, pipeline, sources, recent_shadow = await asyncio.gather(
         kb.get_signal_training_summary(decision_group=None, source_type=None),
         kb.get_signal_pipeline_summary(),
@@ -1733,7 +1801,7 @@ async def sniper_model_status_endpoint():
     samples_needed = max(0, _MIN_TRAINING_SAMPLES - samples - pending)
     eta_hours = round(samples_needed / samples_per_hour, 2) if samples_per_hour > 0 else None
 
-    return {
+    return _sanitize_floats({
         **status,
         "samples": int(status.get("samples", samples) or samples),
         "trainingSamplesAvailable": samples,
@@ -1754,7 +1822,7 @@ async def sniper_model_status_endpoint():
             "recordedTotal": recorded,
             "cycles": cycles,
         },
-    }
+    })
 
 
 @app.get("/signals/shadow-sampler/status")
