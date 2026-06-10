@@ -31,6 +31,74 @@ def _sector_cluster(sym: str) -> str:
     return _SECTOR_CLUSTERS.get(sym, "OTHER")
 
 
+def build_sniper_tail_grid(
+    current_price: float,
+    side: str,
+    base_target_usdt: float,
+    atr_pct: float = 0.0,
+) -> list[dict]:
+    """
+    Gera a escada de gatilhos Tail Hunter para caça de pavios (espetos extremos).
+
+    Geometria ancorada no preço atual de mercado — não no ponto de exaustão da
+    microframe — para que os drops/pumps sejam absolutos em relação ao preço real.
+
+    LONG : entra em quedas de 10%, 11%, 12% — 3 níveis, pirâmide 20/30/50%
+    SHORT: entra em altas de 20%, 21%, 22%, 24% — 4 níveis, pesos 15/25/30/30%
+
+    TP dinâmico: base_target_usdt / trigger_price × 100
+      → mesmo scaling do single-trigger; clamped 0.08%–3.00% (production-safe
+        para qualquer faixa de preço, de $0.0001 a $200k por unidade).
+      → aplica floor ATR se disponível (min 40% do ATR para ser atingível).
+    SL rigoroso: 2× TP (relação 2:1 perda:ganho na margem isolada).
+    """
+    if current_price <= 0 or base_target_usdt <= 0:
+        return []
+
+    grid_layers: list[dict] = []
+
+    def _level_geometry(trigger_p: float) -> tuple[float, float]:
+        """Retorna (tp_pct, sl_pct) clamped — idêntico ao single-trigger scaler."""
+        raw_tp = (base_target_usdt / trigger_p) * 100
+        if atr_pct > 0:
+            raw_tp = max(raw_tp, atr_pct * 0.40)  # mínimo 40% do ATR
+        tp = max(0.08, min(3.00, raw_tp))
+        sl = tp * 2.0
+        return tp, sl
+
+    if side == "LONG":
+        drop_percentages   = [0.10, 0.11, 0.12]
+        allocation_weights = [0.20, 0.30, 0.50]
+        for idx, drop in enumerate(drop_percentages):
+            trigger_p = current_price * (1.0 - drop)
+            tp_pct, sl_pct = _level_geometry(trigger_p)
+            grid_layers.append({
+                "level":            idx + 1,
+                "side":             "LONG",
+                "triggerPrice":     round(trigger_p, 6),
+                "targetPrice":      round(trigger_p * (1.0 + tp_pct / 100), 6),
+                "stopPrice":        round(trigger_p * (1.0 - sl_pct / 100), 6),
+                "allocationFactor": allocation_weights[idx],
+            })
+
+    elif side == "SHORT":
+        pump_percentages   = [0.20, 0.21, 0.22, 0.24]
+        allocation_weights = [0.15, 0.25, 0.30, 0.30]
+        for idx, pump in enumerate(pump_percentages):
+            trigger_p = current_price * (1.0 + pump)
+            tp_pct, sl_pct = _level_geometry(trigger_p)
+            grid_layers.append({
+                "level":            idx + 1,
+                "side":             "SHORT",
+                "triggerPrice":     round(trigger_p, 6),
+                "targetPrice":      round(trigger_p * (1.0 - tp_pct / 100), 6),
+                "stopPrice":        round(trigger_p * (1.0 + sl_pct / 100), 6),
+                "allocationFactor": allocation_weights[idx],
+            })
+
+    return grid_layers
+
+
 def _compute_recommended_leverage(atr_pct_fraction: float) -> int:
     """ATR-adaptive leverage: volatilidade alta → alavancagem menor.
 
@@ -1270,34 +1338,20 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
             _stop_px   = round(_trigger_px * (1 + _sl_pct / 100), 6)
         _decision = "ARM_TRIGGER"
 
-        # ── Tail Hunter upgrade: escala para ARM_TRIGGER_GRID quando volatilidade
-        # justifica uma escada de gatilhos para caça de pavios.
-        # Condições: ENABLE_GRID_SNIPER=true + regime HIGH/EXTREME + ATR ≥ 0.30%.
-        if _ENABLE_GRID_SNIPER and volatility_regime in ("HIGH", "EXTREME") and _atr_pct_for_scale >= 0.30:
-            _grid_step_pct = max(0.25, _atr_pct_for_scale * 0.45)   # espaço entre níveis
-            _grid_tp_pct   = max(0.10, _atr_pct_for_scale * 0.35)   # alvo por nível (bounce curto)
-            _grid_sl_pct   = _grid_tp_pct * 2.2                       # stop: 2.2× do TP
-            _allocations   = [0.20, 0.30, 0.50]                       # pirâmide: mais fundo = mais pesado
-            for _i, _alloc in enumerate(_allocations):
-                if position_side == "LONG":
-                    _lv_trigger = round(_trigger_px * (1 - (_i * _grid_step_pct / 100)), 6)
-                    _lv_target  = round(_lv_trigger * (1 + _grid_tp_pct / 100), 6)
-                    _lv_stop    = round(_lv_trigger * (1 - _grid_sl_pct / 100), 6)
-                    _lv_side    = "LONG"
-                else:
-                    _lv_trigger = round(_trigger_px * (1 + (_i * _grid_step_pct / 100)), 6)
-                    _lv_target  = round(_lv_trigger * (1 - _grid_tp_pct / 100), 6)
-                    _lv_stop    = round(_lv_trigger * (1 + _grid_sl_pct / 100), 6)
-                    _lv_side    = "SHORT"
-                _grid_levels.append({
-                    "level": _i + 1,
-                    "side": _lv_side,
-                    "triggerPrice": _lv_trigger,
-                    "targetPrice": _lv_target,
-                    "stopPrice": _lv_stop,
-                    "allocationFactor": _alloc,
-                })
-            _decision = "ARM_TRIGGER_GRID"
+        # ── Tail Hunter upgrade (produção real) ────────────────────────────────
+        # Condição: ENABLE_GRID_SNIPER=true + score de exaustão microframe ≥ 0.65
+        # Âncora: referencePrice (preço de mercado live) — drops/pumps absolutos,
+        # independentes da microframe. TP dinâmico por base_target_usdt.
+        _exec_priority = float(coaching["executionPriority"])
+        if _ENABLE_GRID_SNIPER and _exec_priority >= 0.65 and _ref_price_for_scale > 0:
+            _grid_levels = build_sniper_tail_grid(
+                current_price=_ref_price_for_scale,
+                side=position_side,
+                base_target_usdt=_base_target_usdt,
+                atr_pct=_atr_pct_for_scale,
+            )
+            if _grid_levels:
+                _decision = "ARM_TRIGGER_GRID"
     elif allow:
         # ARM_TRIGGER com execução a mercado — geometria ancorada no referencePrice
         _ref_px = float(payload.get("referencePrice") or 0)

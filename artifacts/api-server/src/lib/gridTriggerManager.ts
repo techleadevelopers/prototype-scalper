@@ -123,75 +123,95 @@ export async function processGridTrigger(params: {
     }
   }
 
+  const now = Date.now();
+  updateWatcherCreds(creds);
+
+  // ── Fase 1: Disparo em lote paralelo ─────────────────────────────────────────
+  // Todas as ordens LIMIT são enviadas simultaneamente para minimizar latência.
+  // A BingX recebe N requisições em paralelo — reduz janela de slippage entre
+  // o primeiro e o último nível em mercados velozes.
+  const bxSide = positionSide === "LONG" ? "BUY" : "SELL";
+
+  type LevelPlacementResult =
+    | { ok: true; level: GridLevel; orderId: string; qty: number; levelMargin: number }
+    | { ok: false; level: GridLevel };
+
+  const placements = await Promise.all(
+    grid.map(async (level): Promise<LevelPlacementResult> => {
+      const levelMargin = totalMargin * Math.max(0.01, Math.min(1.0, level.allocationFactor));
+      const qty = Math.floor((levelMargin * gridLeverage) / level.triggerPrice * 1_000) / 1_000;
+
+      if (qty <= 0) {
+        logger.warn({ msg: "GRID_LEVEL_QTY_ZERO", symbol, level: level.level, levelMargin, gridLeverage, triggerPrice: level.triggerPrice });
+        return { ok: false, level };
+      }
+
+      try {
+        const data = await bingxPost(
+          "/openApi/swap/v2/trade/order",
+          {
+            symbol,
+            side: bxSide,
+            positionSide,
+            type: "LIMIT",
+            quantity: qty,
+            price: level.triggerPrice,
+            leverage: gridLeverage,
+            timeInForce: "GTX",           // Post-Only — Maker garantido
+            stopLoss: level.stopPrice,
+            takeProfit: level.targetPrice,
+          },
+          creds.apiKey,
+          creds.secretKey,
+        );
+
+        if (data.code !== 0) {
+          logger.error({ msg: "GRID_ORDER_REJECTED", symbol, level: level.level, code: data.code, bxMsg: data.msg });
+          return { ok: false, level };
+        }
+
+        const order = ((data.data as Record<string, unknown>)?.order ?? {}) as Record<string, unknown>;
+        const orderId = String(order.orderId ?? "");
+
+        if (!orderId) {
+          logger.error({ msg: "GRID_ORDER_NO_ID", symbol, level: level.level });
+          return { ok: false, level };
+        }
+
+        logger.info({
+          msg: "GRID_LEVEL_PLACED",
+          symbol, level: level.level,
+          triggerPrice: level.triggerPrice,
+          targetPrice: level.targetPrice,
+          stopPrice: level.stopPrice,
+          allocationFactor: level.allocationFactor,
+          qty, orderId, gridStrategy,
+        });
+
+        return { ok: true, level, orderId, qty, levelMargin };
+      } catch (err) {
+        logger.error({ msg: "GRID_ORDER_EXCEPTION", symbol, level: level.level, err: String(err) });
+        return { ok: false, level };
+      }
+    }),
+  );
+
+  // ── Fase 2: Armar TTL + registrar no watcher (sequencial, sem I/O) ───────────
   const orderIds: string[] = [];
   const triggerIds: string[] = [];
   let levelsArmed = 0;
   let levelsFailed = 0;
-  const now = Date.now();
+  const deployedOrderIds: string[] = [];
 
-  updateWatcherCreds(creds);
+  for (const result of placements) {
+    if (!result.ok) { levelsFailed++; continue; }
+    const { level, orderId, qty, levelMargin } = result;
 
-  for (const level of grid) {
-    const levelMargin = totalMargin * Math.max(0.01, Math.min(1.0, level.allocationFactor));
-    const qty = Math.floor((levelMargin * gridLeverage) / level.triggerPrice * 1_000) / 1_000;
+    orderIds.push(orderId);
+    deployedOrderIds.push(orderId);
 
-    if (qty <= 0) {
-      logger.warn({ msg: "GRID_LEVEL_QTY_ZERO", symbol, level: level.level, levelMargin, gridLeverage, triggerPrice: level.triggerPrice });
-      levelsFailed++;
-      continue;
-    }
-
-    let placedOrderId: string | undefined;
-
-    try {
-      const bxSide = positionSide === "LONG" ? "BUY" : "SELL";
-      const data = await bingxPost(
-        "/openApi/swap/v2/trade/order",
-        {
-          symbol,
-          side: bxSide,
-          positionSide,
-          type: "LIMIT",
-          quantity: qty,
-          price: level.triggerPrice,
-          leverage: gridLeverage,
-          timeInForce: "GTX",             // Post-Only — Maker garantido
-          stopLoss: level.stopPrice,
-          takeProfit: level.targetPrice,
-        },
-        creds.apiKey,
-        creds.secretKey,
-      );
-
-      if (data.code !== 0) {
-        logger.error({
-          msg: "GRID_ORDER_REJECTED",
-          symbol, level: level.level,
-          code: data.code, bxMsg: data.msg,
-        });
-        levelsFailed++;
-        continue;
-      }
-
-      const order = ((data.data as Record<string, unknown>)?.order ?? {}) as Record<string, unknown>;
-      placedOrderId = String(order.orderId ?? "");
-
-      if (!placedOrderId) {
-        logger.error({ msg: "GRID_ORDER_NO_ID", symbol, level: level.level });
-        levelsFailed++;
-        continue;
-      }
-    } catch (err) {
-      logger.error({ msg: "GRID_ORDER_EXCEPTION", symbol, level: level.level, err: String(err) });
-      levelsFailed++;
-      continue;
-    }
-
-    orderIds.push(placedOrderId);
-
-    // ── Arm expiry timer for this level ──────────────────────────────────────
     const triggerId = armLimitOrderExpiry({
-      orderId: placedOrderId,
+      orderId,
       symbol,
       direction: positionSide,
       triggerPrice: level.triggerPrice,
@@ -202,7 +222,7 @@ export async function processGridTrigger(params: {
       cancelFn: async () => {
         await bingxPost(
           "/openApi/swap/v2/trade/cancel",
-          { symbol, orderId: placedOrderId },
+          { symbol, orderId },
           creds.apiKey,
           creds.secretKey,
         ).catch(() => {});
@@ -211,7 +231,7 @@ export async function processGridTrigger(params: {
         try {
           const r = await bingxGet(
             "/openApi/swap/v2/trade/queryOrder",
-            { symbol, orderId: placedOrderId },
+            { symbol, orderId },
             creds.apiKey,
             creds.secretKey,
           );
@@ -228,7 +248,7 @@ export async function processGridTrigger(params: {
       onPartialFill: (filledQty: number, origQty: number) => {
         logger.warn({
           msg: "GRID_PARTIAL_FILL",
-          symbol, level: level.level, orderId: placedOrderId,
+          symbol, level: level.level, orderId,
           filledQty, origQty,
           ratio: origQty > 0 ? (filledQty / origQty).toFixed(3) : "?",
         });
@@ -238,7 +258,6 @@ export async function processGridTrigger(params: {
     triggerIds.push(triggerId);
     levelsArmed++;
 
-    // ── Register each level in livePositionWatcher ────────────────────────────
     const tpDistPct = positionSide === "LONG"
       ? ((level.targetPrice - level.triggerPrice) / level.triggerPrice) * 100
       : ((level.triggerPrice - level.targetPrice) / level.triggerPrice) * 100;
@@ -247,10 +266,10 @@ export async function processGridTrigger(params: {
       : ((level.stopPrice - level.triggerPrice) / level.triggerPrice) * 100;
 
     registerLiveEntry({
-      entryOrderId: placedOrderId,
+      entryOrderId: orderId,
       symbol,
       positionSide,
-      side: positionSide === "LONG" ? "BUY" : "SELL",
+      side: bxSide,
       expectedEntryPrice: level.triggerPrice,
       qty,
       leverage: gridLeverage,
@@ -270,12 +289,28 @@ export async function processGridTrigger(params: {
       msg: "GRID_LEVEL_ARMED",
       symbol, level: level.level,
       triggerPrice: level.triggerPrice,
-      targetPrice: level.targetPrice,
-      stopPrice: level.stopPrice,
-      allocationFactor: level.allocationFactor,
-      qty, orderId: placedOrderId, triggerId,
+      qty, orderId, triggerId,
       gridStrategy, expirationSeconds,
     });
+  }
+
+  // ── Fase 3: TTL coletivo — limpeza de ordens fantasmas ───────────────────────
+  // Após o expirationMs, cancela em lote paralelo todos os deployedOrderIds que
+  // ainda estiverem na pedra. Garantia extra além dos cancelFn individuais.
+  if (deployedOrderIds.length > 0) {
+    setTimeout(() => {
+      logger.info({ msg: "GRID_TTL_MASS_CANCEL", symbol, positionSide, orderCount: deployedOrderIds.length, gridStrategy });
+      void Promise.all(
+        deployedOrderIds.map((oid) =>
+          bingxPost(
+            "/openApi/swap/v2/trade/cancel",
+            { symbol, orderId: oid },
+            creds.apiKey,
+            creds.secretKey,
+          ).catch(() => {}),
+        ),
+      );
+    }, expirationMs);
   }
 
   // ── Background Fill Detector — Single-Fill Guard ───────────────────────────
