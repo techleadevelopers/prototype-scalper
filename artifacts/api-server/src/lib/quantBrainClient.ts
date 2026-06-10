@@ -604,7 +604,8 @@ async function requestJson<T>(
     && ((init.method ?? "GET") === "GET"
       || path === "/edge/evaluate"
       || path === "/kb/trades"
-      || path === "/kb/trades/batch");
+      || path === "/kb/trades/batch"
+      || path === "/trigger-outcomes");
   const attempts = retryable ? 2 : 1;
   const attemptTimeoutMs = Math.max(1_000, timeoutMs);
   let lastError: unknown;
@@ -891,6 +892,21 @@ export async function syncQuantBrainOutcome(
     };
   }
   });
+}
+
+export async function syncQuantBrainTriggerOutcome(
+  outcome: Record<string, unknown>,
+): Promise<{ synced: boolean; error?: string }> {
+  if (!quantBrainEnabled()) return { synced: false, error: "disabled" };
+  try {
+    await postJson<unknown>("/trigger-outcomes", outcome, 10_000);
+    return { synced: true };
+  } catch (err) {
+    return {
+      synced: false,
+      error: err instanceof Error ? err.message : "unknown error",
+    };
+  }
 }
 
 function persistBatchAckFailure(outcome: TradeOutcome, ack: z.infer<typeof OutcomeBatchAckItemSchema>): void {
