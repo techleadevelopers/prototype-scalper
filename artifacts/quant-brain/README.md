@@ -715,6 +715,103 @@ cd quant-brain
 py -3.12 -m pytest -q tests/test_sniper_reconciliation.py tests/test_shadow_lifecycle.py -p no:cacheprovider
 ```
 
+## Implementações Recentes
+
+### Payload `edge-v3` Estendido (`core/edge_gate.py`)
+
+Três novos objetos estruturados adicionados à resposta — retrocompatibilidade total com campos planos anteriores:
+
+| Campo | Conteúdo |
+|---|---|
+| `geometry` | `{ side, triggerPrice, targetPrice, stopPrice, expirationSeconds }` |
+| `probabilityModel` | `{ confidence, edgeScore, expectedValue, kellyFraction }` |
+| `metadata` | `{ signalId, symbol, timestamp, sectorCluster }` |
+| `executionMetrics` | estendido com `baseTargetUsdt`, `calculatedTpPct`, `calculatedSlPct`, `appliedFilters`, `gridStrategy` |
+| `appliedFilters` | ex: `["ATR_SHADOW_PASSED", "FUNDING_WINDOW_PASSED", "DATA_SYNC_PASSED"]` |
+
+**Expiry fast-path:** quando `signal_expired=True`, retorna imediatamente `WAIT` antes de tocar feature extraction, ML inference ou I/O de mercado — corta centenas de ms por chamada.
+
+### Estratégia `ARM_TRIGGER_GRID` — Tail Hunter (`core/edge_gate.py`)
+
+Nova decisão gerada quando `ENABLE_GRID_SNIPER=true` e `executionPriority >= 0.65`:
+
+- Gera `N` níveis de escada com geometria production-safe ancorada na `referencePrice`.
+- **LONG:** drops −10%, −11%, −12%; alocações 20% / 30% / 50%.
+- **SHORT:** pumps +20%, +21%, +22%, +24%; alocações 15% / 25% / 30% / 30%.
+- TP clamped 0.08%–3.00% (seguro de $0.0001 a $200k por unidade); SL = 2× TP.
+- `metadata.sniperQualityValidated = true` sinaliza o Node.js e o Dashboard.
+- Amostras marcadas no banco com `setup_type = "SNIPER_GRID_VALIDATED"` para treino offline puro.
+- `_grid_levels` incluído na resposta; `executionMetrics` inclui `gridStrategy: "TAIL_HUNTER"`.
+
+```env
+ENABLE_GRID_SNIPER=true
+```
+
+### History Logger (`core/history_logger.py`)
+
+Filtro de qualidade para persistência de sinais ARM_TRIGGER em `data/signal_snapshots.jsonl`:
+
+- Só persiste se `decision == ARM_TRIGGER` (ou `ARM_TRIGGER_GRID`), geometria completa (3 preços), `signalId` presente e `SIGNAL_SNAPSHOTS_ENABLED=true`.
+- Thread background com fila em memória — nunca bloqueia o event loop do FastAPI.
+- Escrita atômica (`.tmp` → rename) + rotação automática a 100k linhas.
+- Dataset limpo separado dos outcomes, pronto para treino offline.
+
+### Offline Learner (`core/offline_learner.py`)
+
+`query_purified_samples_count()` lê direto do `knowledge.db`:
+
+```sql
+SELECT COUNT(*) FROM signal_outcomes s
+JOIN trade_outcomes t ON s.source_id = t.outcome_source_id
+WHERE s.allowed = 1 AND t.pnl_usdt IS NOT NULL
+```
+
+Path separado conta apenas `setup_type = 'SNIPER_GRID_VALIDATED'` para rastrear quantos `ARM_TRIGGER_GRID` viraram trades reais.
+
+### Correções de Performance e Qualidade
+
+**Coach Ranker (`core/coach_ranker.py`) — morte por inércia eliminada:**
+- Rampa de confiança `a(n) = min(1, (n-50)/100)` — em n=50, penalidade zero; em n=150, penalidade plena.
+- Bayesian cold-start floor: `learning_score` mistura 25% do prior neutro (0.50) em n=0, decaindo para 0% em n=50.
+- Threshold tóxico elevado de 30→50 amostras para penalidade cheia.
+
+**Signal Learning (`core/signal_learning.py`) — targets ATR-normalizados:**
+- `_atr_normalized_targets()` gera `[0.30×ATR, 0.60×ATR, 1.00×ATR]` convertidos para USDT via notional.
+- Fallback automático para `TARGETS_USDT` se ATR indisponível.
+
+**Knowledge Base (`core/knowledge_base.py`) — WAL Mode:**
+- `init_db()` agora executa antes de qualquer DDL:
+
+```sql
+PRAGMA journal_mode=WAL;
+PRAGMA busy_timeout=5000;
+PRAGMA synchronous=NORMAL;
+PRAGMA cache_size=-32000;
+```
+
+Elimina `database is locked` silencioso em acesso concorrente shadow_sampler vs Node.js.
+
+**Score Calibration (`core/score_calibration.py`) — regime-aware:**
+- `_detect_regime_shift()` compara distribuição dos últimos 30 trades vs. histórico completo.
+- Quando regime mudou (≥60% dos recentes no novo regime): `transition_factor = 0.35` → penalidades reduzidas em 65%.
+- `calibrate_score()` reduz deságio ECE de 50%→20% em transição.
+
+### Novo Endpoint
+
+```text
+GET /sniper/telemetry/stats
+```
+
+Retorna em uma única chamada:
+
+| Campo | Fonte |
+|---|---|
+| `telemetry.purifiedSamplesCount` | DB live query (JOIN signal+trade) |
+| `telemetry.sniperGridValidatedCount` | ARM_TRIGGER_GRID com PnL confirmado |
+| `telemetry.activeModelInfo` | accuracy, brier, features do shadow model |
+| `offlineLearner.*` | ciclos, outcomes, treinos disparados |
+| `jobSupervisorMetrics.*` | runs, falhas, lastDuration, intervalSeconds |
+
 ## Dados Que Não Devem Ir Para Git
 
 ```text

@@ -1,0 +1,214 @@
+ Gaps identificados e corrigidos
+1. BatchTriggerOrchestrator — criado (api-server/src/lib/batchTriggerOrchestrator.ts)
+O componente central descrito no relatório não existia. A classe foi implementada com:
+
+Hard Gate 1 — Mux-Lock global: consulta isMuxLocked() antes de qualquer processamento; aborta silenciosamente se ativo
+Hard Gate 2 — Teto de posições: chama getActivePositionsCountFn() e aborta se >= maxConcurrentPositions
+handleMarketTick(symbol, signal): ponto de entrada que aplica os dois gates antes de processar o sinal QB
+armTriggerAndLock(symbol, signal): coloca a ordem LIMIT Post-Only, ativa o Mux-Lock via activateMuxLock() + registra expiração TTL via armLimitOrderExpiry()
+startTriggerLifecycleMonitor(): polling de 5s para detectar fill completo, fill parcial (Feature 3) ou expiração de TTL
+Design injetável (callbacks placeOrderFn, getActivePositionsCountFn, checkOrderStatusFn) para ser usado por routes/bot.ts ou routes/demo.ts
+2. edge_gate.py — payload estendido com 3 novos objetos estruturados
+Campo	Antes	Depois
+geometry	❌ inexistente	✅ { side, triggerPrice, targetPrice, stopPrice, expirationSeconds }
+probabilityModel	❌ inexistente	✅ { confidence, edgeScore, expectedValue, kellyFraction }
+metadata	❌ inexistente	✅ { signalId, symbol, timestamp, sectorCluster }
+executionMetrics	3 campos	✅ + baseTargetUsdt, calculatedTpPct, calculatedSlPct, appliedFilters
+appliedFilters	❌ inexistente	✅ ex: ["ATR_SHADOW_PASSED", "FUNDING_WINDOW_PASSED", "DATA_SYNC_PASSED"]
+Os campos planos anteriores foram mantidos — retrocompatibilidade total.
+
+3. quantBrainClient.ts — interface TypeScript + schema Zod atualizados
+QuantBrainEdgeResult recebeu os tipos geometry, probabilityModel, metadata e executionMetrics estendido
+Schema Zod espelha exatamente os mesmos tipos para validação em runtime do contrato edge-v3
+Os 3 serviços estão rodando — API Server (8080), Quant Brain (9000) e Dashboard (5000) — sem erros.
+
+
+3 Gates corrigidos — entryProtection.ts
+Fix 1 — CANDLE_DIRECTION_REJECT
+Antes: Bloqueava qualquer divergência entre suggestedSide e positionSide, mesmo com margem de 0.01.
+
+Depois: Só rejeita quando o lado oposto é fortemente dominante — oppositeScore - sideScore ≥ candleDirectionRejectMargin (padrão 0.15, configurável via SCALP_CANDLE_DIRECTION_REJECT_MARGIN).
+
+Fix 2 — CANDLE_CHOP_REJECT
+Antes: Bloqueava quando separation < 0.08 independente do score absoluto. Um sinal com longScore = 0.72 / shortScore = 0.66 era rejeitado apesar de ser forte.
+
+Depois: Só rejeita quando ambas condições são verdadeiras: separação pequena e score absoluto fraco (sideScore < candleMinScore). Score absoluto forte anula o chop check.
+
+Fix 3 — RECENT_EDGE_REJECT
+Antes: Usava o pool global de outcomes. Uma sequência ruim em TRUMP-USDT bloqueava entradas em BTC-USDT, ETH-USDT, etc.
+
+Depois: Avalia por símbolo primeiro quando há ≥ recentEdgeMinTrades trades do símbolo na janela. Só cai no pool global se os dados do símbolo são insuficientes — e nesse caso exige 2× o threshold (recentEdgeMinTrades * 2) antes de rejeitar. Se nem o global tem dados suficientes, o gate passa sem bloquear.
+
+O log de rejeição agora inclui o escopo: RECENT_EDGE_REJECT[BTC-USDT] vs RECENT_EDGE_REJECT[global].
+
+
+ap 1 — history_logger.py (Quality Filter para ARM_TRIGGER)
+
+artifacts/quant-brain/core/history_logger.py criado com filtro de 4 regras: só persiste se decision == ARM_TRIGGER, geometria completa (os 3 preços), signalId presente, e SIGNAL_SNAPSHOTS_ENABLED=true
+Thread background com fila em memória — nunca bloqueia o event loop do FastAPI
+Escrita atômica (.tmp → rename) + rotação automática a 100k linhas
+edge_gate.py: import adicionado + return { convertido em _edge_response = { + chamada log_arm_trigger_snapshot(_edge_response) antes do return
+Dados gravados em data/signal_snapshots.jsonl — dataset limpo separado dos outcomes, pronto para treino offline
+Gap 2 — recordFillOutcome / feedback FILLED_AND_WON / FILLED_AND_STOPPED
+
+exhaustionTriggerManager.ts: nova função recordFillOutcome(signalId, symbol, direction, exitReason, pnl) exportada — mapeia "TP"→FILLED_AND_WON, "SL"→FILLED_AND_STOPPED, ignora "MANUAL", usa o mesmo _enqueueOutcomeWrite para escrita não-bloqueante
+livePositionWatcher.ts: importa e chama recordFillOutcome logo após recordTradeOutcome(outcome), passando entry.signalId, entry.symbol, entry.positionSide, exitReason, outcome.realizedPnl
+Gap 3 — QB Supervisor Status via /api/telemetry/stats
+
+quantBrainClient.ts: getQuantBrainSupervisorStatus() — busca /offline-learner/status e /debug/status em paralelo com deadline de 400ms, cache de 10s, retorna null silenciosamente em falha
+telemetry.ts: /api/telemetry/stats agora inclui quantBrainSupervisor no payload — confirmado ativo via smoke test
+Validação:
+
+API Server: pnpm build ✅ limpo (0 erros TS)
+Python: core.edge_gate e core.history_logger carregam sem erros
+Smoke test filtro: sinal válido aceito, geometria incompleta descartada, REJECT descartado — writer thread vivo
+GET /api/telemetry/stats: campo quantBrainSupervisor presente na resposta
+
+
+A implementação está completa. Aqui está o resumo do que foi entregue:
+
+Estratégia de Gatilhos em Escada (ARM_TRIGGER_GRID) — Tail Hunter
+Arquivos criados
+artifacts/api-server/src/lib/bingxHttp.ts — utilitários HTTP BingX compartilhados (sign, bingxPost, bingxGet) para evitar duplicação entre bot.ts e o grid manager.
+
+artifacts/api-server/src/lib/gridTriggerManager.ts — motor da estratégia:
+
+Recebe ARM_TRIGGER_GRID do QB e coloca N ordens LIMIT GTX (Post-Only Maker) em paralelo
+Distribuição de margem por allocationFactor: 20% / 30% / 50% (pirâmide)
+Cada nível tem TTL independente via armLimitOrderExpiry + cancela via cancelFn
+Sector cascade executado antes de armar o grid
+Background fill poller (5s): ao detectar posição aberta → markTriggerFilled → mux-lock ativo → demais níveis cancelados automaticamente
+Cada nível registrado no livePositionWatcher para tracking de outcome autônomo
+Arquivos modificados
+edge_gate.py — novo caminho de decisão:
+
+Inicializa _grid_levels = [] antes do bloco de decisão
+Após _decision = "ARM_TRIGGER" (branch TRIGGER_LIMIT): se ENABLE_GRID_SNIPER=true + regime HIGH/EXTREME + ATR ≥ 0.30% → gera 3 níveis de escada com step = 45% do ATR, TP = 35% do ATR, SL = 2.2× TP; sobreescreve para "ARM_TRIGGER_GRID"
+Response dict: "grid": _grid_levels + "executionMetrics" inclui gridStrategy: "TAIL_HUNTER" e expirationSeconds
+bot.ts — integração:
+
+qbDecision type expandido para incluir "ARM_TRIGGER_GRID"
+Captura qbGrid e qbGridMetrics do resultado do QB
+Novo bloco de execução antes do path single-order: se qbDecision === "ARM_TRIGGER_GRID" → chama processGridTrigger e retorna sem entrar no fluxo de ordem única
+history_logger.py — filtro atualizado para gravar snapshots de ARM_TRIGGER_GRID também
+
+Controle de ativação
+O grid é opt-in via variável de ambiente:
+
+ENABLE_GRID_SNIPER=true
+
+
+
+Tudo validado. Geometria production-safe para qualquer faixa de preço:
+
+BTC $100k → TP +0.32% / SL -0.64% por nível (ATR floor ativado: 40% × 0.8%)
+SOL $150 → TP dinâmico 0.37–0.38% / SL 2× por nível
+POL $0.07 → clamped no teto de 3.00% / SL 6.00% (cap de segurança)
+
+2 actions
+Implementação completa e no ar. Aqui está o resumo cirúrgico do que foi elevado para nível sniper de produção real:
+
+Upgrades entregues
+1. build_sniper_tail_grid — nova geometria da escada (edge_gate.py)
+Antes (ATR-relativo, ancorando no ponto de exaustão da microframe):
+
+Step entre níveis = 45% do ATR
+TP = 35% do ATR
+SL = 2.2× TP
+Âncora: _trigger_px (ponto de exaustão microframe)
+Agora (drops/pumps fixos da referencePrice, production-safe):
+
+Modo	Drops/Pumps	Alocações	Âncora
+LONG	−10%, −11%, −12%	20% / 30% / 50%	referencePrice (preço live)
+SHORT	+20%, +21%, +22%, +24%	15% / 25% / 30% / 30%	referencePrice (preço live)
+TP dinâmico: base_target_usdt / trigger_price × 100, com floor de 40% do ATR
+TP clamped: 0.08%–3.00% — production-safe de $0.0001 a $200k por unidade
+SL rigoroso: 2× TP (relação 2:1 perda:ganho na margem isolada)
+2. Condição de ativação — score de exaustão (edge_gate.py)
+Antes: volatility_regime in ("HIGH", "EXTREME") and _atr_pct >= 0.30
+
+Agora: ENABLE_GRID_SNIPER=true and executionPriority >= 0.65
+→ O score de exaustão da microframe decide, não o regime de volatilidade
+
+3. Promise.all paralelo — disparo em lote (gridTriggerManager.ts)
+Antes: for loop sequencial — Nível 1 → aguarda resposta → Nível 2 → aguarda → Nível 3
+
+Agora: 3 fases separadas:
+
+Fase 1 — Paralelo: todas as ordens LIMIT disparadas via Promise.all simultaneamente → reduz janela de slippage entre o primeiro e último nível
+Fase 2 — Sequencial sem I/O: TTL individual + registro no livePositionWatcher para cada nível bem-sucedido
+Fase 3 — TTL coletivo: após expirationMs, cancela todos os deployedOrderIds em paralelo via Promise.all — limpeza de ordens fantasmas na pedra
+
+
+Tudo no ar e validado. Resumo das 3 Elevações implementadas:
+
+3 Elevações Sniper — Nível Produção Real
+Elevação 1 — Filtro de Qualidade + Marca no Banco (edge_gate.py)
+Quando o sinal passa pelo filtro (executionPriority ≥ 0.65) e gera a escada de gatilhos:
+
+Flag no response: metadata.sniperQualityValidated = true — Node.js e Dashboard podem consumir direto
+Marca no banco SQLite: chama update_signal_decision_audit() sobrescrevendo setup_type = "SNIPER_GRID_VALIDATED" — identifica amostras puras para o treino offline, separadas dos ARM_TRIGGER comuns
+Elevação 2 — offline_learner.py — Path Direto no Banco
+Nova função query_purified_samples_count() que lê direto do knowledge.db:
+
+SELECT COUNT(*) FROM signal_outcomes s
+JOIN trade_outcomes t ON s.source_id = t.outcome_source_id
+WHERE s.allowed = 1 AND t.pnl_usdt IS NOT NULL
+
+path separado contando apenas setup_type = 'SNIPER_GRID_VALIDATED' para rastrear quantos ARM_TRIGGER_GRID viraram trades reais. Resultado persiste em _learner_state para consulta síncrona a qualquer momento.
+Elevação 3 — /sniper/telemetry/stats (api/server.py)
+Novo endpoint consolidado:
+
+GET http://quant-brain:9000/sniper/telemetry/stats
+
+Retorna em uma única chamada:
+
+Campo	Fonte
+telemetry.purifiedSamplesCount	DB live query (JOIN signal+trade)
+telemetry.sniperGridValidatedCount	ARM_TRIGGER_GRID com PnL confirmado
+telemetry.activeModelInfo	shadow_model_status() (accuracy, brier, features)
+offlineLearner.*	ciclos, outcomes, treinos disparados
+jobSupervisorMetrics.*	runs, falhas, lastDuration, intervalSeconds do job 24h
+
+
+
+
+
+5 Gargalos Resolvidos — Resumo Técnico
+Fix 1 — Coach Ranker: Morte por Inércia eliminada (coach_ranker.py)
+Antes: penalidade cheia disparada em n=50 amostras, suficiente para enterrar ativos promissores com sequência ruim inicial.
+
+Depois (3 mudanças simultâneas):
+
+Rampa de confiança a(n) = min(1, (n-50)/100) — em n=50, penalidade é zero; em n=150, penalidade plena
+Bayesian cold-start floor — learning score mistura 25% do prior neutro (0.50) em n=0, decaindo para 0% em n=50, evitando crash por ruído inicial
+Threshold tóxico elevado de 30→50 amostras para declarar contexto tóxico com penalidade cheia
+Fix 2 — signal_learning.py: Targets ATR-Normalizados (signal_learning.py)
+Antes: TARGETS_USDT = (0.5, 1.0, 2.0) — BTC com $100k e TRUMP com $10 avaliados pelo mesmo alvo absurdo em USDT.
+
+Depois: _atr_normalized_targets() gera targets como [0.30×ATR, 0.60×ATR, 1.00×ATR] convertidos para USDT via notional. BTC (ATR 0.8%, notional $100) → [$0.24, $0.48, $0.80]. TRUMP (ATR 5%, notional $100) → [$1.50, $3.00, $5.00]. Fallback automático para TARGETS_USDT se ATR indisponível.
+
+Fix 3 — knowledge_base.py: WAL Mode + Busy Timeout (knowledge_base.py)
+Antes: SQLite com journal mode padrão (DELETE) → escrita trava banco inteiro, shadow_sampler vs Node.js = database is locked silencioso.
+
+Depois: init_db() executa antes de qualquer DDL:
+
+PRAGMA journal_mode=WAL;   -- leituras concorrentes livres
+PRAGMA busy_timeout=5000;  -- 5s de retry antes de abortar
+PRAGMA synchronous=NORMAL; -- durabilidade segura com WAL
+PRAGMA cache_size=-32000;  -- 32MB cache por conexão
+
+Fix 4 — edge_gate.py: Expiry Fast-Path (edge_gate.py)
+Antes: signal_expired calculado na linha 764, mas judge_entry só chamado na linha 978 — 200+ linhas de feature extraction, evaluate_sniper_window, ML inference desperdiçadas.
+
+Depois: early return imediato após linha 764 quando signal_expired=True:
+
+if signal_expired and not intelligence_only:
+    return {"decision": "WAIT", "blocks": [...], "mode": "expired", ...}
+
+Corta centenas de ms de processamento + I/O de mercado antes mesmo de tocar o pipeline.
+
+Fix 5 — score_calibration.py: Calibração Regime-Aware (score_calibration.py)
+Antes: penalidades de bucket calculadas sem contexto de regime — consolidação recente matava entradas no início de bull/bear markets.
+
+Depois: _detect_regime_shift() compara distribuição dos últimos 30 trades vs. histórico completo. Quando regime mudou (≥60% dos recentes no novo regime): transition_factor = 0.35 → penalidades reduzidas em 65%. calibrate_score() também reduz deságio ECE de 50%→20% em transição. Warning regime_transition_detected:CONSOLIDATION→TRENDING(penalties×0.35) emitido no output.

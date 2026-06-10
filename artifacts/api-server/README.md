@@ -608,6 +608,70 @@ pnpm.cmd --dir artifacts\bingx-dashboard run build
 Se o patch tocar contrato backend/Quant Brain, rode também os testes Python
 focados do contrato no diretório `quant-brain`.
 
+## Implementações Recentes
+
+### BatchTriggerOrchestrator (`src/lib/batchTriggerOrchestrator.ts`)
+
+Componente central de execução de gatilhos com dois hard gates obrigatórios:
+
+- **Hard Gate 1 — Mux-Lock global:** consulta `isMuxLocked()` antes de qualquer processamento; aborta silenciosamente se ativo.
+- **Hard Gate 2 — Teto de posições:** chama `getActivePositionsCountFn()` e aborta se `>= maxConcurrentPositions`.
+- `handleMarketTick(symbol, signal)`: ponto de entrada que aplica os dois gates antes de processar o sinal QB.
+- `armTriggerAndLock(symbol, signal)`: coloca ordem LIMIT Post-Only, ativa Mux-Lock via `activateMuxLock()` e registra expiração TTL via `armLimitOrderExpiry()`.
+- `startTriggerLifecycleMonitor()`: polling de 5s para detectar fill completo, fill parcial ou expiração de TTL.
+- Design injetável (`placeOrderFn`, `getActivePositionsCountFn`, `checkOrderStatusFn`) para uso por `routes/bot.ts` ou `routes/demo.ts`.
+
+### Grid Trigger Manager — Tail Hunter (`src/lib/gridTriggerManager.ts`)
+
+Estratégia `ARM_TRIGGER_GRID` ativada via `ENABLE_GRID_SNIPER=true`:
+
+- Coloca N ordens LIMIT GTX (Post-Only Maker) em paralelo via `Promise.all`.
+- **LONG:** drops −10%, −11%, −12% da `referencePrice`; alocações 20% / 30% / 50%.
+- **SHORT:** pumps +20%, +21%, +22%, +24% da `referencePrice`; alocações 15% / 25% / 30% / 30%.
+- TP dinâmico: `base_target_usdt / trigger_price × 100`, com floor de 40% do ATR; clamped 0.08%–3.00%.
+- SL: 2× TP (relação 2:1 perda:ganho em margem isolada).
+- TTL independente por nível; ao detectar posição aberta → mux-lock ativo → demais níveis cancelados em paralelo.
+- Cada nível registrado no `livePositionWatcher` para tracking autônomo de outcome.
+- Ativação: `executionPriority >= 0.65` (score de exaustão da microframe decide, não regime de volatilidade).
+
+```env
+ENABLE_GRID_SNIPER=true
+```
+
+### Contrato QB Estendido (`src/lib/quantBrainClient.ts`)
+
+`QuantBrainEdgeResult` recebeu novos campos com schema Zod espelhado:
+
+| Campo | Conteúdo |
+|---|---|
+| `geometry` | `{ side, triggerPrice, targetPrice, stopPrice, expirationSeconds }` |
+| `probabilityModel` | `{ confidence, edgeScore, expectedValue, kellyFraction }` |
+| `metadata` | `{ signalId, symbol, timestamp, sectorCluster }` |
+| `executionMetrics` | estendido com `baseTargetUsdt`, `calculatedTpPct`, `calculatedSlPct`, `appliedFilters`, `gridStrategy` |
+
+Retrocompatibilidade total — campos planos anteriores mantidos.
+
+`getQuantBrainSupervisorStatus()` busca `/offline-learner/status` e `/debug/status` em paralelo (deadline 400ms, cache 10s).
+
+### Correções de Gates (`src/lib/entryProtection.ts`)
+
+- **CANDLE_DIRECTION_REJECT:** só rejeita quando o lado oposto é fortemente dominante (`oppositeScore - sideScore >= candleDirectionRejectMargin`). Padrão `0.15`, configurável via `SCALP_CANDLE_DIRECTION_REJECT_MARGIN`.
+- **CANDLE_CHOP_REJECT:** só rejeita quando separação pequena **e** score absoluto fraco (`sideScore < candleMinScore`). Score absoluto forte anula o chop check.
+- **RECENT_EDGE_REJECT:** avalia por símbolo primeiro (se `>= recentEdgeMinTrades` trades do símbolo na janela). Cai no pool global apenas se dados do símbolo são insuficientes, exigindo `2× recentEdgeMinTrades` antes de rejeitar. Log inclui escopo: `RECENT_EDGE_REJECT[BTC-USDT]` vs `RECENT_EDGE_REJECT[global]`.
+
+### Feedback de Fill (`src/lib/exhaustionTriggerManager.ts` + `src/lib/livePositionWatcher.ts`)
+
+`recordFillOutcome(signalId, symbol, direction, exitReason, pnl)` mapeia:
+- `"TP"` → `FILLED_AND_WON`
+- `"SL"` → `FILLED_AND_STOPPED`
+- `"MANUAL"` → ignorado
+
+`livePositionWatcher.ts` chama `recordFillOutcome` logo após `recordTradeOutcome`, fechando o ciclo de aprendizado por sinal.
+
+### Telemetria Estendida
+
+`GET /api/telemetry/stats` inclui o campo `quantBrainSupervisor` no payload, consolidando status do supervisor QB em uma única chamada.
+
 ## Dados Que Não Devem Ir Para Git
 
 ```text
