@@ -1,5 +1,4 @@
 import { useEffect, useMemo, useState } from "react";
-import { PieChart, Pie, Cell } from "recharts";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import {
   Activity,
@@ -170,59 +169,53 @@ function SentimentPanel({ symbol }: { symbol: string }) {
             <span className="text-[8px] text-muted-foreground/50 font-mono">proporção long vs short</span>
           </div>
 
-          {/* Donut chart + barra lado a lado */}
-          <div className="flex items-center gap-3">
-            {/* Donut chart animado */}
-            <div className="relative flex-shrink-0" style={{ width: 56, height: 56 }}>
-              <PieChart width={56} height={56}>
-                <Pie
-                  data={[
-                    { name: "LONG", value: longPct },
-                    { name: "SHORT", value: shortPct },
-                  ]}
-                  cx={27}
-                  cy={27}
-                  innerRadius={18}
-                  outerRadius={26}
-                  startAngle={90}
-                  endAngle={-270}
-                  paddingAngle={longPct > 0 && shortPct > 0 ? 2 : 0}
-                  dataKey="value"
-                  isAnimationActive={true}
-                  animationBegin={0}
-                  animationDuration={900}
-                  animationEasing="ease-out"
-                  stroke="none"
-                >
-                  <Cell fill={longPct >= shortPct ? "#16a34a" : "#22c55e"} opacity={0.85} />
-                  <Cell fill={shortPct > longPct ? "#dc2626" : "#ef4444"} opacity={0.75} />
-                </Pie>
-              </PieChart>
-              {/* Porcentagem dominante no centro */}
-              <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none">
-                <span className={`text-[10px] font-bold leading-none tabular-nums ${longPct >= shortPct ? "text-green-400" : "text-red-400"}`}>
-                  {longPct >= shortPct ? longPct : shortPct}%
+          {/* Bias LONG/SHORT */}
+          <div className="space-y-2">
+            <div className="grid grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-stretch gap-2">
+              <div className="rounded-lg border border-green-500/15 bg-green-500/[0.07] px-2.5 py-2">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-[9px] font-semibold uppercase tracking-wider text-green-300/70">Long</span>
+                  <TrendingUp className="h-3 w-3 text-green-300/70" />
+                </div>
+                <div className="mt-1 flex items-baseline gap-1">
+                  <span className="font-mono text-lg font-bold leading-none text-green-300 tabular-nums">{longPct}</span>
+                  <span className="text-[10px] font-semibold text-green-300/60">%</span>
+                </div>
+              </div>
+
+              <div className="flex min-w-12 flex-col items-center justify-center rounded-lg border border-border/25 bg-background/50 px-2">
+                <span className="text-[8px] font-semibold uppercase tracking-wider text-muted-foreground/60">Bias</span>
+                <span className={`mt-1 text-[10px] font-bold ${longPct >= shortPct ? "text-green-300" : "text-red-300"}`}>
+                  {longPct >= shortPct ? "LONG" : "SHORT"}
                 </span>
-                <span className={`text-[7px] font-semibold leading-none mt-0.5 ${longPct >= shortPct ? "text-green-500/70" : "text-red-500/70"}`}>
-                  {longPct >= shortPct ? "L" : "S"}
-                </span>
+              </div>
+
+              <div className="rounded-lg border border-red-500/15 bg-red-500/[0.07] px-2.5 py-2">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-[9px] font-semibold uppercase tracking-wider text-red-300/70">Short</span>
+                  <TrendingDown className="h-3 w-3 text-red-300/70" />
+                </div>
+                <div className="mt-1 flex items-baseline justify-end gap-1">
+                  <span className="font-mono text-lg font-bold leading-none text-red-300 tabular-nums">{shortPct}</span>
+                  <span className="text-[10px] font-semibold text-red-300/60">%</span>
+                </div>
               </div>
             </div>
 
             {/* Barra + breakout */}
-            <div className="flex-1 flex flex-col gap-1.5">
-              <div className="relative h-8 w-full overflow-hidden rounded-md border border-border/30 bg-muted/10">
+            <div className="rounded-lg border border-border/25 bg-background/45 p-2">
+              <div className="relative h-5 w-full overflow-hidden rounded-md bg-muted/20">
                 <div
-                  className="absolute inset-y-0 left-0 flex items-center justify-end pr-2 bg-gradient-to-r from-green-600/80 to-green-500/60 text-[10px] font-bold text-white shadow-sm transition-all duration-500"
+                  className="absolute inset-y-0 left-0 flex items-center justify-start rounded-l-md bg-gradient-to-r from-green-500/90 via-emerald-400/80 to-emerald-300/70 pl-2 text-[9px] font-bold text-white/95 shadow-sm transition-all duration-500"
                   style={{ width: `${longPct}%` }}
                 >
-                  {longPct >= 28 && <span>{longPct}% LONG</span>}
+                  <span>{longPct}% LONG</span>
                 </div>
                 <div
-                  className="absolute inset-y-0 right-0 flex items-center justify-start pl-2 bg-gradient-to-l from-red-600/80 to-red-500/60 text-[10px] font-bold text-white shadow-sm transition-all duration-500"
+                  className="absolute inset-y-0 right-0 flex items-center justify-end rounded-r-md bg-gradient-to-l from-red-500/90 via-rose-400/80 to-rose-300/70 pr-2 text-[9px] font-bold text-white/95 shadow-sm transition-all duration-500"
                   style={{ width: `${shortPct}%` }}
                 >
-                  {shortPct >= 28 && <span>{shortPct}% SHORT</span>}
+                  <span>{shortPct}% SHORT</span>
                 </div>
                 {longPct < 28 && shortPct < 28 && (
                   <div className="absolute inset-0 flex items-center justify-center text-[10px] font-bold text-muted-foreground">
@@ -230,19 +223,19 @@ function SentimentPanel({ symbol }: { symbol: string }) {
                   </div>
                 )}
               </div>
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-2">
+              <div className="mt-2 flex items-center justify-between gap-2">
+                <div className="flex min-w-0 items-center gap-2">
                   <div className="flex items-center gap-1">
-                    <div className="w-1.5 h-1.5 rounded-full bg-green-500" />
-                    <span className="text-[8px] text-muted-foreground/60">Long</span>
+                    <div className="h-1.5 w-1.5 rounded-full bg-green-400" />
+                    <span className="text-[8px] text-muted-foreground/65">Pressao compradora</span>
                   </div>
                   <div className="flex items-center gap-1">
-                    <div className="w-1.5 h-1.5 rounded-full bg-red-500" />
-                    <span className="text-[8px] text-muted-foreground/60">Short</span>
+                    <div className="h-1.5 w-1.5 rounded-full bg-red-400" />
+                    <span className="text-[8px] text-muted-foreground/65">Pressao vendedora</span>
                   </div>
                 </div>
-                <div className={`flex items-center gap-1 px-1.5 py-0.5 rounded ${breakoutBgColor}`}>
-                  <Zap className={`h-2.5 w-2.5 ${breakoutColor}`} />
+                <div className={`flex shrink-0 items-center gap-1 rounded-md border px-2 py-1 ${breakoutBgColor} ${indicators.highLowBreak === "BREAKOUT_UP" ? "border-green-500/20" : indicators.highLowBreak === "BREAKOUT_DOWN" ? "border-red-500/20" : "border-border/25"}`}>
+                  <Zap className={`h-3 w-3 ${breakoutColor}`} />
                   <span className={`text-[9px] font-mono font-bold ${breakoutColor}`}>{breakoutLabel}</span>
                 </div>
               </div>
@@ -671,6 +664,7 @@ function MassEntryZoneCard({ zone }: { zone: {
 function SniperEntrySection() {
   const [aiText, setAiText] = useState<string | null>(null);
   const [aiMassText, setAiMassText] = useState<string | null>(null);
+  const [armMassText, setArmMassText] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<"sniper" | "mass">("sniper");
 
   const oppsQ = useQuery({
@@ -712,6 +706,34 @@ function SniperEntrySection() {
     retry: 1,
   });
 
+  const tracesQ = useQuery({
+    queryKey: ["sniper-execution-traces"],
+    queryFn: async () => {
+      const r = await fetch(apiUrl("/api/bot/sniper/execution-traces?limit=5"), { credentials: "include" });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      return r.json() as Promise<{
+        traces: Array<{
+          id: string;
+          source: string;
+          cycle?: number;
+          startedAt: number;
+          durationMs?: number;
+          finalStatus: string;
+          finalReason?: string;
+          stages: Array<{
+            stage: string;
+            status: string;
+            reason?: string;
+            details?: Record<string, unknown>;
+          }>;
+        }>;
+      }>;
+    },
+    refetchInterval: 8_000,
+    placeholderData: (prev) => prev,
+    retry: 1,
+  });
+
   const sniperMut = useMutation({
     mutationFn: async () => {
       const r = await fetch(apiUrl("/api/neural/analyst/sniper"), { method: "POST", credentials: "include" });
@@ -732,8 +754,46 @@ function SniperEntrySection() {
     onSuccess: (text) => setAiMassText(text),
   });
 
+  const armMassMut = useMutation({
+    mutationFn: async () => {
+      const r = await fetch(apiUrl("/api/bot/sniper/mass-entry/arm"), {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ maxZones: 3, minConfluence: 0.60 }),
+      });
+      const d = await r.json() as {
+        armed?: boolean;
+        reason?: string;
+        armedZones?: number;
+        rejectedZones?: number;
+        results?: Array<{ symbol: string; side: string; levelsArmed: number; rejects?: string[] }>;
+      };
+      if (!r.ok) throw new Error(d.reason ?? `HTTP ${r.status}`);
+      const armed = d.results?.filter((item) => item.levelsArmed > 0) ?? [];
+      const rejected = d.results?.filter((item) => (item.rejects?.length ?? 0) > 0) ?? [];
+      return [
+        `armedZones=${d.armedZones ?? armed.length}`,
+        `rejectedZones=${d.rejectedZones ?? rejected.length}`,
+        ...armed.map((item) => `${item.symbol} ${item.side}: ${item.levelsArmed} gatilho(s)`),
+        ...rejected.map((item) => `${item.symbol} ${item.side}: ${item.rejects?.[0] ?? "rejeitado"}`),
+      ].join("\n");
+    },
+    onSuccess: (text) => setArmMassText(text),
+    onError: (error) => setArmMassText(error instanceof Error ? error.message : String(error)),
+  });
+
   const opps  = oppsQ.data?.opportunities ?? [];
   const zones = zonesQ.data?.zones ?? [];
+  const latestTrace = tracesQ.data?.traces?.[0] ?? null;
+  const latestBlockedStage = latestTrace?.stages.findLast((stage) => stage.status === "blocked" || stage.status === "error");
+  const latestOkStage = latestTrace?.stages.findLast((stage) => stage.status === "ok");
+  const traceStatusColor =
+    latestTrace?.finalStatus === "placed" || latestTrace?.finalStatus === "armed"
+      ? "border-emerald-500/20 bg-emerald-500/[0.06] text-emerald-200"
+      : latestTrace?.finalStatus === "blocked" || latestTrace?.finalStatus === "error"
+        ? "border-red-500/20 bg-red-500/[0.06] text-red-200"
+        : "border-border/20 bg-card/5 text-muted-foreground";
 
   return (
     <section className="space-y-3">
@@ -761,6 +821,41 @@ function SniperEntrySection() {
             ))}
           </div>
         </div>
+      </div>
+
+      <div className={`rounded-xl border px-3 py-2 ${traceStatusColor}`}>
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex min-w-0 items-center gap-2">
+            <Activity className="h-3.5 w-3.5 shrink-0" />
+            <span className="text-[10px] font-semibold uppercase tracking-wider">Execution trace</span>
+            <span className="truncate text-[11px] font-mono">
+              {latestTrace
+                ? `${latestTrace.finalStatus}${latestTrace.finalReason ? ` · ${latestTrace.finalReason}` : ""}`
+                : "aguardando ciclo"}
+            </span>
+          </div>
+          <div className="flex items-center gap-3 text-[10px] text-muted-foreground/70">
+            {latestTrace?.cycle ? <span>cycle #{latestTrace.cycle}</span> : null}
+            {typeof latestTrace?.durationMs === "number" ? <span>{latestTrace.durationMs}ms</span> : null}
+            {tracesQ.isFetching ? <RefreshCw className="h-3 w-3 animate-spin" /> : null}
+          </div>
+        </div>
+        {latestTrace ? (
+          <div className="mt-2 grid grid-cols-1 gap-1 sm:grid-cols-2">
+            <div className="rounded-lg border border-border/15 bg-background/35 px-2 py-1.5">
+              <div className="text-[8px] uppercase tracking-wider text-muted-foreground/55">Ultimo bloqueio</div>
+              <div className="mt-0.5 truncate text-[10px] font-mono text-foreground/75">
+                {latestBlockedStage ? `${latestBlockedStage.stage}: ${latestBlockedStage.reason ?? latestBlockedStage.status}` : "nenhum bloqueio recente"}
+              </div>
+            </div>
+            <div className="rounded-lg border border-border/15 bg-background/35 px-2 py-1.5">
+              <div className="text-[8px] uppercase tracking-wider text-muted-foreground/55">Ultimo OK</div>
+              <div className="mt-0.5 truncate text-[10px] font-mono text-foreground/75">
+                {latestOkStage ? latestOkStage.stage : "sem etapa aprovada"}
+              </div>
+            </div>
+          </div>
+        ) : null}
       </div>
 
       {activeTab === "sniper" && (
@@ -834,17 +929,31 @@ function SniperEntrySection() {
                 <Sparkles className="w-3.5 h-3.5 text-primary/70" />
                 <span className="text-[10px] font-semibold text-muted-foreground/70">Aprovação IA — Entrada em Massa</span>
               </div>
-              <button
-                type="button"
-                onClick={() => massMut.mutate()}
-                disabled={massMut.isPending}
-                className="flex items-center gap-1 text-[10px] text-primary/70 hover:text-primary transition-colors disabled:opacity-40"
-              >
-                <RefreshCw className={`w-3 h-3 ${massMut.isPending ? "animate-spin" : ""}`} />
-                {massMut.isPending ? "Processando..." : "Gerar plano"}
-              </button>
+              <div className="flex items-center gap-3">
+                <button
+                  type="button"
+                  onClick={() => armMassMut.mutate()}
+                  disabled={armMassMut.isPending || zones.length === 0}
+                  className="flex items-center gap-1 text-[10px] text-emerald-400/80 hover:text-emerald-300 transition-colors disabled:opacity-40"
+                >
+                  <Zap className={`w-3 h-3 ${armMassMut.isPending ? "animate-pulse" : ""}`} />
+                  {armMassMut.isPending ? "Armando..." : "Armar gatilhos"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => massMut.mutate()}
+                  disabled={massMut.isPending}
+                  className="flex items-center gap-1 text-[10px] text-primary/70 hover:text-primary transition-colors disabled:opacity-40"
+                >
+                  <RefreshCw className={`w-3 h-3 ${massMut.isPending ? "animate-spin" : ""}`} />
+                  {massMut.isPending ? "Processando..." : "Gerar plano"}
+                </button>
+              </div>
             </div>
             <div className="px-3 py-2.5">
+              {armMassText ? (
+                <pre className="mb-2 rounded-lg border border-emerald-500/15 bg-emerald-500/5 p-2 text-[10px] text-emerald-200/80 whitespace-pre-wrap font-mono leading-relaxed">{armMassText}</pre>
+              ) : null}
               {aiMassText ? (
                 <pre className="text-[10px] text-foreground/70 whitespace-pre-wrap font-mono leading-relaxed max-h-48 overflow-y-auto">{aiMassText}</pre>
               ) : (
