@@ -1,4 +1,4 @@
-import { useMutation, useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, type UseQueryResult } from "@tanstack/react-query";
 import type { UseMutationOptions, UseQueryOptions } from "@tanstack/react-query";
 import { customFetch } from "./custom-fetch";
 
@@ -138,5 +138,77 @@ export function useResetTriggerSymbol<TError = unknown>(
   return useMutation<{ reset: string; summary: TriggerStatus }, TError, string | undefined>({
     mutationFn: (symbol) => resetTriggerSymbol(symbol),
     ...options,
+  });
+}
+
+// ── Native Trigger Engine types ────────────────────────────────────────────────
+
+export interface NativeGridLevel {
+  level: number;
+  side: string;
+  triggerPrice: number;
+  targetPrice: number;
+  stopPrice: number;
+  allocationFactor: number;
+  distancePct: number;
+}
+
+export interface NativePendingOrder {
+  id: string;
+  symbol: string;
+  direction: "LONG" | "SHORT";
+  triggerPrice: number;
+  orderId: string;
+  armedAt: number;
+  expiresAt: number;
+  sectorCluster?: string;
+  signalId?: string;
+  ttlRemainingMs: number;
+}
+
+export interface NativeTriggerSymbol {
+  symbol: string;
+  currentPrice: number;
+  recentMovePct: number;
+  atrPct: number;
+  longCooldownMs: number;
+  shortCooldownMs: number;
+  wouldFireLong: boolean;
+  wouldFireShort: boolean;
+  longGrid: NativeGridLevel[];
+  shortGrid: NativeGridLevel[];
+}
+
+export interface NativeTriggerStatus {
+  generatedAt: number;
+  config: {
+    enabled: boolean;
+    longDetectPct: number;
+    shortDetectPct: number;
+    baseTpPct: number;
+    expirationSeconds: number;
+    cooldownMs: number;
+  };
+  muxLock: {
+    locked: boolean;
+    reason: string;
+    remainingMs: number;
+  };
+  pendingOrders: NativePendingOrder[];
+  pendingLong: number;
+  pendingShort: number;
+  symbols: NativeTriggerSymbol[];
+}
+
+export const getNativeTriggerStatusQueryKey = () => ["/api/bot/native-trigger/status"] as const;
+
+export const getNativeTriggerStatus = (): Promise<NativeTriggerStatus> =>
+  customFetch<NativeTriggerStatus>("/api/bot/native-trigger/status", { method: "GET" });
+
+export function useNativeTriggerStatus(): UseQueryResult<NativeTriggerStatus, unknown> {
+  return useQuery<NativeTriggerStatus>({
+    queryKey: getNativeTriggerStatusQueryKey(),
+    queryFn: getNativeTriggerStatus,
+    refetchInterval: 5000,
   });
 }

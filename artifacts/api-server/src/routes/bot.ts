@@ -93,7 +93,7 @@ import {
 } from "../lib/exhaustionTriggerManager";
 import { getSectorCluster } from "../lib/sectorMap";
 import { processGridTrigger, type GridLevel, type GridBrainResponse } from "../lib/gridTriggerManager";
-import { evaluateNativeTrigger } from "../lib/nativeTriggerEngine";
+import { evaluateNativeTrigger, getNativeTriggerConfig, getNativeTriggerCooldowns } from "../lib/nativeTriggerEngine";
 
 const router = Router();
 
@@ -4717,6 +4717,113 @@ router.get("/sniper/pnl/report", (_req: Request, res: Response) => {
     },
     bySymbol,
     autopilot: pilotState,
+  });
+});
+
+/**
+ * GET /api/bot/native-trigger/status
+ * Estado completo do Motor Nativo de Gatilhos Tail Hunter.
+ * Retorna: config, mux-lock, ordens PENDING no BingX, e preview de grid por símbolo.
+ */
+router.get("/bot/native-trigger/status", async (_req: Request, res: Response) => {
+  const config = getBotConfig();
+  const symbols = config.allowedSymbols.length > 0 ? config.allowedSymbols : [];
+  const triggerStats = getTriggerStats();
+  const nativeConfig = getNativeTriggerConfig();
+  const cooldowns = getNativeTriggerCooldowns();
+
+  // Pending LIMIT orders no BingX (do exhaustionTriggerManager)
+  const pendingOrders = triggerStats.recentHistory
+    .filter((t) => t.status === "PENDING")
+    .map((t) => ({
+      id: t.id,
+      symbol: t.symbol,
+      direction: t.direction,
+      triggerPrice: t.triggerPrice,
+      orderId: t.orderId,
+      armedAt: t.armedAt,
+      expiresAt: t.expiresAt,
+      sectorCluster: t.sectorCluster,
+      signalId: t.signalId,
+      ttlRemainingMs: Math.max(0, t.expiresAt - Date.now()),
+    }));
+
+  // Preview de grid por símbolo (candles cached 30s — rápido)
+  const LONG_DROPS   = [0.10, 0.11, 0.12];
+  const SHORT_PUMPS  = [0.20, 0.21, 0.22, 0.24];
+  const LONG_WEIGHTS = [0.20, 0.30, 0.50];
+  const SHORT_WEIGHTS = [0.15, 0.25, 0.30, 0.30];
+  const BASE_TP_PCT   = nativeConfig.baseTpPct;
+
+  function buildGrid(currentPrice: number, side: "LONG" | "SHORT", atrPct: number) {
+    if (currentPrice <= 0) return [];
+    const baseTargetUsdt = currentPrice * (BASE_TP_PCT / 100);
+    const levels: Array<{
+      level: number; side: string; triggerPrice: number; targetPrice: number;
+      stopPrice: number; allocationFactor: number; distancePct: number;
+    }> = [];
+    const drops  = side === "LONG" ? LONG_DROPS  : SHORT_PUMPS;
+    const weights = side === "LONG" ? LONG_WEIGHTS : SHORT_WEIGHTS;
+    for (let i = 0; i < drops.length; i++) {
+      const tp_raw = side === "LONG"
+        ? currentPrice * (1 - drops[i])
+        : currentPrice * (1 + drops[i]);
+      const rawTp = Math.max(atrPct > 0 ? atrPct * 0.40 : 0, (baseTargetUsdt / tp_raw) * 100);
+      const tpPct = Math.max(0.08, Math.min(3.00, rawTp));
+      const slPct = tpPct * 2.0;
+      levels.push({
+        level: i + 1,
+        side,
+        triggerPrice: parseFloat(tp_raw.toFixed(6)),
+        targetPrice: parseFloat((side === "LONG"
+          ? tp_raw * (1 + tpPct / 100)
+          : tp_raw * (1 - tpPct / 100)).toFixed(6)),
+        stopPrice: parseFloat((side === "LONG"
+          ? tp_raw * (1 - slPct / 100)
+          : tp_raw * (1 + slPct / 100)).toFixed(6)),
+        allocationFactor: weights[i],
+        distancePct: drops[i] * 100,
+      });
+    }
+    return levels;
+  }
+
+  const symbolResults = await Promise.allSettled(
+    symbols.map(async (symbol) => {
+      const edge = await computeCandleEdge(symbol, "5m");
+      const cd = cooldowns[symbol] ?? { long: 0, short: 0 };
+      const currentPrice = edge?.lastClose ?? 0;
+      const recentMovePct = edge?.recentMovePct ?? 0;
+      const atrPct = edge?.atrPct ?? 0;
+      const wouldFireLong = recentMovePct <= -nativeConfig.longDetectPct && cd.long === 0;
+      const wouldFireShort = recentMovePct >= nativeConfig.shortDetectPct && cd.short === 0;
+      return {
+        symbol,
+        currentPrice,
+        recentMovePct: parseFloat(recentMovePct.toFixed(4)),
+        atrPct: parseFloat(atrPct.toFixed(4)),
+        longCooldownMs: cd.long,
+        shortCooldownMs: cd.short,
+        wouldFireLong,
+        wouldFireShort,
+        longGrid: buildGrid(currentPrice, "LONG", atrPct),
+        shortGrid: buildGrid(currentPrice, "SHORT", atrPct),
+      };
+    })
+  );
+
+  const symbolData = symbolResults
+    .filter((r): r is PromiseFulfilledResult<NonNullable<unknown>> => r.status === "fulfilled")
+    .map((r) => r.value);
+
+  res.json({
+    generatedAt: Date.now(),
+    config: nativeConfig,
+    muxLock: triggerStats.muxLock,
+    pendingOrders,
+    pendingLong: pendingOrders.filter((o) => o.direction === "LONG").length,
+    pendingShort: pendingOrders.filter((o) => o.direction === "SHORT").length,
+    symbols: symbolData,
   });
 });
 

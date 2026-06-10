@@ -287,6 +287,20 @@ export function getNativeTriggerEnabled(): boolean {
   return NATIVE_TRIGGER_ENABLED;
 }
 
+/** Retorna o estado de cooldown de cada símbolo. */
+export function getNativeTriggerCooldowns(): Record<string, { long: number; short: number }> {
+  const now = Date.now();
+  const out: Record<string, { long: number; short: number }> = {};
+  for (const [key, ts] of _lastFiredAt.entries()) {
+    const [sym, side] = key.split(":");
+    if (!out[sym]) out[sym] = { long: 0, short: 0 };
+    const remaining = Math.max(0, COOLDOWN_MS - (now - ts));
+    if (side === "LONG") out[sym].long = remaining;
+    else out[sym].short = remaining;
+  }
+  return out;
+}
+
 export function getNativeTriggerConfig(): {
   enabled: boolean;
   longDetectPct: number;

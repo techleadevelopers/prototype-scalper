@@ -14,8 +14,11 @@ import {
   useDisableTrigger,
   useSnapshotTrigger,
   useResetTriggerSymbol,
+  useNativeTriggerStatus,
   type TriggerSymbolState,
   type TriggerStatus,
+  type NativeTriggerSymbol,
+  type NativePendingOrder,
 } from "@/api-client";
 import {
   Target,
@@ -34,6 +37,9 @@ import {
   Activity,
   Settings,
   Eye,
+  Grid3X3,
+  Lock,
+  Layers,
 } from "lucide-react";
 
 function fmt(n: number | null | undefined, decimals = 2): string {
@@ -56,6 +62,15 @@ function fmtAgo(ms: number | null): string {
   if (m < 60) return `${m}m atrás`;
   return `${Math.floor(m / 60)}h atrás`;
 }
+
+function fmtTtl(ms: number): string {
+  if (ms <= 0) return "expirado";
+  const s = Math.round(ms / 1000);
+  if (s < 60) return `${s}s`;
+  return `${Math.floor(s / 60)}m${s % 60 > 0 ? ` ${s % 60}s` : ""}`;
+}
+
+// ── Old trigger strategy components ──────────────────────────────────────────
 
 function ArmedCard({ s, side, onReset }: {
   s: TriggerSymbolState;
@@ -318,6 +333,193 @@ function SymbolRow({ s, onReset }: { s: TriggerSymbolState; onReset: (sym: strin
   );
 }
 
+// ── Tail Hunter Native Grid components ────────────────────────────────────────
+
+function PendingOrderRow({ o }: { o: NativePendingOrder }) {
+  const isLong = o.direction === "LONG";
+  const token = o.symbol.replace("-USDT", "");
+  const ttlPct = Math.min(100, (o.ttlRemainingMs / (o.expiresAt - o.armedAt)) * 100);
+
+  return (
+    <div className={`flex items-center gap-3 px-3 py-2 rounded-lg border ${
+      isLong
+        ? "border-emerald-500/20 bg-emerald-950/15"
+        : "border-rose-500/20 bg-rose-950/15"
+    }`}>
+      <div className={`w-6 h-6 rounded flex items-center justify-center shrink-0 ${
+        isLong ? "bg-emerald-500/20" : "bg-rose-500/20"
+      }`}>
+        {isLong
+          ? <TrendingUp className="w-3.5 h-3.5 text-emerald-400" />
+          : <TrendingDown className="w-3.5 h-3.5 text-rose-400" />
+        }
+      </div>
+      <div className="font-mono text-xs font-bold text-foreground/85 w-16 shrink-0">{token}</div>
+      <div className={`text-[10px] font-semibold shrink-0 ${isLong ? "text-emerald-400" : "text-rose-400"}`}>
+        {o.direction}
+      </div>
+      <div className="flex-1 min-w-0">
+        <div className="text-[10px] font-mono text-foreground/75">{fmtPrice(o.triggerPrice)}</div>
+        {o.sectorCluster && (
+          <div className="text-[9px] text-muted-foreground/40 truncate">{o.sectorCluster}</div>
+        )}
+      </div>
+      <div className="text-right shrink-0">
+        <div className={`text-[9px] font-mono ${o.ttlRemainingMs < 30000 ? "text-amber-400" : "text-muted-foreground/50"}`}>
+          {fmtTtl(o.ttlRemainingMs)}
+        </div>
+        <div className="w-16 h-0.5 bg-black/30 rounded-full mt-1 overflow-hidden">
+          <div
+            className={`h-full rounded-full transition-all duration-1000 ${
+              ttlPct < 20 ? "bg-amber-400" : isLong ? "bg-emerald-500/70" : "bg-rose-500/70"
+            }`}
+            style={{ width: `${Math.max(0, ttlPct)}%` }}
+          />
+        </div>
+      </div>
+      <div className="text-[9px] text-muted-foreground/35 shrink-0">{fmtAgo(o.armedAt)}</div>
+    </div>
+  );
+}
+
+function NativeSymbolCard({ sym }: { sym: NativeTriggerSymbol }) {
+  const [expanded, setExpanded] = useState(false);
+  const token = sym.symbol.replace("-USDT", "");
+  const movePct = sym.recentMovePct;
+  const isDropping = movePct < 0;
+  const isPumping = movePct > 0;
+  const inCooldownLong = sym.longCooldownMs > 0;
+  const inCooldownShort = sym.shortCooldownMs > 0;
+
+  const absMov = Math.abs(movePct);
+
+  return (
+    <div className="border border-border/15 rounded-lg bg-card/5 overflow-hidden">
+      <div
+        className="flex items-center gap-2 px-3 py-2 cursor-pointer hover:bg-muted/8 transition-colors"
+        onClick={() => setExpanded((v) => !v)}
+      >
+        <span className="font-mono text-xs font-semibold text-foreground/85 w-16 shrink-0">{token}</span>
+
+        <div className={`flex items-center gap-0.5 shrink-0 w-20 text-[10px] font-mono tabular-nums ${
+          isDropping ? "text-emerald-400" : isPumping ? "text-rose-400" : "text-muted-foreground/40"
+        }`}>
+          {isDropping ? <ArrowDown className="w-2.5 h-2.5" /> : isPumping ? <ArrowUp className="w-2.5 h-2.5" /> : null}
+          {movePct >= 0 ? "+" : ""}{fmt(movePct)}%
+        </div>
+
+        <div className="flex-1 flex items-center gap-1.5">
+          {sym.wouldFireLong && (
+            <Badge className="bg-emerald-400/20 text-emerald-300 border-emerald-400/30 text-[9px] px-1.5 py-0 h-4">
+              <Zap className="w-2 h-2 mr-0.5" />LONG FIRE
+            </Badge>
+          )}
+          {sym.wouldFireShort && (
+            <Badge className="bg-rose-400/20 text-rose-300 border-rose-400/30 text-[9px] px-1.5 py-0 h-4">
+              <Zap className="w-2 h-2 mr-0.5" />SHORT FIRE
+            </Badge>
+          )}
+          {inCooldownLong && (
+            <Badge className="bg-amber-500/15 text-amber-400 border-amber-500/25 text-[9px] px-1.5 py-0 h-4">
+              <Clock className="w-2 h-2 mr-0.5" />CD-L {fmtTtl(sym.longCooldownMs)}
+            </Badge>
+          )}
+          {inCooldownShort && (
+            <Badge className="bg-amber-500/15 text-amber-400 border-amber-500/25 text-[9px] px-1.5 py-0 h-4">
+              <Clock className="w-2 h-2 mr-0.5" />CD-S {fmtTtl(sym.shortCooldownMs)}
+            </Badge>
+          )}
+          {!sym.wouldFireLong && !sym.wouldFireShort && !inCooldownLong && !inCooldownShort && (
+            <span className="text-[9px] text-muted-foreground/30">aguardando</span>
+          )}
+        </div>
+
+        <div className="flex items-center gap-1 shrink-0">
+          <span className="text-[9px] text-muted-foreground/40 font-mono">{fmtPrice(sym.currentPrice)}</span>
+        </div>
+
+        {expanded ? <ChevronUp className="w-3 h-3 text-muted-foreground/30 shrink-0" /> : <ChevronDown className="w-3 h-3 text-muted-foreground/30 shrink-0" />}
+      </div>
+
+      {expanded && (
+        <div className="border-t border-border/10 px-3 py-3 bg-black/10 space-y-3">
+          <div className="grid grid-cols-2 gap-3">
+            {/* LONG grid levels */}
+            <div className="space-y-1.5">
+              <div className="text-[9px] font-semibold text-emerald-400/70 uppercase tracking-wider flex items-center gap-1">
+                <TrendingUp className="w-3 h-3" />LONG Grid ({sym.longGrid.length} níveis)
+              </div>
+              {sym.longGrid.length === 0 ? (
+                <div className="text-[9px] text-muted-foreground/35">sem dados de candle</div>
+              ) : (
+                <div className="space-y-1">
+                  {sym.longGrid.map((lvl) => {
+                    const pct = Math.min(100, Math.max(0, (absMov / lvl.distancePct) * 100));
+                    return (
+                      <div key={lvl.level} className="bg-black/20 rounded p-1.5 space-y-1">
+                        <div className="flex items-center justify-between">
+                          <span className="text-[9px] text-emerald-400/60 font-semibold">L{lvl.level} · −{fmt(lvl.distancePct)}% · {Math.round(lvl.allocationFactor * 100)}%</span>
+                          <span className="text-[9px] font-mono text-foreground/70">{fmtPrice(lvl.triggerPrice)}</span>
+                        </div>
+                        <div className="h-0.5 bg-border/20 rounded-full overflow-hidden">
+                          <div className="h-full bg-emerald-500/50 transition-all duration-500" style={{ width: `${pct}%` }} />
+                        </div>
+                        <div className="flex justify-between text-[9px]">
+                          <span className="text-muted-foreground/40">TP <span className="font-mono text-emerald-400/70">{fmtPrice(lvl.targetPrice)}</span></span>
+                          <span className="text-muted-foreground/40">SL <span className="font-mono text-rose-400/70">{fmtPrice(lvl.stopPrice)}</span></span>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
+            {/* SHORT grid levels */}
+            <div className="space-y-1.5">
+              <div className="text-[9px] font-semibold text-rose-400/70 uppercase tracking-wider flex items-center gap-1">
+                <TrendingDown className="w-3 h-3" />SHORT Grid ({sym.shortGrid.length} níveis)
+              </div>
+              {sym.shortGrid.length === 0 ? (
+                <div className="text-[9px] text-muted-foreground/35">sem dados de candle</div>
+              ) : (
+                <div className="space-y-1">
+                  {sym.shortGrid.map((lvl) => {
+                    const pct = Math.min(100, Math.max(0, (absMov / lvl.distancePct) * 100));
+                    return (
+                      <div key={lvl.level} className="bg-black/20 rounded p-1.5 space-y-1">
+                        <div className="flex items-center justify-between">
+                          <span className="text-[9px] text-rose-400/60 font-semibold">S{lvl.level} · +{fmt(lvl.distancePct)}% · {Math.round(lvl.allocationFactor * 100)}%</span>
+                          <span className="text-[9px] font-mono text-foreground/70">{fmtPrice(lvl.triggerPrice)}</span>
+                        </div>
+                        <div className="h-0.5 bg-border/20 rounded-full overflow-hidden">
+                          <div className="h-full bg-rose-500/50 transition-all duration-500" style={{ width: `${pct}%` }} />
+                        </div>
+                        <div className="flex justify-between text-[9px]">
+                          <span className="text-muted-foreground/40">TP <span className="font-mono text-emerald-400/70">{fmtPrice(lvl.targetPrice)}</span></span>
+                          <span className="text-muted-foreground/40">SL <span className="font-mono text-rose-400/70">{fmtPrice(lvl.stopPrice)}</span></span>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          </div>
+
+          <div className="pt-1.5 border-t border-border/10 flex items-center gap-4 text-[9px] text-muted-foreground/40">
+            <span>Atual <span className="font-mono text-foreground/60">{fmtPrice(sym.currentPrice)}</span></span>
+            <span>ATR <span className="font-mono">{fmt(sym.atrPct)}%</span></span>
+            <span>Mov 5m <span className={`font-mono ${isDropping ? "text-emerald-400/60" : isPumping ? "text-rose-400/60" : ""}`}>{movePct >= 0 ? "+" : ""}{fmt(movePct)}%</span></span>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Page ──────────────────────────────────────────────────────────────────────
+
 export default function TriggerPage() {
   const qc = useQueryClient();
   const { toast } = useToast();
@@ -333,6 +535,8 @@ export default function TriggerPage() {
     queryFn: getTriggerStatus,
     refetchInterval: 3000,
   });
+
+  const { data: nativeStatus, isLoading: nativeLoading, refetch: nativeRefetch } = useNativeTriggerStatus();
 
   const enableMut = useEnableTrigger({
     onSuccess: () => {
@@ -389,6 +593,9 @@ export default function TriggerPage() {
     if (s.shortArmed || s.shortFiredAt) armedCards.push({ s, side: "SHORT" });
   }
 
+  const nativeSymbolsFireable = (nativeStatus?.symbols ?? []).filter(s => s.wouldFireLong || s.wouldFireShort);
+  const muxLocked = nativeStatus?.muxLock?.locked ?? false;
+
   return (
     <AppShell>
       <div className="p-4 md:p-6 space-y-4 max-w-5xl mx-auto">
@@ -420,10 +627,10 @@ export default function TriggerPage() {
               size="sm"
               variant="ghost"
               className="h-7 px-2 text-[11px]"
-              onClick={() => refetch()}
-              disabled={isLoading}
+              onClick={() => { refetch(); nativeRefetch(); }}
+              disabled={isLoading || nativeLoading}
             >
-              <RefreshCw className={`w-3.5 h-3.5 ${isLoading ? "animate-spin" : ""}`} />
+              <RefreshCw className={`w-3.5 h-3.5 ${(isLoading || nativeLoading) ? "animate-spin" : ""}`} />
             </Button>
             {isEnabled && (
               <Button
@@ -610,11 +817,9 @@ export default function TriggerPage() {
                   </div>
                 </CardHeader>
                 <CardContent className="px-4 pb-4 space-y-1">
-                  {/* Armados primeiro */}
                   {armedSymbols.map((s) => (
                     <SymbolRow key={s.symbol} s={s} onReset={(sym) => resetMut.mutate(sym)} />
                   ))}
-                  {/* Divisor se houver ambos */}
                   {armedSymbols.length > 0 && monitoringSymbols.length > 0 && (
                     <div className="flex items-center gap-2 py-1">
                       <div className="flex-1 h-px bg-border/10" />
@@ -630,6 +835,131 @@ export default function TriggerPage() {
             )}
           </>
         )}
+
+        {/* ════════════════════════════════════════════════════════════════════
+            Tail Hunter Grid — Motor Nativo de Gatilhos (sempre visível)
+        ════════════════════════════════════════════════════════════════════ */}
+        <div>
+          <div className="flex items-center gap-2 mb-3">
+            <Grid3X3 className="w-4 h-4 text-violet-400" />
+            <h2 className="text-sm font-semibold text-foreground">Tail Hunter Grid</h2>
+            <Badge variant="outline" className="text-[10px] border-violet-500/30 text-violet-400">
+              Motor Nativo
+            </Badge>
+            {muxLocked && (
+              <Badge className="text-[9px] bg-amber-500/15 text-amber-400 border-amber-500/25">
+                <Lock className="w-2 h-2 mr-0.5" />MUX LOCK
+              </Badge>
+            )}
+            <div className="flex-1 h-px bg-border/15" />
+            {nativeStatus?.config && (
+              <span className="text-[9px] text-muted-foreground/40 shrink-0">
+                L −{fmt(nativeStatus.config.longDetectPct)}% · S +{fmt(nativeStatus.config.shortDetectPct)}%
+              </span>
+            )}
+          </div>
+
+          {/* Pending orders summary */}
+          <div className="grid grid-cols-3 gap-3 mb-3">
+            <Card className="border-border/15 bg-card/8">
+              <CardContent className="px-3 py-2.5 text-center">
+                <div className="text-[9px] text-muted-foreground/50 uppercase tracking-wider">Ordens Pending</div>
+                <div className="text-xl font-bold text-foreground mt-0.5">{nativeStatus?.pendingOrders.length ?? 0}</div>
+                <div className="text-[9px] text-muted-foreground/40">na BingX</div>
+              </CardContent>
+            </Card>
+            <Card className="border-emerald-500/20 bg-emerald-950/15">
+              <CardContent className="px-3 py-2.5 text-center">
+                <div className="text-[9px] text-emerald-400/60 uppercase tracking-wider">LONG pending</div>
+                <div className="text-xl font-bold text-emerald-400 mt-0.5">{nativeStatus?.pendingLong ?? 0}</div>
+                <div className="text-[9px] text-emerald-400/40">entradas</div>
+              </CardContent>
+            </Card>
+            <Card className="border-rose-500/20 bg-rose-950/15">
+              <CardContent className="px-3 py-2.5 text-center">
+                <div className="text-[9px] text-rose-400/60 uppercase tracking-wider">SHORT pending</div>
+                <div className="text-xl font-bold text-rose-400 mt-0.5">{nativeStatus?.pendingShort ?? 0}</div>
+                <div className="text-[9px] text-rose-400/40">entradas</div>
+              </CardContent>
+            </Card>
+          </div>
+
+          {/* Pending orders list */}
+          {(nativeStatus?.pendingOrders.length ?? 0) > 0 ? (
+            <Card className="border-border/15 bg-card/8 mb-3">
+              <CardHeader className="pb-2 pt-3.5 px-4">
+                <CardTitle className="text-xs font-semibold flex items-center gap-2 text-muted-foreground/70">
+                  <Layers className="w-3.5 h-3.5 text-violet-400" />
+                  Ordens LIMIT no BingX
+                  <Badge variant="outline" className="text-[9px] border-violet-500/30 text-violet-400">
+                    {nativeStatus!.pendingOrders.length}
+                  </Badge>
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="px-4 pb-4 space-y-1.5">
+                {nativeStatus!.pendingOrders.map((o) => (
+                  <PendingOrderRow key={o.id} o={o} />
+                ))}
+              </CardContent>
+            </Card>
+          ) : (
+            <Card className="border-border/15 bg-card/5 mb-3">
+              <CardContent className="flex items-center justify-center py-6 gap-3">
+                <Eye className="w-4 h-4 text-muted-foreground/25" />
+                <div className="text-[11px] text-muted-foreground/40">
+                  Nenhuma ordem LIMIT pendente no BingX
+                </div>
+              </CardContent>
+            </Card>
+          )}
+
+          {/* Symbols with wouldFire first */}
+          {nativeSymbolsFireable.length > 0 && (
+            <div className="mb-2">
+              <div className="flex items-center gap-2 mb-2">
+                <Zap className="w-3.5 h-3.5 text-amber-400" />
+                <span className="text-[11px] font-semibold text-amber-400">Prontos para disparar</span>
+                <Badge className="text-[9px] bg-amber-500/15 text-amber-400 border-amber-500/25">{nativeSymbolsFireable.length}</Badge>
+              </div>
+              <div className="space-y-1">
+                {nativeSymbolsFireable.map((sym) => (
+                  <NativeSymbolCard key={sym.symbol} sym={sym} />
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* All symbols grid */}
+          <Card className="border-border/15 bg-card/8">
+            <CardHeader className="pb-2 pt-3.5 px-4">
+              <CardTitle className="text-xs font-semibold flex items-center gap-2 text-muted-foreground/70">
+                <Activity className="w-3.5 h-3.5" />
+                Níveis de Grid por Símbolo
+                <Badge variant="outline" className="text-[9px]">{nativeStatus?.symbols.length ?? 0}</Badge>
+                <span className="text-[9px] text-muted-foreground/35 font-normal ml-1">
+                  LONG: L1 −10% L2 −11% L3 −12% · SHORT: S1 +20% S2 +21% S3 +22% S4 +24%
+                </span>
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="px-4 pb-4 space-y-1">
+              {nativeLoading && (nativeStatus?.symbols.length ?? 0) === 0 ? (
+                <div className="flex items-center justify-center py-8 text-[11px] text-muted-foreground/40">
+                  <RefreshCw className="w-3.5 h-3.5 mr-2 animate-spin" />Carregando dados de candle...
+                </div>
+              ) : (nativeStatus?.symbols ?? []).length === 0 ? (
+                <div className="flex items-center justify-center py-8 text-[11px] text-muted-foreground/40">
+                  Nenhum símbolo configurado
+                </div>
+              ) : (
+                (nativeStatus?.symbols ?? [])
+                  .filter(s => !s.wouldFireLong && !s.wouldFireShort)
+                  .map((sym) => (
+                    <NativeSymbolCard key={sym.symbol} sym={sym} />
+                  ))
+              )}
+            </CardContent>
+          </Card>
+        </div>
 
       </div>
     </AppShell>
