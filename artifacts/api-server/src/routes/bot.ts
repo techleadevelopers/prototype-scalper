@@ -98,6 +98,87 @@ const router = Router();
 
 const BINGX_BASE = "https://open-api.bingx.com";
 
+type QuantMassEntryLevel = {
+  index?: number;
+  level?: number;
+  label?: string;
+  price?: number;
+  triggerPrice?: number;
+  targetPrice?: number;
+  stopPrice?: number;
+  position_weight_pct?: number;
+  allocationFactor?: number;
+};
+
+type QuantMassEntryZone = {
+  symbol: string;
+  side: "LONG" | "SHORT";
+  base_price?: number;
+  total_confluence: number;
+  strategy?: string;
+  levels: QuantMassEntryLevel[];
+};
+
+function quantBrainHttpHeaders(): Record<string, string> {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  const token = process.env["QUANT_BRAIN_API_TOKEN"]?.trim();
+  if (token) headers["X-Quant-Brain-Token"] = token;
+  return headers;
+}
+
+async function fetchQuantMassEntryZones(): Promise<QuantMassEntryZone[]> {
+  const baseUrl = process.env["QUANT_BRAIN_URL"]?.trim().replace(/\/+$/, "");
+  if (!baseUrl) throw new Error("QUANT_BRAIN_URL not configured");
+  const response = await fetch(`${baseUrl}/sniper/mass-entry-zones`, {
+    headers: quantBrainHttpHeaders(),
+    signal: AbortSignal.timeout(8_000),
+  });
+  if (!response.ok) throw new Error(`Quant Brain mass-entry HTTP ${response.status}`);
+  const payload = await response.json() as { zones?: unknown };
+  return Array.isArray(payload.zones) ? payload.zones as QuantMassEntryZone[] : [];
+}
+
+function fallbackTargetStop(
+  triggerPrice: number,
+  side: "LONG" | "SHORT",
+  config: ReturnType<typeof getBotConfig>,
+): { targetPrice: number; stopPrice: number } {
+  return side === "LONG"
+    ? {
+        targetPrice: triggerPrice * (1 + config.takeProfitPct / 100),
+        stopPrice: triggerPrice * (1 - config.stopLossPct / 100),
+      }
+    : {
+        targetPrice: triggerPrice * (1 - config.takeProfitPct / 100),
+        stopPrice: triggerPrice * (1 + config.stopLossPct / 100),
+      };
+}
+
+function massZoneToGrid(
+  zone: QuantMassEntryZone,
+  config: ReturnType<typeof getBotConfig>,
+): GridLevel[] {
+  return zone.levels
+    .map((level, idx): GridLevel | null => {
+      const triggerPrice = Number(level.triggerPrice ?? level.price ?? 0);
+      if (!Number.isFinite(triggerPrice) || triggerPrice <= 0) return null;
+      const fallback = fallbackTargetStop(triggerPrice, zone.side, config);
+      const targetPrice = Number(level.targetPrice ?? fallback.targetPrice);
+      const stopPrice = Number(level.stopPrice ?? fallback.stopPrice);
+      const allocationFactor = Number(level.allocationFactor ?? ((level.position_weight_pct ?? 0) / 100));
+      if (!Number.isFinite(targetPrice) || !Number.isFinite(stopPrice) || targetPrice <= 0 || stopPrice <= 0) return null;
+      return {
+        level: Number(level.level ?? idx + 1),
+        side: zone.side,
+        triggerPrice,
+        targetPrice,
+        stopPrice,
+        allocationFactor: Math.max(0.01, Math.min(1, Number.isFinite(allocationFactor) ? allocationFactor : 1 / zone.levels.length)),
+      };
+    })
+    .filter((level): level is GridLevel => level !== null);
+}
+
 type ProtectionBuildResult = {
   orderParams: Record<string, string | number>;
   protectionAttached: boolean;
@@ -658,9 +739,35 @@ interface AutopilotCycleSummary {
   attempted: number;
   placed: number;
   rejected: number;
+  massEntriesAttempted?: number;
+  massEntriesArmed?: number;
+  massEntryLevelsArmed?: number;
   btcChangePct: number;
   aggressionState?: string;
   aggressionReason?: string;
+}
+
+type DecisionTraceStageStatus = "ok" | "blocked" | "warning" | "error" | "skipped";
+
+interface DecisionTraceStage {
+  stage: string;
+  status: DecisionTraceStageStatus;
+  at: number;
+  durationMs?: number;
+  reason?: string;
+  details?: Record<string, unknown>;
+}
+
+interface DecisionTrace {
+  id: string;
+  source: "autopilot" | "manual_mass_entry";
+  cycle?: number;
+  startedAt: number;
+  finishedAt?: number;
+  durationMs?: number;
+  finalStatus: "running" | "armed" | "placed" | "blocked" | "skipped" | "error";
+  finalReason?: string;
+  stages: DecisionTraceStage[];
 }
 
 interface AutopilotState {
@@ -690,6 +797,215 @@ const autopilot: AutopilotState = {
 };
 let autopilotCycleInFlight = false;
 let autopilotSkippedOverlaps = 0;
+const massEntryArmClaims = new Map<string, number>();
+const decisionTraces: DecisionTrace[] = [];
+
+function maxDecisionTraces(): number {
+  return Math.max(20, Math.min(Number(process.env["EXECUTION_TRACE_MAX_ITEMS"] ?? 200), 1000));
+}
+
+function addTraceStage(
+  trace: DecisionTrace,
+  stage: string,
+  status: DecisionTraceStageStatus,
+  details?: Record<string, unknown>,
+  reason?: string,
+): void {
+  trace.stages.push({
+    stage,
+    status,
+    at: Date.now(),
+    durationMs: Date.now() - trace.startedAt,
+    reason,
+    details,
+  });
+}
+
+function recordDecisionTrace(trace: DecisionTrace, finalStatus: DecisionTrace["finalStatus"], finalReason?: string): void {
+  trace.finishedAt = Date.now();
+  trace.durationMs = trace.finishedAt - trace.startedAt;
+  trace.finalStatus = finalStatus;
+  trace.finalReason = finalReason;
+  decisionTraces.push(trace);
+  const maxItems = maxDecisionTraces();
+  if (decisionTraces.length > maxItems) {
+    decisionTraces.splice(0, decisionTraces.length - maxItems);
+  }
+}
+
+function storeAutopilotSummary(summary: AutopilotCycleSummary, trace: DecisionTrace, finalStatus: DecisionTrace["finalStatus"], finalReason?: string): void {
+  autopilot.lastCycle = summary;
+  autopilot.history.push(summary);
+  if (autopilot.history.length > 100) autopilot.history.shift();
+  recordDecisionTrace(trace, finalStatus, finalReason);
+}
+
+function claimMassEntryArm(key: string, ttlMs: number): boolean {
+  const now = Date.now();
+  for (const [claimKey, expiresAt] of massEntryArmClaims) {
+    if (expiresAt <= now) massEntryArmClaims.delete(claimKey);
+  }
+  const existing = massEntryArmClaims.get(key);
+  if (existing && existing > now) return false;
+  massEntryArmClaims.set(key, now + ttlMs);
+  return true;
+}
+
+type MassEntryArmResult = {
+  armed: boolean;
+  reason?: string;
+  zonesAvailable: number;
+  zonesSelected: number;
+  armedZones: number;
+  rejectedZones: number;
+  marginPerZone: number;
+  leverage: number;
+  results: Array<{
+    symbol: string;
+    side: "LONG" | "SHORT";
+    armed: boolean;
+    levelsArmed: number;
+    levelsFailed: number;
+    orderIds: string[];
+    triggerIds: string[];
+    rejects: string[];
+  }>;
+};
+
+async function armQuantMassEntryZones(options: {
+  creds: ExecutionCredentials;
+  config: ReturnType<typeof getBotConfig>;
+  capitalCtx?: CapitalContext | null;
+  maxZones?: number;
+  minConfluence?: number;
+  marginPerZone?: number;
+  leverage?: number;
+  dedupeMs?: number;
+}): Promise<MassEntryArmResult> {
+  const { creds, config } = options;
+  const maxZones = Math.max(1, Math.min(Number(options.maxZones ?? 3), 10));
+  const minConfluence = Math.max(0, Math.min(Number(options.minConfluence ?? 0.60), 1));
+  const marginPerZone = Math.max(0.1, Number(options.marginPerZone ?? config.marginPerTrade));
+  const leverage = Math.max(1, Math.round(Number(options.leverage ?? config.leverage)));
+  const dedupeMs = Math.max(5_000, Number(options.dedupeMs ?? process.env["MASS_ENTRY_ARM_DEDUPE_MS"] ?? 60_000));
+
+  const [zones, resolvedCapitalCtx] = await Promise.all([
+    fetchQuantMassEntryZones(),
+    options.capitalCtx ? Promise.resolve(options.capitalCtx) : fetchCapitalContext(creds).catch(() => null),
+  ]);
+  const emptyResult = (reason?: string): MassEntryArmResult => ({
+    armed: false,
+    reason,
+    zonesAvailable: zones.length,
+    zonesSelected: 0,
+    armedZones: 0,
+    rejectedZones: 0,
+    marginPerZone,
+    leverage,
+    results: [],
+  });
+  if (!resolvedCapitalCtx) {
+    return emptyResult("CAPITAL_CONTEXT_REJECT: live capital snapshot unavailable");
+  }
+
+  const selected = zones
+    .filter((zone) => (zone.side === "LONG" || zone.side === "SHORT") && zone.total_confluence >= minConfluence)
+    .filter((zone) => config.allowedSymbols.length === 0 || config.allowedSymbols.includes(zone.symbol))
+    .sort((a, b) => b.total_confluence - a.total_confluence)
+    .slice(0, maxZones);
+
+  const results: MassEntryArmResult["results"] = [];
+  let projectedOpenCount = resolvedCapitalCtx.openPositionsCount;
+  for (const zone of selected) {
+    const rejects: string[] = [];
+    const symbol = zone.symbol.toUpperCase();
+    const side = zone.side;
+    const counts = resolvedCapitalCtx.countsBySide.get(symbol) ?? { LONG: 0, SHORT: 0 };
+    const sameSide = counts[side];
+    const oppSide = counts[side === "LONG" ? "SHORT" : "LONG"];
+    const stackLimit = driftAdjustedStackLimit(config);
+    const claimKey = `${symbol}:${side}:${zone.levels.map((l) => Number(l.triggerPrice ?? l.price ?? 0).toFixed(8)).join("|")}`;
+
+    if (projectedOpenCount >= config.maxConcurrentPositions) {
+      rejects.push(`CAPITAL_REJECT: ${projectedOpenCount} positions >= max ${config.maxConcurrentPositions}`);
+    }
+    if (resolvedCapitalCtx.marginUtilization > config.maxMarginUtilization) {
+      rejects.push(`MARGIN_REJECT: ${(resolvedCapitalCtx.marginUtilization * 100).toFixed(1)}% > max ${(config.maxMarginUtilization * 100).toFixed(0)}%`);
+    }
+    if (config.preventHedgedPositions && oppSide > 0) {
+      rejects.push(`HEDGE_REJECT: ${symbol} has ${oppSide} open ${side === "LONG" ? "SHORT" : "LONG"} position(s)`);
+    }
+    if (stackLimit === 0) {
+      rejects.push("DRIFT_PAUSED_REJECT: drift policy blocks new entries");
+    } else if (sameSide >= stackLimit) {
+      rejects.push(`STACK_REJECT: ${symbol} ${side} at limit ${sameSide}/${stackLimit}`);
+    }
+    if (!claimMassEntryArm(claimKey, dedupeMs)) {
+      rejects.push("DUPLICATE_MASS_TRIGGER_REJECT: equivalent mass-entry grid was armed recently");
+    }
+
+    const grid = massZoneToGrid(zone, config);
+    if (grid.length === 0) rejects.push("GRID_REJECT: zone has no valid trigger levels");
+
+    if (rejects.length > 0) {
+      results.push({ symbol, side, armed: false, levelsArmed: 0, levelsFailed: 0, orderIds: [], triggerIds: [], rejects });
+      if (rejects.some((reason) => reason.startsWith("GRID_REJECT"))) massEntryArmClaims.delete(claimKey);
+      continue;
+    }
+
+    const signalId = randomUUID();
+    const sectorCluster = getSectorCluster(symbol);
+    const brainResponse: GridBrainResponse = {
+      decision: "ARM_TRIGGER_GRID",
+      grid,
+      executionMetrics: {
+        recommendedLeverage: leverage,
+        gridStrategy: `MASS_${zone.strategy ?? "LADDER"}`,
+        expirationSeconds: Number(process.env["MASS_ENTRY_TRIGGER_EXPIRATION_SECONDS"] ?? 60),
+      },
+      metadata: { signalId, symbol, sectorCluster },
+    };
+
+    const gridResult = await processGridTrigger({
+      symbol,
+      positionSide: side,
+      brainResponse,
+      totalMargin: marginPerZone,
+      leverage,
+      signalId,
+      sectorCluster,
+      creds,
+      hourUtc: new Date().getUTCHours(),
+      btcRegime: "NEUTRAL",
+    });
+
+    const armed = gridResult.levelsArmed > 0;
+    if (!armed) massEntryArmClaims.delete(claimKey);
+    if (armed) projectedOpenCount += 1;
+    results.push({
+      symbol,
+      side,
+      armed,
+      levelsArmed: gridResult.levelsArmed,
+      levelsFailed: gridResult.levelsFailed,
+      orderIds: gridResult.orderIds,
+      triggerIds: gridResult.triggerIds,
+      rejects: [],
+    });
+  }
+
+  const armedZones = results.filter((result) => result.armed).length;
+  return {
+    armed: armedZones > 0,
+    zonesAvailable: zones.length,
+    zonesSelected: selected.length,
+    armedZones,
+    rejectedZones: results.length - armedZones,
+    marginPerZone,
+    leverage,
+    results,
+  };
+}
 
 async function runAutopilotCycleLocked(): Promise<void> {
   if (autopilotCycleInFlight) {
@@ -721,6 +1037,20 @@ async function runAutopilotCycle(): Promise<void> {
   const engine = getEngine();
   const t0 = Date.now();
   const cycleNum = ++autopilot.totalCycles;
+  const trace: DecisionTrace = {
+    id: randomUUID(),
+    source: "autopilot",
+    cycle: cycleNum,
+    startedAt: t0,
+    finalStatus: "running",
+    stages: [],
+  };
+  addTraceStage(trace, "cycle_start", "ok", {
+    gateMode: quantBrainGateMode(),
+    maxConcurrentPositions: config.maxConcurrentPositions,
+    maxMarginUtilization: config.maxMarginUtilization,
+    allowedSymbols: config.allowedSymbols.length,
+  });
 
   // Fetch BTC regime + capital in parallel
   let btcChangePct = 0;
@@ -738,8 +1068,27 @@ async function runAutopilotCycle(): Promise<void> {
   }
 
   if (!capitalCtx) {
+    const summary: AutopilotCycleSummary = {
+      cycle: cycleNum,
+      startedAt: t0,
+      durationMs: Date.now() - t0,
+      candidates: 0,
+      attempted: 0,
+      placed: 0,
+      rejected: 0,
+      btcChangePct,
+      aggressionState: "BLOCKED",
+      aggressionReason: "CAPITAL_CONTEXT_REJECT",
+    };
+    addTraceStage(trace, "capital_context", "blocked", { btcTickerOk: btcResp?.code === 0 }, "CAPITAL_CONTEXT_REJECT: live capital snapshot unavailable");
+    storeAutopilotSummary(summary, trace, "blocked", "CAPITAL_CONTEXT_REJECT");
     return; // Skip cycle — cannot verify capital
   }
+  addTraceStage(trace, "capital_context", "ok", {
+    openPositionsCount: capitalCtx.openPositionsCount,
+    marginUtilization: capitalCtx.marginUtilization,
+    availableMargin: capitalCtx.availableMargin,
+  });
 
   const killSwitch = evaluateLiveKillSwitch({
     config,
@@ -749,6 +1098,7 @@ async function runAutopilotCycle(): Promise<void> {
     integrityOk: true,
   });
   if (!killSwitch.entryAllowed) {
+    addTraceStage(trace, "kill_switch", "blocked", { state: killSwitch.state }, killSwitch.reason);
     const summary: AutopilotCycleSummary = {
       cycle: cycleNum,
       startedAt: t0,
@@ -761,37 +1111,67 @@ async function runAutopilotCycle(): Promise<void> {
       aggressionState: killSwitch.state,
       aggressionReason: killSwitch.reason,
     };
-    autopilot.lastCycle = summary;
-    autopilot.history.push(summary);
-    if (autopilot.history.length > 100) autopilot.history.shift();
+    storeAutopilotSummary(summary, trace, "blocked", killSwitch.reason);
     return;
   }
+  addTraceStage(trace, "kill_switch", "ok", { state: killSwitch.state, reason: killSwitch.reason });
   config = applyKillSwitchToConfig(config, killSwitch);
 
   // Session loss circuit-breaker
   if (config.maxSessionLoss > 0 && autopilot.sessionLossUsd >= config.maxSessionLoss) {
-    stopAutopilot(`SESSION_LOSS_LIMIT: ${autopilot.sessionLossUsd.toFixed(2)} USD >= ${config.maxSessionLoss} USD`);
+    const reason = `SESSION_LOSS_LIMIT: ${autopilot.sessionLossUsd.toFixed(2)} USD >= ${config.maxSessionLoss} USD`;
+    addTraceStage(trace, "session_loss", "blocked", { sessionLossUsd: autopilot.sessionLossUsd, maxSessionLoss: config.maxSessionLoss }, reason);
+    recordDecisionTrace(trace, "blocked", reason);
+    stopAutopilot(reason);
     return;
   }
 
   // No room for more positions
-  if (capitalCtx.openPositionsCount >= config.maxConcurrentPositions) return;
-  if (capitalCtx.marginUtilization > config.maxMarginUtilization) return;
+  if (capitalCtx.openPositionsCount >= config.maxConcurrentPositions) {
+    const reason = `CAPITAL_REJECT: ${capitalCtx.openPositionsCount} positions >= max ${config.maxConcurrentPositions}`;
+    addTraceStage(trace, "position_headroom", "blocked", { openPositionsCount: capitalCtx.openPositionsCount }, reason);
+    recordDecisionTrace(trace, "blocked", reason);
+    return;
+  }
+  if (capitalCtx.marginUtilization > config.maxMarginUtilization) {
+    const reason = `MARGIN_REJECT: ${(capitalCtx.marginUtilization * 100).toFixed(1)}% > max ${(config.maxMarginUtilization * 100).toFixed(0)}%`;
+    addTraceStage(trace, "margin_utilization", "blocked", { marginUtilization: capitalCtx.marginUtilization }, reason);
+    recordDecisionTrace(trace, "blocked", reason);
+    return;
+  }
 
   const symbols = config.allowedSymbols;
-  if (symbols.length === 0) return;
+  if (symbols.length === 0) {
+    addTraceStage(trace, "symbol_allowlist", "blocked", {}, "NO_SYMBOLS_CONFIGURED");
+    recordDecisionTrace(trace, "blocked", "NO_SYMBOLS_CONFIGURED");
+    return;
+  }
 
   const btcRegime: import("../lib/adaptiveEngine").BtcRegime =
     btcChangePct >= config.btcRegimeThresholdPct ? "BULL" :
     btcChangePct <= -config.btcRegimeThresholdPct ? "BEAR" : "NEUTRAL";
   const hourUtc = new Date().getUTCHours();
 
-  if (config.hourBlacklist.includes(hourUtc)) return;
+  if (config.hourBlacklist.includes(hourUtc)) {
+    const reason = `HOUR_BLACKLIST_REJECT: ${hourUtc}`;
+    addTraceStage(trace, "hour_blacklist", "blocked", { hourUtc }, reason);
+    recordDecisionTrace(trace, "blocked", reason);
+    return;
+  }
 
   // Fetch candle edges for all symbols in parallel
   const candleEdges = await computeAllCandleEdges(symbols, "5m").catch(() =>
     symbols.map((sym) => ({ symbol: sym, longScore: 0, shortScore: 0, error: "fetch failed" }))
   );
+  const candleErrors = candleEdges.filter((edge) => Boolean((edge as { error?: string | null }).error));
+  addTraceStage(trace, "candle_edges", candleErrors.length > 0 ? "warning" : "ok", {
+    symbols: symbols.length,
+    errors: candleErrors.length,
+    errorSamples: candleErrors.slice(0, 5).map((edge) => ({
+      symbol: (edge as { symbol?: string }).symbol,
+      error: (edge as { error?: string | null }).error,
+    })),
+  });
   const rotation = await buildSymbolRotationReport({
     symbols,
     engine,
@@ -886,6 +1266,10 @@ async function runAutopilotCycle(): Promise<void> {
     source: "live",
   });
   if (aggression.aggressionState === "PAUSED") {
+    addTraceStage(trace, "aggression", "blocked", {
+      candidates: candidates.length,
+      state: aggression.aggressionState,
+    }, aggression.reason);
     const summary: AutopilotCycleSummary = {
       cycle: cycleNum,
       startedAt: t0,
@@ -898,12 +1282,53 @@ async function runAutopilotCycle(): Promise<void> {
       aggressionState: aggression.aggressionState,
       aggressionReason: aggression.reason,
     };
-    autopilot.lastCycle = summary;
-    autopilot.history.push(summary);
-    if (autopilot.history.length > 100) autopilot.history.shift();
+    storeAutopilotSummary(summary, trace, "blocked", aggression.reason);
     return;
   }
+  addTraceStage(trace, "aggression", "ok", {
+    candidates: candidates.length,
+    state: aggression.aggressionState,
+    maxCandidatesThisCycle: aggression.maxCandidatesThisCycle,
+    maxPositionsThisCycle: aggression.maxPositionsThisCycle,
+    minAggressiveScore: aggression.minAggressiveScore,
+  });
   const aggressiveConfig = applyAggressionToConfig(config, aggression);
+  const massEntryAutopilotEnabled = String(process.env["MASS_ENTRY_AUTOPILOT_ENABLED"] ?? "true").toLowerCase() !== "false";
+  let massEntryResult: MassEntryArmResult | null = null;
+  if (massEntryAutopilotEnabled && quantBrainGateMode() === "enforce") {
+    try {
+      massEntryResult = await armQuantMassEntryZones({
+        creds: autopilot.creds,
+        config: aggressiveConfig,
+        capitalCtx,
+        maxZones: Number(process.env["MASS_ENTRY_AUTOPILOT_MAX_ZONES"] ?? 2),
+        minConfluence: Number(process.env["MASS_ENTRY_AUTOPILOT_MIN_CONFLUENCE"] ?? 0.60),
+        marginPerZone: Number(process.env["MASS_ENTRY_AUTOPILOT_MARGIN_PER_ZONE"] ?? aggressiveConfig.marginPerTrade),
+        leverage: Number(process.env["MASS_ENTRY_AUTOPILOT_LEVERAGE"] ?? aggressiveConfig.leverage),
+      });
+    } catch {
+      addTraceStage(trace, "mass_entry", "error", {}, "MASS_ENTRY_ARM_FAILED");
+      massEntryResult = null;
+    }
+  } else {
+    addTraceStage(trace, "mass_entry", "skipped", {
+      enabled: massEntryAutopilotEnabled,
+      gateMode: quantBrainGateMode(),
+    }, !massEntryAutopilotEnabled ? "MASS_ENTRY_AUTOPILOT_DISABLED" : "QUANT_BRAIN_GATE_MODE_NOT_ENFORCE");
+  }
+  if (massEntryResult) {
+    addTraceStage(trace, "mass_entry", massEntryResult.armed ? "ok" : "blocked", {
+      zonesAvailable: massEntryResult.zonesAvailable,
+      zonesSelected: massEntryResult.zonesSelected,
+      armedZones: massEntryResult.armedZones,
+      rejectedZones: massEntryResult.rejectedZones,
+      levelsArmed: massEntryResult.results.reduce((sum, result) => sum + result.levelsArmed, 0),
+      rejects: massEntryResult.results
+        .filter((result) => result.rejects.length > 0)
+        .slice(0, 5)
+        .map((result) => ({ symbol: result.symbol, side: result.side, reason: result.rejects[0] })),
+    }, massEntryResult.reason);
+  }
 
   // Sort by adaptive rotation-adjusted score, take top N
   candidates.sort((a, b) => b.combinedScore - a.combinedScore);
@@ -925,8 +1350,17 @@ async function runAutopilotCycle(): Promise<void> {
   }
 
   // Respect max concurrent positions headroom
-  const headroom = config.maxConcurrentPositions - capitalCtx.openPositionsCount;
+  const massEntriesArmed = massEntryResult?.armedZones ?? 0;
+  const massEntryLevelsArmed = massEntryResult?.results.reduce((sum, result) => sum + result.levelsArmed, 0) ?? 0;
+  const headroom = config.maxConcurrentPositions - capitalCtx.openPositionsCount - massEntriesArmed;
   const firing = toFire.slice(0, Math.max(0, Math.min(headroom, aggression.maxPositionsThisCycle)));
+  addTraceStage(trace, "candidate_selection", firing.length > 0 || massEntriesArmed > 0 ? "ok" : "blocked", {
+    candidates: candidates.length,
+    selected: toFire.length,
+    firing: firing.length,
+    headroom,
+    massEntriesArmed,
+  }, firing.length > 0 || massEntriesArmed > 0 ? undefined : "NO_EXECUTABLE_CANDIDATES");
 
   let placed = 0;
   let rejected = 0;
@@ -961,8 +1395,15 @@ async function runAutopilotCycle(): Promise<void> {
     if (result.placed) placed++;
     else rejected++;
   }
+  addTraceStage(trace, "order_execution", placed > 0 || massEntriesArmed > 0 ? "ok" : "blocked", {
+    attempted: firing.length,
+    placed,
+    rejected,
+    massEntriesArmed,
+    massEntryLevelsArmed,
+  }, placed > 0 || massEntriesArmed > 0 ? undefined : "NO_ORDER_PLACED");
 
-  autopilot.totalPlaced += placed;
+  autopilot.totalPlaced += placed + massEntriesArmed;
   recordAggressionCycleImpact(firing.length, placed);
 
   const summary: AutopilotCycleSummary = {
@@ -973,13 +1414,19 @@ async function runAutopilotCycle(): Promise<void> {
     attempted: firing.length,
     placed,
     rejected,
+    massEntriesAttempted: massEntryResult?.zonesSelected ?? 0,
+    massEntriesArmed,
+    massEntryLevelsArmed,
     btcChangePct,
     aggressionState: aggression.aggressionState,
     aggressionReason: aggression.reason,
   };
-  autopilot.lastCycle = summary;
-  autopilot.history.push(summary);
-  if (autopilot.history.length > 100) autopilot.history.shift();
+  storeAutopilotSummary(
+    summary,
+    trace,
+    placed > 0 ? "placed" : massEntriesArmed > 0 ? "armed" : "blocked",
+    placed > 0 || massEntriesArmed > 0 ? undefined : "NO_ORDER_PLACED",
+  );
 }
 
 /** GET /api/bot/config — current bot configuration from ENV */
@@ -3693,6 +4140,86 @@ router.post("/bot/sniper/mass", requireAdminAuthorization, async (req: Request, 
 // ── Sniper: Autopilot endpoints ───────────────────────────────────────────────
 
 /** POST /api/bot/sniper/autopilot/start — begin server-side autonomous scalp loop */
+router.post("/bot/sniper/mass-entry/arm", requireAdminAuthorization, async (req: Request, res: Response) => {
+  const creds = getCredentials(req);
+  if (!creds) { res.status(401).json({ error: "Not connected." }); return; }
+
+  const config = getBotConfig();
+  if (!config.allowExecution) {
+    res.status(403).json({ armed: false, reason: "SCALP_ALLOW_EXECUTION=false blocks mass trigger arming." });
+    return;
+  }
+  if (quantBrainGateMode() !== "enforce") {
+    res.status(403).json({ armed: false, reason: "QUANT_BRAIN_GATE_MODE must be enforce to arm mass-entry triggers." });
+    return;
+  }
+  try {
+    assertLiveExecutionAllowed(creds);
+  } catch (err) {
+    res.status(403).json({
+      armed: false,
+      reason: err instanceof Error ? err.message : "Real-money execution refused.",
+    });
+    return;
+  }
+
+  const maxZones = Math.max(1, Math.min(Number(req.body?.maxZones ?? 3), 10));
+  const minConfluence = Math.max(0, Math.min(Number(req.body?.minConfluence ?? 0.60), 1));
+  const marginPerZone = Math.max(0.1, Number(req.body?.marginPerZone ?? config.marginPerTrade));
+  const leverage = Math.max(1, Math.round(Number(req.body?.leverage ?? config.leverage)));
+  const dedupeMs = Math.max(5_000, Number(process.env["MASS_ENTRY_ARM_DEDUPE_MS"] ?? 60_000));
+  const trace: DecisionTrace = {
+    id: randomUUID(),
+    source: "manual_mass_entry",
+    startedAt: Date.now(),
+    finalStatus: "running",
+    stages: [],
+  };
+  addTraceStage(trace, "manual_request", "ok", { maxZones, minConfluence, marginPerZone, leverage });
+
+  const muxLock = isMuxLocked();
+  if (muxLock.locked) {
+    const reason = `MUX_LOCK_ACTIVE: cooldown ${Math.ceil(muxLock.remainingMs / 1000)}s`;
+    addTraceStage(trace, "mux_lock", "blocked", { remainingMs: muxLock.remainingMs }, reason);
+    recordDecisionTrace(trace, "blocked", reason);
+    res.status(409).json({
+      armed: false,
+      reason,
+      muxLock,
+    });
+    return;
+  }
+
+  const result = await armQuantMassEntryZones({
+    creds,
+    config,
+    maxZones,
+    minConfluence,
+    marginPerZone,
+    leverage,
+    dedupeMs,
+  });
+  if (result.reason?.startsWith("CAPITAL_CONTEXT_REJECT")) {
+    addTraceStage(trace, "mass_entry", "blocked", { zonesAvailable: result.zonesAvailable }, result.reason);
+    recordDecisionTrace(trace, "blocked", result.reason);
+    res.status(503).json(result);
+    return;
+  }
+  addTraceStage(trace, "mass_entry", result.armed ? "ok" : "blocked", {
+    zonesAvailable: result.zonesAvailable,
+    zonesSelected: result.zonesSelected,
+    armedZones: result.armedZones,
+    rejectedZones: result.rejectedZones,
+    levelsArmed: result.results.reduce((sum, item) => sum + item.levelsArmed, 0),
+    rejects: result.results
+      .filter((item) => item.rejects.length > 0)
+      .slice(0, 5)
+      .map((item) => ({ symbol: item.symbol, side: item.side, reason: item.rejects[0] })),
+  }, result.reason);
+  recordDecisionTrace(trace, result.armed ? "armed" : "blocked", result.armed ? undefined : "NO_MASS_ENTRY_ARMED");
+  res.json(result);
+});
+
 router.post("/bot/sniper/autopilot/start", requireAdminAuthorization, (req: Request, res: Response) => {
   const creds = getCredentials(req);
   if (!creds) { res.status(401).json({ error: "Not connected." }); return; }
@@ -3770,6 +4297,7 @@ router.get("/bot/sniper/autopilot/status", (_req: Request, res: Response) => {
     cycleInFlight: autopilotCycleInFlight,
     skippedOverlaps: autopilotSkippedOverlaps,
     lastCycle: autopilot.lastCycle,
+    lastTrace: decisionTraces.at(-1) ?? null,
     aggression: getAggressionStatus(),
     recentHistory: autopilot.history.slice(-20),
     config: {
@@ -3779,6 +4307,22 @@ router.get("/bot/sniper/autopilot/status", (_req: Request, res: Response) => {
       positionStackingEnabled: config.positionStackingEnabled,
       maxPositionsPerSymbol: config.maxPositionsPerSymbol,
     },
+  });
+});
+
+/** GET /api/bot/sniper/execution-traces — recent decision/block reasons */
+router.get("/bot/sniper/execution-traces", requireAdminAuthorization, (req: Request, res: Response) => {
+  const limit = Math.max(1, Math.min(Number(req.query.limit ?? 50), maxDecisionTraces()));
+  const source = typeof req.query.source === "string" ? req.query.source : "";
+  const traces = decisionTraces
+    .filter((trace) => !source || trace.source === source)
+    .slice(-limit)
+    .reverse();
+  res.json({
+    generatedAt: Date.now(),
+    totalBuffered: decisionTraces.length,
+    maxBuffered: maxDecisionTraces(),
+    traces,
   });
 });
 
