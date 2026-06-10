@@ -7,6 +7,7 @@ backtest walk-forward, detecção de overfitting, bootstrap de confiança.
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 import logging
 import math
@@ -930,11 +931,7 @@ async def compute_entry_quality_by_symbol(days: int = 30) -> dict:
     async with connect(kb.DB_PATH) as db:
         db.row_factory = Row
         rows = await (await db.execute(
-            """SELECT symbol, side, pnl_pct,
-                      json_extract(features, '$.rsi') as rsi,
-                      json_extract(features, '$.volume_ratio') as vol_ratio,
-                      json_extract(features, '$.oi_change_pct') as oi_chg,
-                      json_extract(features, '$.funding_rate') as funding
+            """SELECT symbol, side, hit_configured, features
                FROM signal_outcomes
                WHERE finalized=1 AND created_at >= ? AND hit_configured IS NOT NULL
                ORDER BY created_at DESC
@@ -946,12 +943,17 @@ async def compute_entry_quality_by_symbol(days: int = 30) -> dict:
     for row in rows:
         sym  = row["symbol"] or "?"
         side = row["side"] or "?"
-        pnl  = float(row["pnl_pct"] or 0)
-        rsi  = float(row["rsi"] or 50)
-        vol  = float(row["vol_ratio"] or 1)
-        oi   = float(row["oi_chg"] or 0)
-        fund = float(row["funding"] or 0)
-        win  = pnl > 0
+        try:
+            features = json.loads(row["features"] or "{}")
+            if not isinstance(features, dict):
+                features = {}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            features = {}
+        rsi  = _to_float(features.get("rsi"), 50)
+        vol  = _to_float(features.get("volume_ratio", features.get("vol_ratio")), 1)
+        oi   = _to_float(features.get("oi_change_pct", features.get("oi_chg")), 0)
+        fund = _to_float(features.get("funding_rate", features.get("funding")), 0)
+        win  = int(row["hit_configured"] or 0) == 1
 
         key = f"{sym}_{side}"
         if key not in result:
@@ -998,6 +1000,15 @@ async def compute_entry_quality_by_symbol(days: int = 30) -> dict:
             "sniper_recommendation": _derive_sniper_rec(r, wr),
         }
     return summary
+
+
+def _to_float(value: Any, default: float) -> float:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _derive_sniper_rec(r: dict, wr: float) -> str:
