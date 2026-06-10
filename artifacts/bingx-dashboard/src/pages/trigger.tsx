@@ -946,9 +946,15 @@ export default function TriggerPage() {
                 <Activity className="w-3.5 h-3.5" />
                 Níveis de Grid por Símbolo
                 <Badge variant="outline" className="text-[9px]">{nativeStatus?.symbols.length ?? 0}</Badge>
-                <span className="text-[9px] text-muted-foreground/35 font-normal ml-1">
-                  LONG: L1 −10% L2 −11% L3 −12% · SHORT: S1 +20% S2 +21% S3 +22% S4 +24%
-                </span>
+                {nativeStatus?.config.brutalMode ? (
+                  <span className="text-[9px] text-rose-400/50 font-normal ml-1">
+                    BRUTAL · L1−10%…L10−22% · S1+20%…S10+40%
+                  </span>
+                ) : (
+                  <span className="text-[9px] text-muted-foreground/35 font-normal ml-1">
+                    L1−10% L2−11% L3−12% · S1+20% S2+21% S3+22% S4+24%
+                  </span>
+                )}
               </CardTitle>
             </CardHeader>
             <CardContent className="px-4 pb-4 space-y-1">
