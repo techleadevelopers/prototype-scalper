@@ -28,6 +28,7 @@ import {
   BrainCircuit,
   Target,
   Dna,
+  LineChart,
 } from "lucide-react";
 
 const NAV = [
@@ -40,6 +41,7 @@ const NAV = [
   { href: "/demo", label: "Demo Lab", icon: FlaskConical, highlight: true },
   { href: "/trigger", label: "Gatilho", icon: Target, highlight: true },
   { href: "/neural", label: "Neural", icon: Dna, highlight: true },
+  { href: "/sniper-pnl", label: "Lucro Real", icon: LineChart, highlight: true },
   { href: "/settings", label: "Settings", icon: Settings },
 ];
 

@@ -118,6 +118,38 @@ export function getTriggerHistory(limit = 50): ExhaustionTriggerRecord[] {
   return all.slice(-limit);
 }
 
+/**
+ * Retorna estatísticas agregadas de todos os gatilhos registrados nesta sessão.
+ * Usado pelo endpoint /api/sniper/pnl/report para calcular fill rate real.
+ */
+export function getTriggerStats(): {
+  totalArmed: number;
+  pending: number;
+  presumedFilled: number;
+  expired: number;
+  cancelled: number;
+  fillRate: number;
+  expiryRate: number;
+  recentHistory: ExhaustionTriggerRecord[];
+} {
+  const all = Array.from(_triggers.values());
+  const pending = all.filter((t) => t.status === "PENDING").length;
+  const filled = all.filter((t) => t.status === "PRESUMED_FILLED").length;
+  const expired = all.filter((t) => t.status === "EXPIRED").length;
+  const cancelled = all.filter((t) => t.status === "CANCELLED").length;
+  const resolved = filled + expired + cancelled;
+  return {
+    totalArmed: all.length,
+    pending,
+    presumedFilled: filled,
+    expired,
+    cancelled,
+    fillRate: resolved > 0 ? filled / resolved : 0,
+    expiryRate: resolved > 0 ? expired / resolved : 0,
+    recentHistory: all.slice(-20),
+  };
+}
+
 /** Remove registros antigos (não-pendentes com mais de 10 minutos). */
 function cleanupOldTriggers(): void {
   const cutoff = Date.now() - 10 * 60_000;

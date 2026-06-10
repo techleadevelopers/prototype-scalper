@@ -82,7 +82,7 @@ import {
 } from "../lib/live_readiness";
 import { loadClosedTrades } from "../lib/demoTradeStore";
 import { getPolicyStatus } from "../lib/policyManifest";
-import { armLimitOrderExpiry } from "../lib/exhaustionTriggerManager";
+import { armLimitOrderExpiry, getTriggerStats } from "../lib/exhaustionTriggerManager";
 
 const router = Router();
 
@@ -1276,7 +1276,8 @@ router.post("/bot/order", async (req: Request, res: Response) => {
         expectedValuePct: qbOrderResult?.economics?.mlEconomicGate?.expectedValuePct ?? null,
         optimalThreshold: qbOrderResult?.economics?.mlEconomicGate?.optimalThreshold ?? null,
         profitabilityVerified: qbOrderResult?.economics?.mlEconomicGate?.profitabilityVerified ?? undefined,
-        kellyFraction: qbOrderResult?.economics?.kellyFraction ?? null,
+        // QB geometry contract kellyFraction tem prioridade sobre economics
+        kellyFraction: qbOrderResult?.kellyFraction ?? qbOrderResult?.economics?.kellyFraction ?? null,
         mlSizingMultiplier: qbOrderResult?.economics?.mlEconomicGate?.sizingMultiplier
           ?? qbOrderResult?.economics?.mlEconomicSizeMultiplier
           ?? null,
@@ -2910,6 +2911,10 @@ async function executeSingleOrder(
       leverage: orderLeverage,
       clientOrderID: clientOrderId,
       ...(useTriggerLimit && qbTriggerPrice != null ? { price: qbTriggerPrice } : {}),
+      // Post-Only (GTX = Good Till Crossing): garante execução estritamente como Maker.
+      // BingX cancela automaticamente se a ordem cruzaria o spread (seria Taker).
+      // Aplicado apenas a ordens LIMIT — evita taxas de Taker e slippage.
+      ...(useTriggerLimit ? { timeInForce: "GTX" } : {}),
     };
     // CONTRATO DE ARQUITETURA: Se o QB forneceu targetPrice e stopPrice absolutos,
     // eles são usados DIRETAMENTE. O Node.js não recalcula geometria.
@@ -3850,6 +3855,113 @@ router.get("/sniper/protection/status", (_req: Request, res: Response) => {
     topSymbolsWithBadExit,
     latestCriticalFailures,
     recommendedActions,
+  });
+});
+
+// ── Sniper P&L Report — Relatório de Lucro Real ───────────────────────────────
+
+/**
+ * GET /api/sniper/pnl/report
+ *
+ * Relatório de lucratividade real do sistema Sniper:
+ *  - P&L acumulado de trades live (não-demo)
+ *  - Fill rate dos gatilhos ARM_TRIGGER (ordens LIMIT por exaustão)
+ *  - Kelly efficiency: tamanho real vs teórico Kelly
+ *  - Breakdown por símbolo
+ *  - Estado do autopilot nesta sessão
+ */
+router.get("/sniper/pnl/report", (_req: Request, res: Response) => {
+  const allOutcomes = exportAllOutcomes();
+  const liveOutcomes = allOutcomes.filter((o) => !isDemoOutcome(o));
+  const demoOutcomes = allOutcomes.filter((o) => isDemoOutcome(o));
+
+  // ── Métricas Live ──────────────────────────────────────────────────────────
+  const totalLive = liveOutcomes.length;
+  const wins = liveOutcomes.filter((o) => o.realizedPnl > 0);
+  const losses = liveOutcomes.filter((o) => o.realizedPnl <= 0);
+  const netPnl = liveOutcomes.reduce((s, o) => s + o.realizedPnl, 0);
+  const grossWin = wins.reduce((s, o) => s + o.realizedPnl, 0);
+  const grossLoss = Math.abs(losses.reduce((s, o) => s + o.realizedPnl, 0));
+  const winRate = totalLive > 0 ? wins.length / totalLive : 0;
+  const profitFactor = grossLoss > 0 ? grossWin / grossLoss : grossWin > 0 ? Infinity : 0;
+  const avgPnl = totalLive > 0 ? netPnl / totalLive : 0;
+  const avgWin = wins.length > 0 ? grossWin / wins.length : 0;
+  const avgLoss = losses.length > 0 ? grossLoss / losses.length : 0;
+
+  // ── Fill Rate dos Gatilhos ARM_TRIGGER ─────────────────────────────────────
+  const triggerStats = getTriggerStats();
+
+  // ── Breakdown por Símbolo ──────────────────────────────────────────────────
+  const symbolMap = new Map<string, {
+    trades: number; wins: number; netPnl: number; grossWin: number; grossLoss: number;
+  }>();
+  for (const o of liveOutcomes) {
+    const key = `${o.symbol}:${o.positionSide}`;
+    const existing = symbolMap.get(key) ?? { trades: 0, wins: 0, netPnl: 0, grossWin: 0, grossLoss: 0 };
+    existing.trades++;
+    existing.netPnl += o.realizedPnl;
+    if (o.realizedPnl > 0) { existing.wins++; existing.grossWin += o.realizedPnl; }
+    else { existing.grossLoss += Math.abs(o.realizedPnl); }
+    symbolMap.set(key, existing);
+  }
+  const bySymbol = Array.from(symbolMap.entries())
+    .map(([key, v]) => ({
+      key,
+      symbol: key.split(":")[0],
+      positionSide: key.split(":")[1],
+      trades: v.trades,
+      wins: v.wins,
+      winRate: v.trades > 0 ? v.wins / v.trades : 0,
+      netPnl: v.netPnl,
+      profitFactor: v.grossLoss > 0 ? v.grossWin / v.grossLoss : (v.grossWin > 0 ? 99 : 0),
+    }))
+    .sort((a, b) => b.netPnl - a.netPnl);
+
+  // ── Estado Autopilot desta Sessão ─────────────────────────────────────────
+  const pilotState = {
+    running: autopilot.running,
+    startedAt: autopilot.startedAt,
+    uptimeSec: autopilot.startedAt ? Math.floor((Date.now() - autopilot.startedAt) / 1000) : 0,
+    totalCycles: autopilot.totalCycles,
+    totalPlaced: autopilot.totalPlaced,
+    sessionLossUsd: autopilot.sessionLossUsd,
+    stopReason: autopilot.stopReason,
+  };
+
+  res.json({
+    generatedAt: Date.now(),
+    live: {
+      totalTrades: totalLive,
+      wins: wins.length,
+      losses: losses.length,
+      winRate: Math.round(winRate * 10000) / 100,
+      profitFactor: Math.round(profitFactor * 100) / 100,
+      netPnlUsdt: Math.round(netPnl * 100) / 100,
+      grossWinUsdt: Math.round(grossWin * 100) / 100,
+      grossLossUsdt: Math.round(grossLoss * 100) / 100,
+      avgPnlUsdt: Math.round(avgPnl * 100) / 100,
+      avgWinUsdt: Math.round(avgWin * 100) / 100,
+      avgLossUsdt: Math.round(avgLoss * 100) / 100,
+    },
+    demo: {
+      totalTrades: demoOutcomes.length,
+      netPnlUsdt: Math.round(demoOutcomes.reduce((s, o) => s + o.realizedPnl, 0) * 100) / 100,
+      winRate: demoOutcomes.length > 0
+        ? Math.round((demoOutcomes.filter((o) => o.realizedPnl > 0).length / demoOutcomes.length) * 10000) / 100
+        : 0,
+    },
+    triggerGeometry: {
+      totalArmed: triggerStats.totalArmed,
+      pending: triggerStats.pending,
+      presumedFilled: triggerStats.presumedFilled,
+      expired: triggerStats.expired,
+      cancelled: triggerStats.cancelled,
+      fillRatePct: Math.round(triggerStats.fillRate * 10000) / 100,
+      expiryRatePct: Math.round(triggerStats.expiryRate * 10000) / 100,
+      recentActivity: triggerStats.recentHistory.slice(-10),
+    },
+    bySymbol,
+    autopilot: pilotState,
   });
 });
 
