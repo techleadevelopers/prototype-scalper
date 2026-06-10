@@ -15,6 +15,19 @@ MODEL_DIR = Path(__file__).parent.parent / "data" / "models"
 MODEL_PATH = MODEL_DIR / "sniper_target_050.joblib"
 METADATA_PATH = MODEL_DIR / "sniper_target_050.json"
 MIN_TRAINING_SAMPLES = max(1, int(os.environ.get("MIN_TRAINING_SAMPLES", "300")))
+
+# ── Sniper Grid Weighting ──────────────────────────────────────────────────────
+# SHADOW_MODEL_SNIPER_WEIGHT: multiplicador aplicado a amostras SNIPER_GRID_VALIDATED.
+# Valor 1.0 = sem diferenciação. Valores > 1 ensinam o modelo a priorizar
+# padrões de tail-repique em detrimento de ruído de volatilidade lateral.
+SHADOW_MODEL_SNIPER_WEIGHT = float(os.environ.get("SHADOW_MODEL_SNIPER_WEIGHT", "3.0"))
+
+# SHADOW_MODEL_SNIPER_ONLY: quando true, filtra o dataset exclusivamente para
+# amostras SNIPER_GRID_VALIDATED. Requer min_samples // 3 validadas ou faz
+# fallback automático para weighting sem filtro.
+SHADOW_MODEL_SNIPER_ONLY = os.environ.get("SHADOW_MODEL_SNIPER_ONLY", "false").lower() == "true"
+# ──────────────────────────────────────────────────────────────────────────────
+
 _bundle_cache: dict[str, Any] = {"mtime": None, "bundle": None}
 _metadata_cache: dict[str, Any] = {"mtime": None, "metadata": None}
 
@@ -465,8 +478,32 @@ async def train_shadow_model(min_samples: int = MIN_TRAINING_SAMPLES) -> dict[st
             "minSamples": min_samples,
         }
 
+    # ── Sniper Grid Weighting / Filtering ─────────────────────────────────────
+    sniper_weight = SHADOW_MODEL_SNIPER_WEIGHT
+    sniper_only_active = False
+    total_before_filter = len(rows)
+
+    if SHADOW_MODEL_SNIPER_ONLY:
+        sniper_rows = [r for r in rows if r.get("setup_type") == "SNIPER_GRID_VALIDATED"]
+        # Requer ao menos min_samples // 3 amostras puras para ativar filtro exclusivo
+        if len(sniper_rows) >= max(30, min_samples // 3):
+            rows = sniper_rows
+            sniper_only_active = True
+        # Caso contrário cai em weighting sem filtro (dados insuficientes)
+
+    sniper_count_in_dataset = sum(
+        1 for r in rows if r.get("setup_type") == "SNIPER_GRID_VALIDATED"
+    )
+
     x = [_feature_dict(row) for row in rows]
     y = np.asarray([int(row.get("hit_configured") or 0) for row in rows])
+
+    # Vetor de pesos: amostras SNIPER_GRID_VALIDATED recebem multiplicador configurável
+    sample_weights = np.array([
+        sniper_weight if row.get("setup_type") == "SNIPER_GRID_VALIDATED" else 1.0
+        for row in rows
+    ])
+    # ──────────────────────────────────────────────────────────────────────────
 
     # Divisão temporal (não aleatória)
     split = max(int(len(rows) * 0.8), 1)
@@ -517,8 +554,9 @@ async def train_shadow_model(min_samples: int = MIN_TRAINING_SAMPLES) -> dict[st
         gb_model = build_gb_model()
         rf_model = build_rf_model()
 
-        gb_model.fit(x[:train_end], fold_y)
-        rf_model.fit(x[:train_end], fold_y)
+        fold_weights = sample_weights[:train_end]
+        gb_model.fit(x[:train_end], fold_y, classifier__sample_weight=fold_weights)
+        rf_model.fit(x[:train_end], fold_y, classifier__sample_weight=fold_weights)
 
         gb_proba = gb_model.predict_proba(x[train_end:validation_end])[:, 1]
         rf_proba = rf_model.predict_proba(x[train_end:validation_end])[:, 1]
@@ -540,8 +578,9 @@ async def train_shadow_model(min_samples: int = MIN_TRAINING_SAMPLES) -> dict[st
     gb_final = build_gb_model()
     rf_final = build_rf_model()
 
-    gb_final.fit(x[:split], y[:split])
-    rf_final.fit(x[:split], y[:split])
+    train_weights = sample_weights[:split]
+    gb_final.fit(x[:split], y[:split], classifier__sample_weight=train_weights)
+    rf_final.fit(x[:split], y[:split], classifier__sample_weight=train_weights)
 
     # Avaliação no test set
     gb_test = gb_final.predict_proba(x[split:])[:, 1]
@@ -579,8 +618,13 @@ async def train_shadow_model(min_samples: int = MIN_TRAINING_SAMPLES) -> dict[st
     metadata = {
         "trainedAt": time.time(),
         "samples": len(rows),
+        "totalSamplesBeforeFilter": total_before_filter,
         "trainSamples": split,
         "testSamples": len(rows) - split,
+        "sniperGridSampleCount": sniper_count_in_dataset,
+        "sniperGridSamplePct": round(sniper_count_in_dataset / max(1, len(rows)) * 100, 2),
+        "sniperWeightMultiplier": sniper_weight,
+        "sniperOnlyMode": sniper_only_active,
         "modelBrier": round(model_brier, 6),
         "baselineBrier": round(baseline_brier, 6),
         "modelLogLoss": round(model_log_loss, 6),

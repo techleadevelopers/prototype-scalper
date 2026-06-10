@@ -747,6 +747,35 @@ Nova decisão gerada quando `ENABLE_GRID_SNIPER=true` e `executionPriority >= 0.
 ENABLE_GRID_SNIPER=true
 ```
 
+### Sample Weighting SNIPER_GRID_VALIDATED (`core/shadow_model.py`)
+
+O pipeline de treinamento do shadow model agora aplica pesos diferenciados por qualidade de amostra. O modelo aprende especificamente os padrões de order book e aceleração de preço que precedem tail-repiques, descartando ruído de volatilidade lateralizada.
+
+**Modo weighting (padrão):** todas as amostras treinam; `SNIPER_GRID_VALIDATED` recebem peso `SHADOW_MODEL_SNIPER_WEIGHT` (padrão `3.0`) — equivale a contá-las 3× nos gradientes de ambos GradientBoosting e RandomForest.
+
+**Modo exclusivo:** quando `SHADOW_MODEL_SNIPER_ONLY=true`, o dataset é filtrado para conter apenas `SNIPER_GRID_VALIDATED`. Ativa somente se houver `≥ max(30, MIN_TRAINING_SAMPLES // 3)` amostras qualificadas — caso contrário faz fallback automático para weighting sem filtro, sem falha silenciosa.
+
+**Propagação:** os pesos são passados via `classifier__sample_weight` em todos os `fit()` calls — walk-forward expanding-window (4 folds) e modelo final. O Pipeline do sklearn roteia o parâmetro direto ao classificador, sem afetar o `DictVectorizer`.
+
+**Variáveis de ambiente:**
+
+```env
+SHADOW_MODEL_SNIPER_WEIGHT=3.0   # multiplicador (float, default 3.0)
+SHADOW_MODEL_SNIPER_ONLY=false   # filtro exclusivo (bool, default false)
+```
+
+**Campos adicionados ao metadata do modelo salvo:**
+
+| Campo | Descrição |
+|---|---|
+| `sniperGridSampleCount` | total de amostras SNIPER_GRID_VALIDATED no dataset de treino |
+| `sniperGridSamplePct` | percentual do dataset que é validado por grid |
+| `sniperWeightMultiplier` | valor efetivo do multiplicador aplicado |
+| `sniperOnlyMode` | `true` se o filtro exclusivo foi ativado neste treino |
+| `totalSamplesBeforeFilter` | total de rows antes do filtro exclusivo (para auditoria) |
+
+Todos os campos são expostos pelo endpoint `GET /models/sniper/status` e por `GET /sniper/telemetry/stats`.
+
 ### History Logger (`core/history_logger.py`)
 
 Filtro de qualidade para persistência de sinais ARM_TRIGGER em `data/signal_snapshots.jsonl`:
