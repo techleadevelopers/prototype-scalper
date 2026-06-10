@@ -144,6 +144,44 @@ router.get("/neural/sniper/btc-commander", async (req: Request, res: Response) =
   catch (e) { res.status(503).json({ error: String(e) }); }
 });
 
+// ── Sniper Entry Opportunities ────────────────────────────────────────────────
+
+router.get("/neural/sniper/entry-opportunities", async (_req: Request, res: Response) => {
+  try { res.json(await qbCached("/sniper/entry-opportunities", 5_000, 5_000)); }
+  catch (e) { res.status(503).json({ error: String(e) }); }
+});
+
+router.get("/neural/sniper/mass-entry-zones", async (_req: Request, res: Response) => {
+  try { res.json(await qbCached("/sniper/mass-entry-zones", 5_000, 5_000)); }
+  catch (e) { res.status(503).json({ error: String(e) }); }
+});
+
+router.post("/neural/analyst/sniper", async (_req: Request, res: Response) => {
+  try {
+    const qbUrl = process.env["QUANT_BRAIN_URL"]?.trim();
+    if (!qbUrl) { res.status(503).json({ error: "QUANT_BRAIN_URL not configured" }); return; }
+    const r = await fetch(`${qbUrl}/analyst/sniper`, { method: "POST", signal: AbortSignal.timeout(20_000) });
+    if (!r.ok) { res.status(r.status).json({ error: await r.text() }); return; }
+    res.json(await r.json());
+  } catch (e) { res.status(503).json({ error: String(e) }); }
+});
+
+router.post("/neural/analyst/mass-entry", async (_req: Request, res: Response) => {
+  try {
+    const qbUrl = process.env["QUANT_BRAIN_URL"]?.trim();
+    if (!qbUrl) { res.status(503).json({ error: "QUANT_BRAIN_URL not configured" }); return; }
+    const r = await fetch(`${qbUrl}/analyst/mass-entry`, { method: "POST", signal: AbortSignal.timeout(20_000) });
+    if (!r.ok) { res.status(r.status).json({ error: await r.text() }); return; }
+    res.json(await r.json());
+  } catch (e) { res.status(503).json({ error: String(e) }); }
+});
+
+router.get("/neural/strategic/entry-quality", async (req: Request, res: Response) => {
+  const days = Number(req.query["days"] ?? 30);
+  try { res.json(await qbCached(`/strategic/entry-quality?days=${days}`, TIMEOUT_MS, 120_000)); }
+  catch (e) { res.status(503).json({ error: String(e) }); }
+});
+
 // ── Tactical Alerts ───────────────────────────────────────────────────────────
 
 router.get("/neural/tactical/alerts", async (_req: Request, res: Response) => {

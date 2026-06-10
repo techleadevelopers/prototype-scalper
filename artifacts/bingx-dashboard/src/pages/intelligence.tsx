@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { PieChart, Pie, Cell } from "recharts";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useMutation } from "@tanstack/react-query";
 import {
   Activity,
   AlertTriangle,
@@ -22,6 +22,13 @@ import {
   Clock,
   Zap,
   BarChart2,
+  Crosshair,
+  Layers,
+  ChevronDown,
+  ChevronUp,
+  Sparkles,
+  ArrowDownToLine,
+  ArrowUpFromLine,
 } from "lucide-react";
 import {
   getGetBingXTickerQueryKey,
@@ -509,6 +516,350 @@ function FrameRow({ name, frame }: { name: string; frame: AnyRecord }) {
   );
 }
 
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+function fmtPrice(n: number | null | undefined): string {
+  if (n == null) return "—";
+  if (n >= 10000) return n.toLocaleString("en-US", { maximumFractionDigits: 1 });
+  if (n >= 1) return n.toFixed(4);
+  return n.toFixed(6);
+}
+function scoreColor(s: number) {
+  if (s >= 0.75) return "text-emerald-400";
+  if (s >= 0.60) return "text-amber-400";
+  return "text-muted-foreground/70";
+}
+function scoreBg(s: number) {
+  if (s >= 0.75) return "bg-emerald-500/15 border-emerald-500/25";
+  if (s >= 0.60) return "bg-amber-500/15 border-amber-500/25";
+  return "bg-muted/15 border-border/20";
+}
+
+// ─── SniperOpportunityCard ────────────────────────────────────────────────────
+function SniperOpportunityCard({ opp }: { opp: {
+  symbol: string; side: string; confluence_score: number;
+  confidence: number; entry_price: number; signals: string[]; signal_details: Record<string, { score: number; label?: string; vol_ratio?: number }>
+}}) {
+  const [expanded, setExpanded] = useState(false);
+  const isLong = opp.side === "LONG";
+  const token = opp.symbol.replace("-USDT", "");
+
+  return (
+    <div className={`rounded-xl border overflow-hidden ${scoreBg(opp.confluence_score)}`}>
+      <div
+        className="flex items-center gap-2 px-3 py-2.5 cursor-pointer hover:bg-white/3 transition-colors"
+        onClick={() => setExpanded(v => !v)}
+      >
+        <div className={`w-6 h-6 rounded flex items-center justify-center shrink-0 ${isLong ? "bg-emerald-500/20" : "bg-rose-500/20"}`}>
+          {isLong ? <ArrowUpFromLine className="w-3 h-3 text-emerald-400" /> : <ArrowDownToLine className="w-3 h-3 text-rose-400" />}
+        </div>
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2">
+            <span className="font-mono text-xs font-bold text-foreground">{token}</span>
+            <span className={`text-[9px] font-bold ${isLong ? "text-emerald-400" : "text-rose-400"}`}>{opp.side}</span>
+          </div>
+          <div className="text-[9px] text-muted-foreground/60 truncate">
+            {opp.signals.slice(0, 3).join(" · ")}
+          </div>
+        </div>
+        <div className="text-right shrink-0">
+          <div className={`font-mono text-sm font-bold ${scoreColor(opp.confluence_score)}`}>
+            {(opp.confluence_score * 100).toFixed(0)}
+          </div>
+          <div className="text-[8px] text-muted-foreground/50">score</div>
+        </div>
+        <div className="text-right shrink-0 hidden sm:block">
+          <div className="font-mono text-xs text-foreground/80">{fmtPrice(opp.entry_price)}</div>
+          <div className="text-[8px] text-muted-foreground/50">entrada</div>
+        </div>
+        {expanded ? <ChevronUp className="w-3 h-3 text-muted-foreground/40 shrink-0" /> : <ChevronDown className="w-3 h-3 text-muted-foreground/40 shrink-0" />}
+      </div>
+
+      {expanded && (
+        <div className="border-t border-white/5 px-3 py-2.5 space-y-1.5 bg-black/15">
+          <div className="grid grid-cols-3 gap-2 text-center mb-2">
+            <div>
+              <div className="text-[8px] text-muted-foreground/50 uppercase">Confluência</div>
+              <div className={`font-mono text-sm font-bold ${scoreColor(opp.confluence_score)}`}>{(opp.confluence_score * 100).toFixed(1)}%</div>
+            </div>
+            <div>
+              <div className="text-[8px] text-muted-foreground/50 uppercase">Confiança</div>
+              <div className="font-mono text-sm font-bold text-foreground/80">{(opp.confidence * 100).toFixed(0)}%</div>
+            </div>
+            <div>
+              <div className="text-[8px] text-muted-foreground/50 uppercase">Preço</div>
+              <div className="font-mono text-xs font-bold text-foreground/80">{fmtPrice(opp.entry_price)}</div>
+            </div>
+          </div>
+          <div className="text-[9px] text-muted-foreground/50 font-semibold uppercase tracking-wider mb-1">Sinais ativos</div>
+          <div className="flex flex-wrap gap-1">
+            {opp.signals.map((sig, i) => (
+              <span key={i} className={`px-1.5 py-0.5 rounded text-[9px] font-mono ${
+                isLong ? "bg-emerald-500/10 text-emerald-400/80" : "bg-rose-500/10 text-rose-400/80"
+              }`}>{sig}</span>
+            ))}
+          </div>
+          {Object.entries(opp.signal_details).length > 0 && (
+            <div className="pt-1.5 space-y-1">
+              {Object.entries(opp.signal_details).map(([key, detail]) => (
+                <div key={key} className="flex justify-between text-[9px]">
+                  <span className="text-muted-foreground/55 capitalize">{key.replace(/_/g, " ")}</span>
+                  <span className={`font-mono ${scoreColor(detail.score)}`}>{(detail.score * 100).toFixed(0)}%</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── MassEntryZoneCard ────────────────────────────────────────────────────────
+function MassEntryZoneCard({ zone }: { zone: {
+  symbol: string; side: string; base_price: number; total_confluence: number;
+  strategy: string; levels: Array<{ index: number; label: string; price: number; position_weight_pct: number; trigger_deviation_pct: number }>
+}}) {
+  const isLong = zone.side === "LONG";
+  const token = zone.symbol.replace("-USDT", "");
+
+  return (
+    <div className={`rounded-xl border overflow-hidden ${isLong ? "border-emerald-500/20 bg-emerald-950/15" : "border-rose-500/20 bg-rose-950/15"}`}>
+      <div className="px-3 py-2 border-b border-white/5 flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <Layers className={`w-3.5 h-3.5 ${isLong ? "text-emerald-400" : "text-rose-400"}`} />
+          <span className="font-mono text-xs font-bold text-foreground">{token}</span>
+          <span className={`text-[9px] font-bold ${isLong ? "text-emerald-400" : "text-rose-400"}`}>{zone.side}</span>
+          <span className="text-[9px] text-muted-foreground/50">{zone.strategy}</span>
+        </div>
+        <span className={`font-mono text-xs font-bold ${scoreColor(zone.total_confluence)}`}>
+          {(zone.total_confluence * 100).toFixed(0)}%
+        </span>
+      </div>
+      <div className="px-3 py-2.5 space-y-2">
+        {zone.levels.map((lv) => (
+          <div key={lv.index} className="flex items-center gap-2">
+            <div className={`w-5 h-5 rounded text-[9px] font-bold flex items-center justify-center shrink-0 ${
+              lv.index === 0
+                ? isLong ? "bg-emerald-500/30 text-emerald-300" : "bg-rose-500/30 text-rose-300"
+                : "bg-muted/20 text-muted-foreground/60"
+            }`}>
+              {lv.index + 1}
+            </div>
+            <div className="flex-1">
+              <div className="flex items-center justify-between">
+                <span className="text-[9px] text-muted-foreground/60">{lv.label}</span>
+                <span className="font-mono text-[10px] text-foreground/80">{fmtPrice(lv.price)}</span>
+              </div>
+              <div className="h-1 mt-1 bg-black/20 rounded-full overflow-hidden">
+                <div
+                  className={`h-full rounded-full ${isLong ? "bg-emerald-500/60" : "bg-rose-500/60"}`}
+                  style={{ width: `${lv.position_weight_pct}%` }}
+                />
+              </div>
+              <div className="text-[8px] text-muted-foreground/40 mt-0.5">
+                {lv.position_weight_pct}% do capital · desvio {lv.trigger_deviation_pct}%
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ─── SniperEntrySection ───────────────────────────────────────────────────────
+function SniperEntrySection() {
+  const [aiText, setAiText] = useState<string | null>(null);
+  const [aiMassText, setAiMassText] = useState<string | null>(null);
+  const [activeTab, setActiveTab] = useState<"sniper" | "mass">("sniper");
+
+  const oppsQ = useQuery({
+    queryKey: ["sniper-entry-opportunities"],
+    queryFn: async () => {
+      const r = await fetch(apiUrl("/api/neural/sniper/entry-opportunities"), { credentials: "include" });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      return r.json() as Promise<{
+        count: number; threshold: number; timestamp: number;
+        opportunities: Array<{
+          symbol: string; side: string; confluence_score: number;
+          confidence: number; entry_price: number; signals: string[];
+          signal_details: Record<string, { score: number }>; timestamp: number;
+        }>;
+        market_context: Record<string, { rsi: number; volume_ratio: number; btc_regime: string }>;
+      }>;
+    },
+    refetchInterval: 8_000,
+    placeholderData: (prev) => prev,
+    retry: 1,
+  });
+
+  const zonesQ = useQuery({
+    queryKey: ["sniper-mass-entry-zones"],
+    queryFn: async () => {
+      const r = await fetch(apiUrl("/api/neural/sniper/mass-entry-zones"), { credentials: "include" });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      return r.json() as Promise<{
+        count: number; timestamp: number;
+        zones: Array<{
+          symbol: string; side: string; base_price: number;
+          total_confluence: number; strategy: string;
+          levels: Array<{ index: number; label: string; price: number; position_weight_pct: number; trigger_deviation_pct: number }>;
+        }>;
+      }>;
+    },
+    refetchInterval: 8_000,
+    placeholderData: (prev) => prev,
+    retry: 1,
+  });
+
+  const sniperMut = useMutation({
+    mutationFn: async () => {
+      const r = await fetch(apiUrl("/api/neural/analyst/sniper"), { method: "POST", credentials: "include" });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const d = await r.json() as { full_text?: string };
+      return d.full_text ?? "Sem resposta";
+    },
+    onSuccess: (text) => setAiText(text),
+  });
+
+  const massMut = useMutation({
+    mutationFn: async () => {
+      const r = await fetch(apiUrl("/api/neural/analyst/mass-entry"), { method: "POST", credentials: "include" });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const d = await r.json() as { full_text?: string };
+      return d.full_text ?? "Sem resposta";
+    },
+    onSuccess: (text) => setAiMassText(text),
+  });
+
+  const opps  = oppsQ.data?.opportunities ?? [];
+  const zones = zonesQ.data?.zones ?? [];
+
+  return (
+    <section className="space-y-3">
+      {/* Header */}
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <Crosshair className="w-4 h-4 text-primary" />
+          <h2 className="text-sm font-bold text-foreground">Entradas Sniper</h2>
+          <span className="text-[10px] text-muted-foreground/50">Confluência multi-sinal · Independente do gatilho</span>
+        </div>
+        <div className="flex items-center gap-2">
+          {oppsQ.isFetching && <RefreshCw className="w-3 h-3 animate-spin text-muted-foreground/40" />}
+          <div className="flex rounded-lg border border-border/30 overflow-hidden">
+            {(["sniper", "mass"] as const).map((tab) => (
+              <button
+                key={tab}
+                type="button"
+                onClick={() => setActiveTab(tab)}
+                className={`px-3 py-1 text-[10px] font-semibold transition-colors ${
+                  activeTab === tab ? "bg-primary/15 text-primary" : "text-muted-foreground/60 hover:bg-muted/20"
+                }`}
+              >
+                {tab === "sniper" ? `Precisão (${opps.length})` : `Massa (${zones.length})`}
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {activeTab === "sniper" && (
+        <div className="space-y-3">
+          {opps.length === 0 ? (
+            <div className="rounded-xl border border-border/15 bg-card/5 flex items-center justify-center py-8 gap-3">
+              <Crosshair className="w-5 h-5 text-muted-foreground/20" />
+              <div className="text-[12px] text-muted-foreground/40">
+                Nenhuma oportunidade sniper ativa — aguardando confluência de sinais
+              </div>
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-2">
+              {opps.map((opp, i) => (
+                <SniperOpportunityCard key={`${opp.symbol}-${opp.side}-${i}`} opp={opp} />
+              ))}
+            </div>
+          )}
+
+          {/* AI Analysis */}
+          <div className="rounded-xl border border-border/15 bg-card/5 overflow-hidden">
+            <div className="flex items-center justify-between px-3 py-2 border-b border-border/10">
+              <div className="flex items-center gap-1.5">
+                <Sparkles className="w-3.5 h-3.5 text-primary/70" />
+                <span className="text-[10px] font-semibold text-muted-foreground/70">Análise IA Sniper</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => sniperMut.mutate()}
+                disabled={sniperMut.isPending}
+                className="flex items-center gap-1 text-[10px] text-primary/70 hover:text-primary transition-colors disabled:opacity-40"
+              >
+                <RefreshCw className={`w-3 h-3 ${sniperMut.isPending ? "animate-spin" : ""}`} />
+                {sniperMut.isPending ? "Analisando..." : "Analisar agora"}
+              </button>
+            </div>
+            <div className="px-3 py-2.5">
+              {aiText ? (
+                <pre className="text-[10px] text-foreground/70 whitespace-pre-wrap font-mono leading-relaxed max-h-48 overflow-y-auto">{aiText}</pre>
+              ) : (
+                <p className="text-[10px] text-muted-foreground/40 italic">
+                  Clique em "Analisar agora" para gerar análise das oportunidades sniper com IA.
+                </p>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {activeTab === "mass" && (
+        <div className="space-y-3">
+          {zones.length === 0 ? (
+            <div className="rounded-xl border border-border/15 bg-card/5 flex items-center justify-center py-8 gap-3">
+              <Layers className="w-5 h-5 text-muted-foreground/20" />
+              <div className="text-[12px] text-muted-foreground/40">
+                Nenhuma zona de entrada em massa (requer score ≥ 60% em pelo menos 1 símbolo)
+              </div>
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-2">
+              {zones.map((z, i) => (
+                <MassEntryZoneCard key={`${z.symbol}-${z.side}-${i}`} zone={z} />
+              ))}
+            </div>
+          )}
+
+          {/* AI Mass Entry */}
+          <div className="rounded-xl border border-border/15 bg-card/5 overflow-hidden">
+            <div className="flex items-center justify-between px-3 py-2 border-b border-border/10">
+              <div className="flex items-center gap-1.5">
+                <Sparkles className="w-3.5 h-3.5 text-primary/70" />
+                <span className="text-[10px] font-semibold text-muted-foreground/70">Aprovação IA — Entrada em Massa</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => massMut.mutate()}
+                disabled={massMut.isPending}
+                className="flex items-center gap-1 text-[10px] text-primary/70 hover:text-primary transition-colors disabled:opacity-40"
+              >
+                <RefreshCw className={`w-3 h-3 ${massMut.isPending ? "animate-spin" : ""}`} />
+                {massMut.isPending ? "Processando..." : "Gerar plano"}
+              </button>
+            </div>
+            <div className="px-3 py-2.5">
+              {aiMassText ? (
+                <pre className="text-[10px] text-foreground/70 whitespace-pre-wrap font-mono leading-relaxed max-h-48 overflow-y-auto">{aiMassText}</pre>
+              ) : (
+                <p className="text-[10px] text-muted-foreground/40 italic">
+                  Clique em "Gerar plano" para a IA aprovar e ajustar os pesos de cada zona de entrada em massa.
+                </p>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
 export default function IntelligencePage() {
   const [symbol, setSymbol] = useState("BTC-USDT");
   const [side, setSide] = useState<Side>("LONG");
@@ -807,6 +1158,9 @@ export default function IntelligencePage() {
                 </div>
               </div>
             </PanelBox>
+
+            {/* ── Sniper Entry Opportunities ── */}
+            <SniperEntrySection />
 
             {/* Bottom 4 panels */}
             <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">

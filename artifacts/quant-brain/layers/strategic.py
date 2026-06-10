@@ -919,6 +919,116 @@ def report_to_dict(report: StrategicReport) -> dict:
     }
 
 
+async def compute_entry_quality_by_symbol(days: int = 30) -> dict:
+    """
+    Analisa historicamente quais condições (RSI, vol, OI, funding) geraram
+    as melhores entradas por símbolo e lado. Usado pelo SniperEntryEngine
+    para calibrar thresholds.
+    """
+    cutoff = time.time() - days * 86400
+
+    async with connect(kb.DB_PATH) as db:
+        db.row_factory = Row
+        rows = await (await db.execute(
+            """SELECT symbol, side, pnl_pct,
+                      json_extract(features, '$.rsi') as rsi,
+                      json_extract(features, '$.volume_ratio') as vol_ratio,
+                      json_extract(features, '$.oi_change_pct') as oi_chg,
+                      json_extract(features, '$.funding_rate') as funding
+               FROM signal_outcomes
+               WHERE finalized=1 AND created_at >= ? AND hit_configured IS NOT NULL
+               ORDER BY created_at DESC
+               LIMIT 5000""",
+            (cutoff,),
+        )).fetchall()
+
+    result: dict[str, dict] = {}
+    for row in rows:
+        sym  = row["symbol"] or "?"
+        side = row["side"] or "?"
+        pnl  = float(row["pnl_pct"] or 0)
+        rsi  = float(row["rsi"] or 50)
+        vol  = float(row["vol_ratio"] or 1)
+        oi   = float(row["oi_chg"] or 0)
+        fund = float(row["funding"] or 0)
+        win  = pnl > 0
+
+        key = f"{sym}_{side}"
+        if key not in result:
+            result[key] = {
+                "symbol": sym, "side": side,
+                "total": 0, "wins": 0,
+                "rsi_win": [], "rsi_loss": [],
+                "vol_win": [], "vol_loss": [],
+                "oi_win": [],  "oi_loss": [],
+                "fund_win":[], "fund_loss":[],
+            }
+        r = result[key]
+        r["total"] += 1
+        if win:
+            r["wins"] += 1
+            r["rsi_win"].append(rsi); r["vol_win"].append(vol)
+            r["oi_win"].append(oi);   r["fund_win"].append(fund)
+        else:
+            r["rsi_loss"].append(rsi); r["vol_loss"].append(vol)
+            r["oi_loss"].append(oi);   r["fund_loss"].append(fund)
+
+    def _avg(lst): return round(sum(lst) / len(lst), 3) if lst else None
+
+    summary = {}
+    for key, r in result.items():
+        if r["total"] < 5:
+            continue
+        wr = round(r["wins"] / r["total"] * 100, 1)
+        summary[key] = {
+            "symbol": r["symbol"],
+            "side": r["side"],
+            "total": r["total"],
+            "win_rate": wr,
+            "best_entry_conditions": {
+                "avg_rsi_wins":   _avg(r["rsi_win"]),
+                "avg_rsi_losses": _avg(r["rsi_loss"]),
+                "avg_vol_wins":   _avg(r["vol_win"]),
+                "avg_vol_losses": _avg(r["vol_loss"]),
+                "avg_oi_wins":    _avg(r["oi_win"]),
+                "avg_oi_losses":  _avg(r["oi_loss"]),
+                "avg_fund_wins":  _avg(r["fund_win"]),
+                "avg_fund_losses":_avg(r["fund_loss"]),
+            },
+            "sniper_recommendation": _derive_sniper_rec(r, wr),
+        }
+    return summary
+
+
+def _derive_sniper_rec(r: dict, wr: float) -> str:
+    """Deriva recomendação de entrada sniper baseada em condições históricas."""
+    rsi_wins   = r["rsi_win"]
+    rsi_losses = r["rsi_loss"]
+    vol_wins   = r["vol_win"]
+
+    lines = []
+    if rsi_wins and rsi_losses:
+        avg_rsi_w = sum(rsi_wins) / len(rsi_wins)
+        avg_rsi_l = sum(rsi_losses) / len(rsi_losses)
+        diff = abs(avg_rsi_w - avg_rsi_l)
+        if diff >= 5:
+            lines.append(f"RSI ideal: {avg_rsi_w:.0f} (wins) vs {avg_rsi_l:.0f} (losses) — diferença {diff:.0f}pp")
+
+    if vol_wins:
+        avg_vol_w = sum(vol_wins) / len(vol_wins)
+        if avg_vol_w > 1.5:
+            lines.append(f"Volume spike ({avg_vol_w:.1f}x) correlaciona com wins")
+        elif avg_vol_w < 1.2:
+            lines.append(f"Volume baixo nos wins — favorece entradas em acumulação silenciosa")
+
+    if wr >= 60:
+        lines.append(f"Edge sólido ({wr}% WR) — aumentar tamanho em condições ideais")
+    elif wr < 45:
+        lines.append(f"Edge fraco ({wr}% WR) — aguardar confluência mais forte antes de entrar")
+
+    return " | ".join(lines) if lines else f"WR={wr}% — continuar monitoramento"
+
+
 async def run_strategic_loop(interval_hours: int = 6):
     """Roda análise estratégica a cada N horas e salva na KB."""
     await kb.init_db()

@@ -704,3 +704,359 @@ async def run_tactical_loop(engine: FeatureEngine, interval_seconds: int = 5):
         except Exception as e:
             log.error(f"Tactical loop error: {e}")
         await asyncio.sleep(interval_seconds)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SNIPER ENTRY ENGINE — Multi-signal confluence for precision entries
+# ═══════════════════════════════════════════════════════════════════════════════
+
+from dataclasses import field as _field
+
+
+@dataclass
+class SniperOpportunity:
+    symbol: str
+    side: str                   # LONG | SHORT
+    confluence_score: float     # 0.0–1.0 weighted sum
+    entry_price: float
+    signals: list               # active signal names
+    signal_details: dict        # per-signal breakdown
+    confidence: float           # calibrated confidence
+    timestamp: float = _field(default_factory=time.time)
+
+
+@dataclass
+class MassEntryZone:
+    symbol: str
+    side: str
+    base_price: float
+    levels: list                # [{index, label, price, position_weight_pct, trigger_deviation_pct}]
+    total_confluence: float
+    strategy: str               # LADDER | CLUSTER | SINGLE
+    timestamp: float = _field(default_factory=time.time)
+
+
+# ── Signal scorers ─────────────────────────────────────────────────────────────
+
+def _score_rsi_divergence(history: list[dict], side: str) -> tuple:
+    """RSI divergence: price new low + RSI higher low = bullish; vice versa for bearish."""
+    if len(history) < 20:
+        return 0.0, "INSUFFICIENT_DATA"
+
+    prices = [h.get("price", 0) for h in history[-20:] if h.get("price", 0) > 0]
+    rsis   = [h.get("rsi", 50) for h in history[-20:]]
+
+    if len(prices) < 10:
+        return 0.0, "INSUFFICIENT_PRICES"
+
+    mid = len(prices) // 2
+    early_low  = min(prices[:mid])
+    late_low   = min(prices[mid:])
+    early_high = max(prices[:mid])
+    late_high  = max(prices[mid:])
+    early_rsi  = sum(rsis[:mid]) / max(1, mid)
+    late_rsi   = sum(rsis[mid:]) / max(1, len(rsis) - mid)
+
+    if side == "LONG":
+        if late_low < early_low * 0.998 and late_rsi > early_rsi + 3:
+            s = min(1.0, (late_rsi - early_rsi) / 15)
+            return round(0.5 + s * 0.4, 3), "BULLISH_DIVERGENCE"
+    else:
+        if late_high > early_high * 1.002 and late_rsi < early_rsi - 3:
+            s = min(1.0, (early_rsi - late_rsi) / 15)
+            return round(0.5 + s * 0.4, 3), "BEARISH_DIVERGENCE"
+
+    return 0.0, "NO_DIVERGENCE"
+
+
+def _score_momentum_burst(history: list[dict], side: str, window: int = 6) -> tuple:
+    """Aceleração de preço na direção do trade."""
+    if len(history) < window:
+        return 0.0, "INSUFFICIENT_DATA"
+
+    recent = history[-window:]
+    prices = [h.get("price", 0) for h in recent if h.get("price", 0) > 0]
+
+    if len(prices) < 3:
+        return 0.0, "NO_PRICES"
+
+    velocity = (prices[-1] - prices[0]) / prices[0] * 100
+
+    if side == "LONG" and velocity > 0.3:
+        s = min(1.0, velocity / 1.5)
+        return round(s * 0.75, 3), f"LONG_MOMENTUM_{velocity:.2f}pct"
+    elif side == "SHORT" and velocity < -0.3:
+        s = min(1.0, abs(velocity) / 1.5)
+        return round(s * 0.75, 3), f"SHORT_MOMENTUM_{abs(velocity):.2f}pct"
+
+    return 0.0, "NO_BURST"
+
+
+def _score_funding_extreme(funding_rate: float, side: str) -> tuple:
+    """Funding rate extremo → mean-reversion bias."""
+    if side == "LONG" and funding_rate < -0.0005:
+        s = min(0.85, abs(funding_rate) / 0.002 * 0.85)
+        return round(s, 3), f"NEG_FUNDING_{funding_rate:.5f}"
+    if side == "SHORT" and funding_rate > 0.0005:
+        s = min(0.85, funding_rate / 0.002 * 0.85)
+        return round(s, 3), f"POS_FUNDING_{funding_rate:.5f}"
+    return 0.0, "NEUTRAL_FUNDING"
+
+
+def _score_vol_squeeze_breakout(history: list[dict], side: str) -> tuple:
+    """Vol comprimida seguida de explosão → entrada no breakout."""
+    if len(history) < 15:
+        return 0.0, "INSUFFICIENT_DATA"
+
+    mid   = len(history) // 2
+    early = history[:mid]
+    late  = history[mid:]
+
+    def avg_abs_chg(lst):
+        vals = [abs(h.get("price_change_pct", 0)) for h in lst]
+        return sum(vals) / max(1, len(vals))
+
+    early_vol = avg_abs_chg(early)
+    late_vol  = avg_abs_chg(late)
+
+    if early_vol > 0 and late_vol > early_vol * 1.8 and late_vol > 0.15:
+        chg = late[-1].get("price_change_pct", 0) if late else 0
+        if side == "LONG" and chg > 0:
+            return 0.70, "VOL_SQUEEZE_BREAKOUT_LONG"
+        if side == "SHORT" and chg < 0:
+            return 0.70, "VOL_SQUEEZE_BREAKOUT_SHORT"
+
+    return 0.0, "NO_SQUEEZE"
+
+
+def _score_book_imbalance(snap: dict, side: str) -> tuple:
+    """Imbalance de book de ordens favorável ao lado."""
+    imb = snap.get("book_imbalance", 0.0)
+    if imb == 0:
+        return 0.0, "NO_BOOK_DATA"
+    if side == "LONG" and imb > 0.15:
+        s = min(0.80, imb * 2)
+        return round(s, 3), f"BOOK_BID_HEAVY_{imb:.3f}"
+    if side == "SHORT" and imb < -0.15:
+        s = min(0.80, abs(imb) * 2)
+        return round(s, 3), f"BOOK_ASK_HEAVY_{imb:.3f}"
+    return 0.0, "NEUTRAL_BOOK"
+
+
+def _score_cvd_bias(snap: dict, side: str) -> tuple:
+    """Cumulative delta de volume aponta para a direção."""
+    cvd = snap.get("cvd", 0.0)
+    if cvd == 0:
+        return 0.0, "NO_CVD"
+    if side == "LONG" and cvd > 0.10:
+        s = min(0.75, cvd * 1.5)
+        return round(s, 3), f"CVD_POSITIVE_{cvd:.3f}"
+    if side == "SHORT" and cvd < -0.10:
+        s = min(0.75, abs(cvd) * 1.5)
+        return round(s, 3), f"CVD_NEGATIVE_{cvd:.3f}"
+    return 0.0, "NEUTRAL_CVD"
+
+
+# ── SniperEntryEngine ──────────────────────────────────────────────────────────
+
+class SniperEntryEngine:
+    """
+    Confluência de 8 sinais independentes por símbolo e lado.
+    Score ponderado >= THRESHOLD → oportunidade sniper.
+    """
+
+    SIGNAL_WEIGHTS = {
+        "rsi_divergence": 0.22,
+        "order_flow":     0.18,
+        "volume_spike":   0.15,
+        "momentum_burst": 0.14,
+        "book_imbalance": 0.12,
+        "cvd_bias":       0.10,
+        "funding_extreme":0.05,
+        "vol_squeeze":    0.04,
+    }
+    THRESHOLD = 0.52
+
+    def score_symbol(
+        self, sym: str, snap: dict, history: list[dict]
+    ) -> Optional[SniperOpportunity]:
+        price = snap.get("price", 0)
+        if not history or price <= 0:
+            return None
+        best: Optional[SniperOpportunity] = None
+        for side in ("LONG", "SHORT"):
+            opp = self._score_side(sym, side, snap, history, price)
+            if opp and (best is None or opp.confluence_score > best.confluence_score):
+                best = opp
+        return best
+
+    def _score_side(self, sym, side, snap, history, price) -> Optional[SniperOpportunity]:
+        scores: dict[str, float] = {}
+        labels: list[str] = []
+        details: dict = {}
+
+        # 1. RSI divergence
+        rsi_s, rsi_lbl = _score_rsi_divergence(history, side)
+        scores["rsi_divergence"] = rsi_s
+        if rsi_s > 0:
+            labels.append(rsi_lbl)
+            details["rsi_divergence"] = {"score": rsi_s, "label": rsi_lbl}
+
+        # 2. Order flow imbalance
+        ofi = _detect_order_flow_imbalance(history)
+        ofi_ok = (side == "LONG" and ofi.get("direction") == "BUYING_PRESSURE") or \
+                 (side == "SHORT" and ofi.get("direction") == "SELLING_PRESSURE")
+        ofi_s = round(ofi.get("confidence", 0) * 0.9, 3) if ofi_ok else 0.0
+        scores["order_flow"] = ofi_s
+        if ofi_s > 0:
+            labels.append(ofi.get("signal", "OFI"))
+            details["order_flow"] = {"score": ofi_s, "direction": ofi.get("direction")}
+
+        # 3. Volume spike + direction
+        vol_ratio = snap.get("volume_ratio", 1.0)
+        price_chg = snap.get("price_change_pct", 0.0)
+        vol_ok = (side == "LONG" and vol_ratio >= 1.5 and price_chg > 0) or \
+                 (side == "SHORT" and vol_ratio >= 1.5 and price_chg < 0)
+        vol_s = round(min(0.85, (vol_ratio - 1) / 3), 3) if vol_ok else 0.0
+        scores["volume_spike"] = vol_s
+        if vol_s > 0:
+            labels.append(f"VOL_SPIKE_{vol_ratio:.1f}x")
+            details["volume_spike"] = {"score": vol_s, "vol_ratio": round(vol_ratio, 2)}
+
+        # 4. Momentum burst
+        mom_s, mom_lbl = _score_momentum_burst(history, side)
+        scores["momentum_burst"] = mom_s
+        if mom_s > 0:
+            labels.append(mom_lbl)
+            details["momentum_burst"] = {"score": mom_s, "label": mom_lbl}
+
+        # 5. Book imbalance
+        book_s, book_lbl = _score_book_imbalance(snap, side)
+        scores["book_imbalance"] = book_s
+        if book_s > 0:
+            labels.append(book_lbl)
+            details["book_imbalance"] = {"score": book_s}
+
+        # 6. CVD bias
+        cvd_s, cvd_lbl = _score_cvd_bias(snap, side)
+        scores["cvd_bias"] = cvd_s
+        if cvd_s > 0:
+            labels.append(cvd_lbl)
+            details["cvd_bias"] = {"score": cvd_s, "cvd": round(snap.get("cvd", 0), 4)}
+
+        # 7. Funding extreme
+        fund_s, fund_lbl = _score_funding_extreme(snap.get("funding_rate", 0), side)
+        scores["funding_extreme"] = fund_s
+        if fund_s > 0:
+            labels.append(fund_lbl)
+            details["funding_extreme"] = {"score": fund_s, "rate": snap.get("funding_rate")}
+
+        # 8. Volatility squeeze breakout
+        sq_s, sq_lbl = _score_vol_squeeze_breakout(history, side)
+        scores["vol_squeeze"] = sq_s
+        if sq_s > 0:
+            labels.append(sq_lbl)
+            details["vol_squeeze"] = {"score": sq_s}
+
+        # Weighted confluence
+        total = sum(self.SIGNAL_WEIGHTS.get(k, 0) * v for k, v in scores.items())
+
+        if total < self.THRESHOLD:
+            return None
+
+        active    = sum(1 for v in scores.values() if v > 0)
+        confidence = round(min(0.92, 0.42 + active * 0.08), 3)
+
+        return SniperOpportunity(
+            symbol=sym,
+            side=side,
+            confluence_score=round(total, 4),
+            entry_price=price,
+            signals=labels,
+            signal_details=details,
+            confidence=confidence,
+        )
+
+
+_sniper_engine = SniperEntryEngine()
+
+
+async def compute_sniper_opportunities(engine: "FeatureEngine") -> list:
+    """Varre todos os símbolos e retorna SniperOpportunities ordenadas por score."""
+    snaps_obj = engine.get_all_snapshots()
+    opps = []
+    for sym, snap_obj in snaps_obj.items():
+        snap    = engine.to_dict(snap_obj)
+        history = list(_snap_buffer.get(sym, deque()))
+        opp     = _sniper_engine.score_symbol(sym, snap, history)
+        if opp:
+            opps.append(opp)
+    opps.sort(key=lambda x: x.confluence_score, reverse=True)
+    return opps
+
+
+def compute_mass_entry_zones(
+    symbol: str,
+    history: list[dict],
+    side: str,
+    n_levels: int = 3,
+    step_pct: float = 0.30,
+) -> Optional[MassEntryZone]:
+    """
+    Gera N níveis de entrada escalonados (ladder) para entrada em massa.
+    Pesos Kelly-inspirados: entrada imediata com maior exposição.
+    """
+    if not history:
+        return None
+    current = history[-1].get("price", 0)
+    if current <= 0:
+        return None
+
+    weight_map = {1: [1.0], 2: [0.55, 0.45], 3: [0.40, 0.35, 0.25]}
+    label_map  = {1: ["IMMEDIATE"], 2: ["IMMEDIATE", "LIMIT_1"],
+                  3: ["IMMEDIATE", "LIMIT_1", "LIMIT_2"]}
+    weights = weight_map.get(n_levels, [0.40, 0.35, 0.25])
+    lbl_arr = label_map.get(n_levels, ["IMMEDIATE", "LIMIT_1", "LIMIT_2"])
+
+    levels = []
+    for i, (w, lbl) in enumerate(zip(weights, lbl_arr)):
+        deviation = i * step_pct
+        if side == "LONG":
+            price = current * (1 - deviation / 100)
+        else:
+            price = current * (1 + deviation / 100)
+        levels.append({
+            "index": i,
+            "label": lbl,
+            "price": round(price, 6),
+            "position_weight_pct": round(w * 100, 1),
+            "trigger_deviation_pct": round(deviation, 2),
+        })
+
+    strategy = {1: "SINGLE", 2: "CLUSTER", 3: "LADDER"}.get(n_levels, "LADDER")
+    return MassEntryZone(
+        symbol=symbol,
+        side=side,
+        base_price=current,
+        levels=levels,
+        total_confluence=1.0,
+        strategy=strategy,
+    )
+
+
+async def compute_all_mass_entry_zones(
+    engine: "FeatureEngine",
+    opportunities: list,
+) -> list:
+    """Para cada oportunidade sniper de alta confluência, gera zona de entrada em massa."""
+    zones = []
+    for opp in opportunities:
+        if opp.confluence_score < 0.60:
+            continue
+        history = list(_snap_buffer.get(opp.symbol, deque()))
+        n = 3 if opp.confluence_score >= 0.72 else 2
+        zone = compute_mass_entry_zones(opp.symbol, history, opp.side, n_levels=n)
+        if zone:
+            zone.total_confluence = opp.confluence_score
+            zones.append(zone)
+    return zones

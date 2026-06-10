@@ -288,6 +288,165 @@ def _fallback_tactical(alerts: list[dict], snapshots: dict) -> str:
     return "\n".join(lines)
 
 
+def _build_sniper_prompt(opportunities: list[dict], snapshots: dict) -> str:
+    opp_text = []
+    for o in opportunities[:8]:
+        sym = o.get("symbol", "?").replace("-USDT", "")
+        opp_text.append(
+            f"  {sym} {o.get('side','?')}: score={o.get('confluence_score',0):.2f} "
+            f"| conf={o.get('confidence',0):.0%} | price={o.get('entry_price',0):.4f} "
+            f"| sinais=[{', '.join(o.get('signals',[])[:4])}]"
+        )
+
+    snap_text = []
+    for sym, snap in list(snapshots.items())[:6]:
+        short = sym.replace("-USDT", "")
+        snap_text.append(
+            f"  {short}: RSI={snap.get('rsi',50):.0f} | vol={snap.get('volume_ratio',1):.1f}x "
+            f"| OI={snap.get('oi_change_pct',0):+.1f}% | fund={snap.get('funding_rate',0):+.4f} "
+            f"| CVD={snap.get('cvd',0):+.3f} | book_imb={snap.get('book_imbalance',0):+.3f}"
+        )
+
+    return f"""Você é um trader sniper de futuros cripto analisando oportunidades de entrada de alta precisão.
+
+OPORTUNIDADES SNIPER DETECTADAS (ordenadas por confluência):
+{chr(10).join(opp_text) if opp_text else "  Nenhuma oportunidade ativa no momento."}
+
+CONTEXTO DE MERCADO:
+{chr(10).join(snap_text) if snap_text else "  Sem snapshots disponíveis."}
+
+Para cada oportunidade sniper, forneça:
+1. VEREDICTO: EXECUTE / AGUARDE / EVITE e por quê (2 frases)
+2. ENTRADA IDEAL: preço específico de entrada e lógica
+3. GESTÃO: TP sugerido (%) e SL sugerido (%)
+4. RISCO: o que invalidaria este setup
+
+Seja cirúrgico e específico. Use os números. Máximo 300 palavras total."""
+
+
+def _build_mass_entry_prompt(zones: list[dict], market_context: dict) -> str:
+    zone_text = []
+    for z in zones[:5]:
+        sym = z.get("symbol", "?").replace("-USDT", "")
+        levels = z.get("levels", [])
+        level_str = " | ".join(
+            f"L{l['index']+1}@{l['price']:.4f}({l['position_weight_pct']}%)" for l in levels
+        )
+        zone_text.append(
+            f"  {sym} {z.get('side','?')}: score={z.get('total_confluence',0):.2f} "
+            f"| estratégia={z.get('strategy','?')} | {level_str}"
+        )
+
+    btc_regime = market_context.get("btc_regime", "UNKNOWN")
+    btc_vol = market_context.get("btc_vol_pct", 0)
+
+    return f"""Você é um gestor de risco quantitativo planejando entrada em massa escalonada (ladder).
+
+ZONAS DE ENTRADA EM MASSA IDENTIFICADAS:
+{chr(10).join(zone_text) if zone_text else "  Nenhuma zona ativa com confluência suficiente."}
+
+CONTEXTO MACRO:
+  BTC Regime: {btc_regime} | Volatilidade BTC: {btc_vol:.2f}%
+
+Analise cada zona e forneça:
+1. APROVAÇÃO: aprove ou rejeite cada zona (com razão de 1 linha)
+2. AJUSTE DE PESOS: os pesos sugeridos (40/35/25%) estão corretos ou devem ser ajustados?
+3. TIMING: execute agora ou aguarde confirmação de qual condição?
+4. CORRELAÇÃO: há risco de todas as entradas correlacionadas se mover contra ao mesmo tempo?
+
+Seja prático e direto. Máximo 250 palavras."""
+
+
+def _fallback_sniper(opportunities: list[dict]) -> str:
+    lines = ["=== ANÁLISE SNIPER (modo sem IA) ===\n"]
+    if not opportunities:
+        lines.append("Nenhuma oportunidade sniper ativa no momento.")
+        lines.append("Aguardando confluência de sinais (RSI divergence + OFI + volume spike).")
+        return "\n".join(lines)
+
+    for o in opportunities[:5]:
+        sym  = o.get("symbol", "?").replace("-USDT", "")
+        side = o.get("side", "?")
+        sc   = o.get("confluence_score", 0)
+        sigs = ", ".join(o.get("signals", [])[:3])
+        lines.append(f"{sym} {side}: score={sc:.2f} | {sigs}")
+
+    lines.append("\nPara análise narrativa sniper: configure ANTHROPIC_API_KEY.")
+    return "\n".join(lines)
+
+
+def _fallback_mass_entry(zones: list[dict]) -> str:
+    lines = ["=== ENTRADA EM MASSA (modo sem IA) ===\n"]
+    if not zones:
+        lines.append("Nenhuma zona de entrada em massa com confluência suficiente (>0.60).")
+        return "\n".join(lines)
+
+    for z in zones[:3]:
+        sym    = z.get("symbol", "?").replace("-USDT", "")
+        side   = z.get("side", "?")
+        sc     = z.get("total_confluence", 0)
+        strat  = z.get("strategy", "?")
+        levels = z.get("levels", [])
+        lines.append(f"\n{sym} {side} ({strat}) — score={sc:.2f}:")
+        for lv in levels:
+            lines.append(f"  L{lv['index']+1}: {lv['label']} @ {lv['price']:.4f} ({lv['position_weight_pct']}% do capital)")
+
+    lines.append("\nPara aprovação automática e ajuste de pesos: configure ANTHROPIC_API_KEY.")
+    return "\n".join(lines)
+
+
+async def run_sniper_analysis(opportunities: list[dict], snapshots: dict) -> "AIAnalysis":
+    """Analisa oportunidades sniper ativas e gera plano de entrada de precisão."""
+    ts     = time.time()
+    prompt = _build_sniper_prompt(opportunities, snapshots)
+
+    if not _has_ai():
+        text = _fallback_sniper(opportunities)
+        return AIAnalysis("SNIPER", ts, "fallback", text[:200], text,
+                          {"opportunities": len(opportunities)})
+
+    client = _get_client()
+    try:
+        msg = await client.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=800,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        full_text = msg.content[0].text
+        return AIAnalysis("SNIPER", ts, "claude-haiku-4-5", full_text[:200], full_text,
+                          {"opportunities": len(opportunities), "snapshots": len(snapshots)})
+    except Exception as e:
+        log.error(f"AI sniper analysis error: {e}")
+        text = _fallback_sniper(opportunities)
+        return AIAnalysis("SNIPER", ts, "fallback", text[:200], text, {})
+
+
+async def run_mass_entry_scan(zones: list[dict], market_context: dict) -> "AIAnalysis":
+    """Gera plano de entrada em massa escalonada para zonas de alta confluência."""
+    ts     = time.time()
+    prompt = _build_mass_entry_prompt(zones, market_context)
+
+    if not _has_ai():
+        text = _fallback_mass_entry(zones)
+        return AIAnalysis("MASS_ENTRY", ts, "fallback", text[:200], text,
+                          {"zones": len(zones)})
+
+    client = _get_client()
+    try:
+        msg = await client.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=700,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        full_text = msg.content[0].text
+        return AIAnalysis("MASS_ENTRY", ts, "claude-haiku-4-5", full_text[:200], full_text,
+                          {"zones": len(zones)})
+    except Exception as e:
+        log.error(f"AI mass entry scan error: {e}")
+        text = _fallback_mass_entry(zones)
+        return AIAnalysis("MASS_ENTRY", ts, "fallback", text[:200], text, {})
+
+
 def _fallback_hypothesis(patterns: list[dict]) -> str:
     lines = ["=== GERAÇÃO DE HIPÓTESES (modo sem IA) ===\n"]
     if patterns:
