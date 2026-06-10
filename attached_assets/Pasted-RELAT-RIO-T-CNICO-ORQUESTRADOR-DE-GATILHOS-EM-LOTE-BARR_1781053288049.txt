@@ -1,0 +1,121 @@
+RELATÓRIO TÉCNICO: ORQUESTRADOR DE GATILHOS EM LOTE & BARREIRA DE CONCORRÊNCIAO objetivo deste avanço é garantir que o backend em Node.js gerencie a lista de SYMBOLS do .env aplicando as novas regras (como o Mux-Lock e o Dynamic Target Scaler) de forma centralizada, impedindo que tarefas assíncronas paralelas causem colisões de margem ou estouro de limite de requisições (rate limits) na API da BingX.🎛️ I. A Arquitetura do Batch Orchestrator (Node.js)Em vez de deixar cada WebSocket de cada moeda agir de forma totalmente isolada e sem controle, implementamos a classe BatchTriggerOrchestrator. Ela centraliza o estado do Mux-Lock e gerencia o teto de concorrência em memória.O Gerenciador de Estados Centralizado:TypeScript// backend/src/lib/batchTriggerOrchestrator.ts
+import { quantBrainClient } from "./quantBrainClient";
+import { bingxClient } from "./bingxClient";
+
+interface MuxLockState {
+  isActive: boolean;
+  expiresAt: number;
+  triggeringSignalId: string | null;
+}
+
+class BatchTriggerOrchestrator {
+  private muxLock: MuxLockState = { isActive: false, expiresAt: 0, triggeringSignalId: null };
+  private activePositionsCount: number = 0;
+  private maxConcurrentPositions: number = 3;
+
+  constructor() {
+    const candlesLock = Number(process.env.MUX_LOCK_CANDLES) || 2;
+    console.log(`[🎯 BATCH] Orquestrador iniciado. MUX_LOCK_CANDLES = ${candlesLock}m`);
+  }
+
+  /**
+   * Avalia e processa o sinal para um símbolo da lista do .env
+   */
+  public async handleMarketTick(symbol: string, candleData: any): Promise<void> {
+    const now = Date.now();
+
+    // 1. HARD GATE: Verifica se o Mux-Lock global está ativo
+    if (this.muxLock.isActive) {
+      if (now < this.muxLock.expiresAt) {
+        const remainingSec = Math.ceil((this.muxLock.expiresAt - now) / 1000);
+        // Log silencioso ou debug para não poluir o painel
+        return; 
+      } else {
+        // Mux-Lock expirou naturalmente, libera o barramento
+        this.muxLock.isActive = false;
+        this.muxLock.triggeringSignalId = null;
+        console.log(`[🔓 MUX_LOCK] Barramento liberado automaticamente.`);
+      }
+    }
+
+    // 2. HARD GATE: Valida o teto de posições abertas em massa simultâneas
+    this.activePositionsCount = await bingxClient.getActivePositionsCount();
+    if (this.activePositionsCount >= this.maxConcurrentPositions) {
+      return; // Aborta sem processar para economizar chamadas de API
+    }
+
+    // 3. EXECUTA O PIPELINE DO EDGE (Quant Brain Python)
+    const brainResponse = await quantBrainClient.evaluateEdge(symbol, candleData);
+    if (brainResponse.decision !== "ARM_TRIGGER") return;
+
+    // 4. ATIVAÇÃO DO GATILHO E DISPARO DO MUX-LOCK SÍNCRONO
+    await this.armTriggerAndLock(symbol, brainResponse);
+  }
+
+  private async armTriggerAndLock(symbol: string, signal: any): Promise<void> {
+    try {
+      // Envia a ordem limitada Maker (Post-Only) para a pedra na BingX
+      const order = await bingxClient.placeOrder({
+        symbol: symbol,
+        side: signal.geometry.side === "LONG" ? "BUY" : "SELL",
+        type: "LIMIT",
+        price: signal.geometry.triggerPrice,
+        takeProfit: signal.geometry.targetPrice,
+        stopLoss: signal.geometry.stopPrice,
+        postOnly: true
+      });
+
+      // Ativa o bloqueio de disparo por tick imediatamente (Feature 1)
+      const lockDurationMs = (Number(process.env.MUX_LOCK_CANDLES) || 2) * 60 * 1000;
+      this.muxLock = {
+        isActive: true,
+        expiresAt: Date.now() + lockDurationMs,
+        triggeringSignalId: signal.metadata.signalId
+      };
+
+      console.log(`[🔒 MUX_LOCK_ACTIVE] Gatilho armado em ${symbol}. Bloqueio global ativado por ${lockDurationMs / 1000}s.`);
+      
+      // Inicializa o background poll de 5s para monitorar o preenchimento ou expiração (TTL)
+      this.startTriggerLifecycleMonitor(symbol, order.id, signal);
+
+    } catch (error) {
+      console.error(`[❌ BATCH_ERROR] Falha ao armar gatilho para ${symbol}:`, error);
+    }
+  }
+
+  private startTriggerLifecycleMonitor(symbol: string, orderId: string, signal: any): void {
+    // Implementação do background poll de 5s e as regras de Partial Fill (Feature 3)
+  }
+}
+
+export const batchOrchestrator = new BatchTriggerOrchestrator();
+📉 II. Estrutura de Payload Atualizada com as Novas FeaturesO contrato de dados gerado pelo core/edge_gate.py pós-implementação dessas 5 regras deve refletir exatamente as variáveis de controle calculadas. O payload sela o triângulo geométrico com os novos clamps de segurança de alvo curto.JSON{
+  "decision": "ARM_TRIGGER",
+  "metadata": {
+    "signalId": "sig_20260609_sol_077",
+    "symbol": "SOL-USDT",
+    "timestamp": 1781039014000,
+    "sectorCluster": "LAYER_1"
+  },
+  "geometry": {
+    "side": "LONG",
+    "triggerPrice": 142.3500,
+    "targetPrice": 142.7060,
+    "stopPrice": 142.1720,
+    "expirationSeconds": 25
+  },
+  "executionMetrics": {
+    "recommendedLeverage": 20,
+    "baseTargetUsdt": 0.50,
+    "calculatedTpPct": 0.2501,
+    "calculatedSlPct": 0.1250,
+    "appliedFilters": ["ATR_SHADOW_PASSED", "FUNDING_WINDOW_PASSED"]
+  },
+  "probabilityModel": {
+    "confidence": 0.8120,
+    "edgeScore": 8.50,
+    "expectedValue": 0.0058,
+    "kellyFraction": 0.0950
+  }
+}
+🔍 A Geometria Clamped na Prática (Feature 5)Olha que linda a matemática da IA trabalhando no payload acima para a moeda fictícia a $142.35:Take Profit Curto ($0.50 cents): $\text{tp\_pct} = (0.50 / 142.35) \times 100 = 0.3512\%$.Ajuste por ATR: O ATR de 1m acusou alta volatilidade, a IA aplicou o multiplicador dinâmico e cravou o calculatedTpPct em 0.2501% (dentro do Clamp seguro de $0.08\% \le \text{tp} \le 3.0\%$).Risco Matemático Pura: O Stop Loss nasceu exatamente na metade da distância do TP (0.1250%), travando a relação 2:1 de recompensa/risco na pedra da corretora.📊 III. Próximo Passo do Pipeline de SinaisCom o orquestrador síncrono e centralizado montado, a última ponta da integração é o Tratamento das Métricas do Feedback Loop.Toda vez que o startTriggerLifecycleMonitor detectar um desfecho na BingX, ele precisa salvar na base de dados as novas tags integradas:FILLED_AND_WONFILLED_AND_STOPPEDEXPIRED_UNFILLEDPARTIAL_FILL_CANCELED (Para alimentar a estatística da sua Feature 3

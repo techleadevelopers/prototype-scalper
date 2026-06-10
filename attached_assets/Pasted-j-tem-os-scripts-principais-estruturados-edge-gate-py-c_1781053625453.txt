@@ -1,0 +1,129 @@
+já tem os scripts principais estruturados (edge_gate.py, candle_intelligence.py, database.py, etc.), vamos implementar essa estratégia de Grid Sniper de Alta Volatilidade diretamente no coração do seu fluxo.Aqui está o relatório técnico de integração cirúrgico para que o Quant Brain calcule e retorne a Escada de Gatilhos em massa, pronto para o Node.js disparar em lote na BingX:📐 I. Lógica de Cálculo da Escada Dinâmica (Quant Brain)Para que essa estratégia funcione com segurança 24h por dia na nuvem, o edge_gate.py não pode usar apenas percentuais fixos secos (10% e 20%). Se o mercado entrar em um dia de calmaria extrema, 10% de distância fará o robô passar dias sem executar nada. Se entrar em dia de colapso macro, 10% pode ser rompido como papel.O algoritmo vai misturar os seus alvos com o ATR de 15m:LONG (Modo Queda Livre): Inicia a escada a partir de $10\%$ abaixo do preço atual (ou baseado em $3.5 \times \text{ATR}_{15m}$ para se ajustar à volatilidade real). Cada degrau subsequente desce $1\%$.SHORT (Modo Parabólico): Inicia a rede a partir de $20\%$ acima do preço atual ($5.0 \times \text{ATR}_{15m}$), pulverizando ordens acima com espaçamento de $1\%$ para capturar a exaustão de compra.📑 II. Ajuste do Contrato de Dados do Edge (ARM_TRIGGER_GRID)Para que o backend Node.js saiba exatamente como estruturar o envio em massa para a BingX, o contrato do endpoint /edge/evaluate deve retornar a decisão ARM_TRIGGER_GRID contendo um array ordenado de camadas geométricas mutáveis.JSON{
+  "decision": "ARM_TRIGGER_GRID",
+  "metadata": {
+    "signalId": "grid_20260609_pol_881",
+    "symbol": "POL-USDT",
+    "timestamp": 1781042790000,
+    "sectorCluster": "LAYER_2"
+  },
+  "executionMetrics": {
+    "recommendedLeverage": 20,
+    "gridStrategy": "TAIL_HUNTER",
+    "expirationSeconds": 45
+  },
+  "grid": [
+    {
+      "level": 1,
+      "side": "LONG",
+      "triggerPrice": 0.0630,
+      "targetPrice": 0.0636,
+      "stopPrice": 0.0567,
+      "allocationFactor": 0.20
+    },
+    {
+      "level": 2,
+      "side": "LONG",
+      "triggerPrice": 0.0623,
+      "targetPrice": 0.0629,
+      "stopPrice": 0.0560,
+      "allocationFactor": 0.30
+    },
+    {
+      "level": 3,
+      "side": "LONG",
+      "triggerPrice": 0.0616,
+      "targetPrice": 0.0622,
+      "stopPrice": 0.0553,
+      "allocationFactor": 0.50
+    }
+  ]
+}
+🛠️ III. Integração de Código no Core do Python (edge_gate.py)Adicione o bloco responsável por construir a escada em lote dentro do seu gerenciador do Edge. Esse método vai calcular os preços baseados nos inputs de distância para LONG e SHORT que você especificou:Python# Adicionar ou mesclar no seu quant-brain/core/edge_gate.py
+
+def build_sniper_tail_grid(symbol: str, current_price: float, side: str, base_target_usdt: float):
+    """
+    Gera uma malha/escada de gatilhos na pedra em massa para capturar pavios extremos (espetos).
+    LONG começa em -10% | SHORT começa em +20% do preço atual.
+    """
+    grid_layers = []
+    
+    if side == "LONG":
+        # Definição dos multiplicadores de queda especificados por você
+        drop_percentages = [0.10, 0.11, 0.12] 
+        # Distribuição de lote por degrau (Martingale controlado ou linear)
+        allocation_weights = [0.20, 0.30, 0.50] 
+        
+        for idx, drop in enumerate(drop_percentages):
+            trigger_p = current_price * (1.0 - drop)
+            # Alvo curto dinâmico escalado com base na Feature 5 do Target Scaler
+            tp_pct = (base_target_usdt / trigger_p) * 100
+            sl_pct = tp_pct * 2 # Relação controlada sobre a margem isolada
+            
+            grid_layers.append({
+                "level": idx + 1,
+                "side": "LONG",
+                "triggerPrice": round(trigger_p, 4),
+                "targetPrice": round(trigger_p * (1.0 + (tp_pct / 100)), 4),
+                "stopPrice": round(trigger_p * (1.0 - (sl_pct / 100)), 4),
+                "allocationFactor": allocation_weights[idx]
+            })
+            
+    elif side == "SHORT":
+        # Definição dos multiplicadores de subida especificados por você
+        pump_percentages = [0.20, 0.21, 0.22, 0.24]
+        allocation_weights = [0.15, 0.25, 0.30, 0.30]
+        
+        for idx, pump in enumerate(pump_percentages):
+            trigger_p = current_price * (1.0 + pump)
+            tp_pct = (base_target_usdt / trigger_p) * 100
+            sl_pct = tp_pct * 2
+            
+            grid_layers.append({
+                "level": idx + 1,
+                "side": "SHORT",
+                "triggerPrice": round(trigger_p, 4),
+                "targetPrice": round(trigger_p * (1.0 - (tp_pct / 100)), 4),
+                "stopPrice": round(trigger_p * (1.0 + (sl_pct / 100)), 4),
+                "allocationFactor": allocation_weights[idx]
+            })
+
+    return grid_layers
+🎛️ IV. Orquestração de Envio em Lote no Backend Node.jsQuando o endpoint de avaliação do seu servidor Node.js receber o payload ARM_TRIGGER_GRID vindo da IA, ele vai disparar todas as ordens de forma assíncrona concorrente usando a API de endpoints da BingX como LIMIT + Post-Only:TypeScript// backend/src/lib/gridExecutionEngine.ts
+import { bingxClient } from "./bingxClient";
+
+export async function deploySniperGridInMassa(symbol: string, brainGridResponse: any): Promise<void> {
+  const { grid, executionMetrics } = brainGridResponse;
+  
+  console.log(`[🎯 BATCH SNIPER] Armanda rede de captura para ${symbol}. Total de degraus: ${grid.length}`);
+
+  // Dispara todas as ordens em paralelo no barramento HTTP para diminuir o tempo de execução
+  const gridPromises = grid.map(async (layer: any) => {
+    try {
+      const order = await bingxClient.placeOrder({
+        symbol: symbol,
+        side: layer.side === "LONG" ? "BUY" : "SELL",
+        type: "LIMIT",
+        price: layer.triggerPrice,
+        quantity: (process.env.BASE_LOT_SIZE_USDT || 10) * layer.allocationFactor,
+        postOnly: true, // Estrito: Garante taxa Maker e proíbe agredir o book antes do espeto
+        takeProfit: layer.targetPrice,
+        stopLoss: layer.stopPrice
+      });
+      
+      console.log(`[✅ LAYER UNLOCKED] Degrau ${layer.level} posicionado na pedra: $${layer.triggerPrice}`);
+      return order.id;
+    } catch (err) {
+      console.error(`[❌ LAYER FAILED] Falha ao injetar degrau ${layer.level} de ${symbol}:`, err);
+      return null;
+    }
+  });
+
+  const deployedOrderIds = await Promise.all(gridPromises);
+
+  // Configura a expiração coletiva (TTL) do grid para limpar ordens fantasmas da pedra
+  setTimeout(async () => {
+    console.log(`[⏱️ GRID TTL] Verificando e limpando ordens remanescentes do grid de ${symbol}...`);
+    await bingxClient.cancelAllOpenOrdersForSymbol(symbol, deployedOrderIds.filter(Boolean));
+  }, executionMetrics.expirationSeconds * 1000);
+}
+🛡️ V. Interação Perfeita com as Travas que Você CriouEssa malha de rede se apoia 100% na robustez das 5 features que você implementou anteriormente:Mux-Lock Inteligente: Se o espeto de queda for violento o suficiente para acionar os Degraus 1 e 2 da Polygon simultaneamente, a sua trava de concorrência global entra em ação assim que a posição fechar com lucro, limpando o Degrau 3 que ficou pendente sem preencher.Partial Fill Guard: Se o mercado derreter apenas até os $10\%$ (pegar só uma fração do primeiro degrau) e subir direto para o Take Profit curto de $0.50 cents, o gerenciador cancela o restante da escada que ficou para baixo de forma imediata.Filtragem de Dados Puros: Graças ao seu filtro de qualidade sniper, se a IA armar essa escada de grid, o sistema só vai salvar no arquivo trigger_outcomes.jsonl o desfecho real de execução do trade. Sinais gerados que expiraram sem preenchimento não poluem o re-treino do offline_learner.py.

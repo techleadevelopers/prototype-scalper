@@ -270,11 +270,38 @@ export interface QuantBrainEdgeResult {
   kellyFraction?: number | null;
   // System 2: Sector cluster para cascade filter (cancelamento de ordens irmãs)
   sectorCluster?: string;
-  // System 4: Execution metrics — contrato padrão-ouro v4
+  // System 4: Execution metrics — contrato padrão-ouro v4 (extended)
   executionMetrics?: {
     recommendedLeverage: number;
     minTickDensity1m: number;
     maxSpreadAllowed: number;
+    // Dynamic Target Scaler fields (relatório técnico)
+    baseTargetUsdt?: number;
+    calculatedTpPct?: number;
+    calculatedSlPct?: number;
+    appliedFilters?: string[];
+  };
+  // ── Objetos estruturados do relatório técnico ──────────────────────────────
+  // Complementam os campos planos acima (backward compat mantida).
+  // BatchTriggerOrchestrator consome geometry + probabilityModel diretamente.
+  metadata?: {
+    signalId: string;
+    symbol: string;
+    timestamp: number;
+    sectorCluster: string;
+  };
+  geometry?: {
+    side: "LONG" | "SHORT";
+    triggerPrice: number | null;
+    targetPrice: number | null;
+    stopPrice: number | null;
+    expirationSeconds: number | null;
+  };
+  probabilityModel?: {
+    confidence: number;
+    edgeScore: number;
+    expectedValue: number;
+    kellyFraction: number;
   };
 }
 
@@ -417,11 +444,35 @@ const QuantBrainEdgeResponseSchema = z.object({
   kellyFraction: z.number().nullable().optional(),
   // System 2: Sector cluster
   sectorCluster: z.string().optional(),
-  // System 4: Execution metrics
+  // System 4: Execution metrics — contrato padrão-ouro v4 (extended)
   executionMetrics: z.object({
     recommendedLeverage: z.number().int().min(1).max(50),
     minTickDensity1m: z.number().int().min(0),
     maxSpreadAllowed: z.number().positive(),
+    baseTargetUsdt: z.number().positive().optional(),
+    calculatedTpPct: z.number().positive().optional(),
+    calculatedSlPct: z.number().positive().optional(),
+    appliedFilters: z.array(z.string()).optional(),
+  }).optional(),
+  // ── Objetos estruturados do relatório técnico ─────────────────────────────
+  metadata: z.object({
+    signalId: z.string().min(1),
+    symbol: z.string().min(1),
+    timestamp: z.number().int().positive(),
+    sectorCluster: z.string(),
+  }).optional(),
+  geometry: z.object({
+    side: z.enum(["LONG", "SHORT"]),
+    triggerPrice: z.number().positive().nullable(),
+    targetPrice: z.number().positive().nullable(),
+    stopPrice: z.number().positive().nullable(),
+    expirationSeconds: z.number().int().positive().nullable(),
+  }).optional(),
+  probabilityModel: z.object({
+    confidence: z.number().min(0).max(1),
+    edgeScore: z.number(),
+    expectedValue: z.number(),
+    kellyFraction: z.number().min(0),
   }).optional(),
 }).passthrough();
 

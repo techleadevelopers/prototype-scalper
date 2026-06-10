@@ -1,0 +1,77 @@
+Integração da Estratégia de Gatilhos em Escada para Caça de Pavios:📐 I. A Lógica Geométrica: Por que usar Distâncias Fixas ou Clamps por Volatilidade?Se uma moeda custa $0.07 e cai 10%, ela vai para $0.063. Para moedas muito voláteis, 10% de queda acontece em 3 minutos. Para moedas pesadas (como BTC ou ETH), 10% é um movimento de crash de mercado.A Regra de Ouro para o edge_gate.py:Para manter o sistema estável e contínuo, a IA deve ler o parâmetro base do seu .env (ex: GRID_START_LONG_PCT=10), mas cruzar com o ATR de 15m para garantir que o preço não mude de estrutura antes de buscar a ordem.Para LONG (Alvo na Queda): O sistema pega o preço atual e calcula níveis subsequentes (ex: $10\%, 11\%, 12\%$) injetando as frações de volume.Para SHORT (Alvo na Exaustão de Subida): O sistema joga a rede lá em cima ($20\%, 21\%, 22\%$), esperando o esgotamento do volume comprador.📑 II. Ajuste do Contrato do Edge para Múltiplos Gatilhos (Payload)O endpoint /edge/evaluate não vai mais retornar apenas um triggerPrice. Como estamos falando de Gatilhos em Massa, ele deve retornar uma matriz de sub-gatilhos geométricos estruturados (um array de ordens limpas).JSON{
+  "decision": "ARM_TRIGGER_GRID",
+  "metadata": {
+    "signalId": "grid_20260609_poly_099",
+    "symbol": "POL-USDT",
+    "timestamp": 1781041168000,
+    "sectorCluster": "LAYER_2"
+  },
+  "executionMetrics": {
+    "recommendedLeverage": 20,
+    "gridStrategy": "TAIL_HUNTER",
+    "expirationSeconds": 60 
+  },
+  "grid": [
+    {
+      "level": 1,
+      "side": "LONG",
+      "triggerPrice": 0.0630, 
+      "targetPrice": 0.0636,  
+      "stopPrice": 0.0617,    
+      "allocationFactor": 0.20 
+    },
+    {
+      "level": 2,
+      "side": "LONG",
+      "triggerPrice": 0.0623, 
+      "targetPrice": 0.0629,
+      "stopPrice": 0.0610,
+      "allocationFactor": 0.30
+    },
+    {
+      "level": 3,
+      "side": "LONG",
+      "triggerPrice": 0.0616, 
+      "targetPrice": 0.0622,
+      "stopPrice": 0.0603,
+      "allocationFactor": 0.50
+    }
+  ]
+}
+🎛️ III. Implementação no Backend Executor (Node.js)O backend recebe esse payload do tipo ARM_TRIGGER_GRID e, em vez de enviar uma única ordem, faz um disparo em lote (Batch Order Placement) na BingX, usando a flag postOnly: true para garantir que todas entrem como Maker.TypeScript// backend/src/lib/gridTriggerManager.ts
+import { bingxClient } from "./bingxClient";
+import { positionSizing } from "./positionSizing";
+
+export async function processGridTrigger(symbol: string, brainResponse: any) {
+  if (brainResponse.decision !== "ARM_TRIGGER_GRID") return;
+
+  // 1. Calcula o tamanho total da mão para a operação de Grid
+  const totalSize = positionSizing.getGridBaseSize(symbol);
+
+  // 2. Loop para espalhar as ordens na pedra em massa
+  for (const layer of brainResponse.grid) {
+    try {
+      // Modula o tamanho do lote de cada degrau com base no allocationFactor da IA
+      const layerSize = totalSize * layer.allocationFactor;
+
+      await bingxClient.placeOrder({
+        symbol: symbol,
+        side: layer.side === "LONG" ? "BUY" : "SELL",
+        type: "LIMIT",
+        price: layer.triggerPrice,
+        quantity: layerSize,
+        postOnly: true, // Obrigatório: Garante taxa maker e não agride o book
+        takeProfit: layer.targetPrice,
+        stopLoss: layer.stopPrice
+      });
+
+      console.log(`[🎯 GRID SNIPER] Degrau ${layer.level} armado na pedra em ${symbol} a $${layer.triggerPrice}`);
+    } catch (error) {
+      console.error(`[❌ GRID ERROR] Falha ao armar camada ${layer.level} de ${symbol}:`, error);
+    }
+  }
+
+  // 3. Monitoramento de Expiração Coletiva (TTL do Grid)
+  setGridTimeout(symbol, brainResponse.executionMetrics.expirationSeconds);
+}
+📈 IV. Compatibilidade com as 5 Features que Você já ImplementouEssa nova estratégia de escada se integra perfeitamente com a infraestrutura robusta que você acabou de criar no passo anterior:Single-Fill Execution Guard (Mux-Lock): Se o mercado derreter com tanta força que o espeto pegar o seu Degrau 1 e o Degrau 2, assim que a posição for ativada e o repique curto acontecer (gerando o fechamento com lucro), o Node aciona o Mux-Lock global e limpa qualquer resquício de ordens que tenham sobrado na pedra.Partial Fill Policy: Se o espeto de queda for tão rápido que apenas "arranhar" o seu primeiro gatilho de 10% (preenchendo só metade do lote do Degrau 1) e voltar para o Take Profit, o seu gerenciador de ordens parciais cancela o resto da escada pendente abaixo para não deixar pontas soltas.ATR Shadow Filter: Se a Polygon entrar em um modo "travado/gappy" onde o preço pula de $0.07 para $0.065 sem negociação fluida intermediária, o filtro barra o acionamento do grid 

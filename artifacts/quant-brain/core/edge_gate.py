@@ -1287,6 +1287,26 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
     # EV como fração do nocional (não em USDT absoluto) — comparável entre tamanhos
     _ev_pct = round(net_ev_usdt / max(0.01, notional), 6)
 
+    # ── Compute applied filters (Feature 2 & 4 pass/fail tags) ──────────────
+    _atr_shadow_passed = not any("ATR_SHADOW_UNTRADABLE" in b for b in universal_blocks)
+    _funding_window_passed = not any("FUNDING_WINDOW_REJECT" in b for b in universal_blocks)
+    _data_sync_passed = not any("DATA_SYNC_REJECT" in b for b in universal_blocks)
+    _applied_filters: list[str] = []
+    if _atr_shadow_passed:
+        _applied_filters.append("ATR_SHADOW_PASSED")
+    else:
+        _applied_filters.append("ATR_SHADOW_FAILED")
+    if _funding_window_passed:
+        _applied_filters.append("FUNDING_WINDOW_PASSED")
+    else:
+        _applied_filters.append("FUNDING_WINDOW_FAILED")
+    if _data_sync_passed:
+        _applied_filters.append("DATA_SYNC_PASSED")
+    else:
+        _applied_filters.append("DATA_SYNC_FAILED")
+
+    _recommended_leverage = _compute_recommended_leverage(_alt_atr_pct_v)
+
     return {
         "allow": allow,
         "available": True,
@@ -1381,9 +1401,7 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
         "triggerPrice": _microframe.get("triggerPrice"),
         "triggerExpirationSeconds": _microframe.get("triggerExpirationSeconds", 45),
         "microframeRegime": _microframe,
-        # ── Contrato de Geometria Completa ────────────────────────────────────
-        # Estes campos são a saída oficial do Quant Brain conforme o contrato.
-        # O Node.js NÃO deve recalcular nenhum destes valores.
+        # ── Contrato de Geometria Completa (campos planos — backward compat) ──
         "decision": _decision,
         "targetPrice": _target_px,
         "stopPrice": _stop_px,
@@ -1394,12 +1412,39 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
         "kellyFraction": round(_kelly_fraction, 6),
         # ── System 2: Sector cluster para cascade filter no Node.js ────────────
         "sectorCluster": _sector_cluster(symbol),
-        # ── System 4: Execution metrics — contrato padrão-ouro ────────────────
-        # Node.js consome estes campos para gate de tick density e alavancagem
-        # dinâmica calculada pelo QB com base na volatilidade ATR real.
+        # ── System 4: Execution metrics — contrato padrão-ouro v4 ────────────
+        # Node.js consome estes campos para gate de tick density, alavancagem
+        # dinâmica e validação de geometria (calculatedTpPct / calculatedSlPct).
         "executionMetrics": {
-            "recommendedLeverage": _compute_recommended_leverage(_alt_atr_pct_v),
+            "recommendedLeverage": _recommended_leverage,
             "minTickDensity1m": int((data_quality.get("alt1m") or {}).get("samples", 0)),
             "maxSpreadAllowed": 0.0002,
+            # ── Campos adicionados pelo relatório técnico (Dynamic Target Scaler)
+            "baseTargetUsdt": _base_target_usdt,
+            "calculatedTpPct": round(_tp_pct, 6),
+            "calculatedSlPct": round(_sl_pct, 6),
+            "appliedFilters": _applied_filters,
+        },
+        # ── Objetos estruturados do relatório técnico ─────────────────────────
+        # Complementam os campos planos (backward compat mantida).
+        # BatchTriggerOrchestrator consome `geometry` e `probabilityModel`.
+        "metadata": {
+            "signalId": request_signal_id,
+            "symbol": symbol,
+            "timestamp": int(time.time() * 1000),
+            "sectorCluster": _sector_cluster(symbol),
+        },
+        "geometry": {
+            "side": position_side,
+            "triggerPrice": _trigger_px,
+            "targetPrice": _target_px,
+            "stopPrice": _stop_px,
+            "expirationSeconds": _raw_expiration if _decision == "ARM_TRIGGER" else None,
+        },
+        "probabilityModel": {
+            "confidence": _confidence,
+            "edgeScore": _edge_score,
+            "expectedValue": _ev_pct,
+            "kellyFraction": round(_kelly_fraction, 6),
         },
     }

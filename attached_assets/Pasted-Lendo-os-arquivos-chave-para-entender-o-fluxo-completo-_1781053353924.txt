@@ -1,0 +1,62 @@
+Lendo os arquivos chave para entender o fluxo completo dos rejects antes de qualquer alteração.
+
+
+4 actions
+Preciso ver o fluxo completo do sniper autopilot e como os gates são chamados nele, não só no endpoint manual.
+
+
+3 actions
+Continuando a auditoria — lendo o ciclo do sniper e o candleEdge em paralelo.
+
+
+3 actions
+Continuando leitura — ciclo do sniper após a seleção de candidatos e como os gates do endpoint são invocados.
+
+
+3 actions
+Preciso ver como o sniper coloca ordens no endpoint — para confirmar o double-gate.
+
+
+3 actions
+Já tenho o quadro completo. Deixa eu confirmar os call sites antes de escrever o código.
+
+
+3 actions
+Tenho o mapeamento completo. Lendo os call sites do bot.ts para ver o contexto exato antes de implementar.
+
+
+4 actions
+Diagnóstico completo. Tenho 3 problemas cirúrgicos a corrigir:
+
+CANDLE_DIRECTION_REJECT — bloqueia quando suggestedSide ≠ positionSide, mesmo quando a margem de diferença é de 0.01. Deveria só bloquear quando o lado oposto é fortemente dominante (margem ≥ candleDirectionRejectMargin, padrão 0.15)
+CANDLE_CHOP_REJECT — bloqueia quando separation < 0.08 independente do score absoluto. Se sideScore ≥ candleMinScore, o sinal é válido mesmo com separação pequena
+RECENT_EDGE_REJECT — usa pool global de outcomes. Uma sequência ruim num símbolo bloqueia todos os outros. Deve avaliar por símbolo primeiro, cair no global só se não há dados suficientes (com threshold dobrado)
+
+Diagnóstico completo. Tenho 3 problemas cirúrgicos a corrigir:
+
+CANDLE_DIRECTION_REJECT — bloqueia quando suggestedSide ≠ positionSide, mesmo quando a margem de diferença é de 0.01. Deveria só bloquear quando o lado oposto é fortemente dominante (margem ≥ candleDirectionRejectMargin, padrão 0.15)
+CANDLE_CHOP_REJECT — bloqueia quando separation < 0.08 independente do score absoluto. Se sideScore ≥ candleMinScore, o sinal é válido mesmo com separação pequena
+RECENT_EDGE_REJECT — usa pool global de outcomes. Uma sequência ruim num símbolo bloqueia todos os outros. Deve avaliar por símbolo primeiro, cair no global só se não há dados suficientes (com threshold dobrado)
+Implementando todos em paralelo:
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

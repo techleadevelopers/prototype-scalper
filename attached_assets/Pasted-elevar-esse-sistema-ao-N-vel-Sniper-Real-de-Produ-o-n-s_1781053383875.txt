@@ -1,0 +1,198 @@
+elevar esse sistema ao Nível Sniper Real de Produção, nós precisamos arrancar o lixo de dados do caminho, blindar o ciclo de re-treinamento e garantir que o supervisor de tarefas (job_supervisor) tenha telemetria total.
+
+Se o seu sistema hoje salva registros misturados de LONG+SHORT sem critério, o modelo offline vai aprender com ruído e gerar gatilhos viciados. O cérebro precisa de dados puros.
+
+Aqui está o plano de engenharia e o código pronto para essas 3 Elevações Críticas, mantendo o sistema 100% estável e contínuo na nuvem:
+
+🛠️ 1. Filtro de Qualidade Sniper (Expulsando o Lixo de Dados)
+O sistema não pode salvar todas as análises feitas no /edge/evaluate. Ele só deve registrar no histórico (trigger_outcomes.jsonl) as oportunidades que realmente passaram por todos os filtros (Spread, ATR Shadow, Funding Window) e se tornaram ordens limites reais na pedra.
+
+Modifique a função que escreve o histórico para aplicar o Filtro de Pureza:
+
+Python
+# quant-brain/core/history_logger.py
+import json
+import os
+
+def log_sniper_opportunity(signal_data, execution_outcome=None):
+    """
+    Filtro de Qualidade: Garante que apenas gatilhos estruturados válidos 
+    sejam armazenados para o re-treinamento de 24h.
+    """
+    # ❌ BLOQUEIO DE LIXO: Se a IA deu "WAIT" ou se foi rejeitada por filtros de risco, DESCARTA do treino
+    if signal_data.get("decision") != "ARM_TRIGGER":
+        return 
+
+    # Validação de integridade dos dados geométricos
+    geometry = signal_data.get("geometry", {})
+    if not all(k in geometry for k in ["triggerPrice", "targetPrice", "stopPrice"]):
+        return
+
+    log_entry = {
+        "signalId": signal_data["metadata"]["signalId"],
+        "symbol": signal_data["metadata"]["symbol"],
+        "timestamp": signal_data["metadata"]["timestamp"],
+        "sectorCluster": signal_data["metadata"]["sectorCluster"],
+        "features": signal_data["features"],  # Snapshot das features multiframe (1m, 5m, 15m)
+        "geometry": geometry,
+        "executionMetrics": signal_data.get("executionMetrics", {}),
+        "outcome": execution_outcome or "PENDING"  # Atualizado pelo Node.js depois
+    }
+
+    # Escrita atômica em modo append seguro para evitar corrupção de arquivo na Cloud
+    with open("artifacts/trigger_outcomes.jsonl", "a") as f:
+        f.write(json.dumps(log_entry) + "\n")
+🧠 2. offline_learner.py — O Loop de Re-Treinamento Autônomo 24h
+Este worker vai rodar de forma isolada em background. Ele vai ler o arquivo .jsonl purificado, extrair as features matemáticas e ajustar o peso do modelo para maximizar a eficiência geométrica dos gatilhos.
+
+Python
+# quant-brain/core/offline_learner.py
+import json
+import os
+import joblib
+from datetime import datetime
+from sklearn.ensemble import RandomForestClassifier
+
+class SniperOfflineLearner:
+    def __init__(self, file_path="artifacts/trigger_outcomes.jsonl", model_path="artifacts/shadow_model.pkl"):
+        self.file_path = file_path
+        self.model_path = model_path
+
+    def run_24h_recalibration(self):
+        print(f"[🧠 LEARNER] Iniciando ciclo de recalibração offline: {datetime.now()}")
+        
+        if not os.path.exists(self.file_path):
+            print("[⚠️ LEARNER] Arquivo trigger_outcomes.jsonl não encontrado. Abortando.")
+            return False
+
+        X, y = [], []
+        
+        # 1. Parsing do dataset purificado
+        with open(self.file_path, "r") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                record = json.loads(line)
+                
+                # Só treina com dados que foram de fato resolvidos pela corretora
+                if record["outcome"] in ["FILLED_AND_WON", "FILLED_AND_STOPPED", "PARTIAL_FILL_CANCELED"]:
+                    X.append(record["features"])
+                    # Classe 1: Sucesso total (bateu alvo) | Classe 0: Tomou Stop ou falhou na execução
+                    y.append(1 if record["outcome"] == "FILLED_AND_WON" else 0)
+
+        if len(X) < 50:  # Guardrail de amostragem mínima
+            print(f"[⚠️ LEARNER] Dados insuficientes para re-treino seguro ({len(X)} amostras).")
+            return False
+
+        # 2. Treinamento focado em otimizar a probabilidade de acerto do gatilho
+        print(f"[🔬 LEARNER] Processando {len(X)} amostras históricas...")
+        model = RandomForestClassifier(n_estimators=100, max_depth=6, random_state=42)
+        model.fit(X, y)
+
+        # 3. Guardrail de Segurança Técnica antes de substituir o arquivo de produção
+        # O modelo novo precisa comprovar vantagem estatística real
+        score = model.score(X, y)
+        if score > 0.58:  # Mínimo de 58% de acurácia matemática esperada pós-taxas
+            joblib.dump(model, self.model_path)
+            print(f"[✅ LEARNER] Recalibrado com sucesso. Acurácia de Treino: {score:.2%}")
+            return True
+        else:
+            print(f"[🚫 LEARNER] Novo modelo rejeitado por baixa eficiência estatística ({score:.2%}).")
+            return False
+
+if __name__ == "__main__":
+    learner = SniperOfflineLearner()
+    learner.run_24h_recalibration()
+📊 3. Registro no job_supervisor + API Telemetry (Node.js)
+Para garantir estabilidade contínua na Cloud sem surpresas ou travamentos silenciosos, o backend Node.js gerencia e expõe a saúde do ciclo do Edge e do re-treinamento através de estados controlados em memória.
+
+TypeScript
+// backend/src/lib/jobSupervisor.ts
+import { exec } from "child_process";
+import { promisify } from "util";
+
+const execAsync = promisify(exec);
+
+interface JobState {
+  jobName: string;
+  lastRun: Date | null;
+  status: "IDLE" | "RUNNING" | "SUCCESS" | "FAILED";
+  errorLog: string | null;
+}
+
+class JobSupervisor {
+  private jobs: Map<string, JobState> = new Map();
+
+  constructor() {
+    // Inicializa o estado do monitor do re-treinamento
+    this.jobs.set("offline_recalibration", {
+      jobName: "Offline Learner 24h",
+      lastRun: null,
+      status: "IDLE",
+      errorLog: null
+    });
+  }
+
+  /**
+   * Orquestra o disparo seguro do script Python de re-treino via Cron / Intervalo
+   */
+  public async triggerOfflineRecalibration(): Promise<void> {
+    const state = this.jobs.get("offline_recalibration")!;
+    if (state.status === "RUNNING") return;
+
+    state.status = "RUNNING";
+    state.lastRun = new Date();
+
+    try {
+      console.log(`[⏰ SUPERVISOR] Disparando worker assíncrono de re-treinamento...`);
+      // Executa o script Python isolado em background
+      await execAsync("python3 quant-brain/core/offline_learner.py");
+      
+      state.status = "SUCCESS";
+      state.errorLog = null;
+      console.log(`[✅ SUPERVISOR] Ciclo do Learner executado com sucesso.`);
+    } catch (error: any) {
+      state.status = "FAILED";
+      state.errorLog = error.message;
+      console.error(`[❌ SUPERVISOR] Falha crítica no re-treino autônomo:`, error);
+    }
+  }
+
+  public getSupervisorStats(): JobState[] {
+    return Array.from(this.jobs.values());
+  }
+}
+
+export const jobSupervisor = new JobSupervisor();
+O Endpoint da API para o seu Dashboard:
+O seu painel frontal em Node.js passa a consumir essa rota para expor os indicadores exatos da engrenagem quantitativa, garantindo que você saiba exatamente a saúde do robô:
+
+TypeScript
+// backend/src/routes/telemetry.ts
+import { Router, Request, Response } from "express";
+import { jobSupervisor } from "../lib/jobSupervisor";
+import fs from "fs";
+
+const router = Router();
+
+router.get("/stats", async (req: Request, res: Response) => {
+  let logCount = 0;
+  
+  // Conta quantas amostras de gatilhos sniper purificados já existem guardadas
+  if (fs.existsSync("artifacts/trigger_outcomes.jsonl")) {
+    const fileContent = fs.readFileSync("artifacts/trigger_outcomes.jsonl", "utf-8");
+    logCount = fileContent.split("\n").filter(Boolean).length;
+  }
+
+  res.json({
+    engineStatus: "ONLINE",
+    supervisorJobs: jobSupervisor.getSupervisorStats(),
+    telemetry: {
+      purifiedSamplesCount: logCount,
+      databasePath: "artifacts/trigger_outcomes.jsonl",
+      activeModel: "artifacts/shadow_model.pkl"
+    }
+  });
+});
+
+export default router;
