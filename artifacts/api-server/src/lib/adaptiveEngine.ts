@@ -1084,8 +1084,16 @@ export class AdaptiveEngine extends EventEmitter {
     this.globalEwmaEv = 0;
     this.globalEwmaFee = 0;
     this.totalTrades = 0;
+    let skipped = 0;
     for (const outcome of outcomes) {
-      this.recordOutcome(outcome);
+      try {
+        this.recordOutcome(outcome);
+      } catch {
+        skipped++;
+      }
+    }
+    if (skipped > 0) {
+      console.warn(`[AdaptiveEngine] rebuildFromOutcomes: skipped ${skipped} invalid legacy outcome(s)`);
     }
   }
 }

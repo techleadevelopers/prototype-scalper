@@ -932,12 +932,15 @@ async def get_macro_candle_regime():
 async def get_btc_commander(window_seconds: int = Query(int(os.environ.get("SNIPER_WINDOW_SECONDS", "300")), ge=60, le=900)):
     """BTC real-time commander for sniper scalp gating."""
     history = get_snapshot_history("BTC-USDT", window_seconds)
-    features = await run_blocking(
-        build_movement_features,
-        "BTC-USDT",
-        history,
-        window_seconds,
-    )
+    if history:
+        features = await run_blocking(
+            build_movement_features,
+            "BTC-USDT",
+            history,
+            window_seconds,
+        )
+    else:
+        features = build_movement_features("BTC-USDT", [], window_seconds)
     cmd = classify_btc_commander(features)
     # Add aliases so the dashboard can read both field names
     cmd["classification"] = cmd.get("state", "—")
@@ -963,11 +966,19 @@ async def evaluate_sniper_symbol(symbol: str, window_seconds: int = Query(int(os
         sym = f"{sym}-USDT"
     alt_history = get_snapshot_history(sym, window_seconds)
     btc_history = get_snapshot_history("BTC-USDT", window_seconds)
+    if alt_history or btc_history:
+        return await run_blocking(
+            evaluate_sniper_window,
+            sym,
+            alt_history,
+            btc_history,
+            window_seconds=window_seconds,
+        )
     return await run_blocking(
         evaluate_sniper_window,
         sym,
-        alt_history,
-        btc_history,
+        [],
+        [],
         window_seconds=window_seconds,
     )
 
@@ -1320,7 +1331,8 @@ async def evaluate_edge_endpoint(body: dict):
     if "symbol" not in body:
         raise HTTPException(400, "Required field: symbol")
     try:
-        return await asyncio.wait_for(evaluate_edge_gate(body), timeout=_EDGE_EVALUATE_TIMEOUT_SECONDS)
+        result = await asyncio.wait_for(evaluate_edge_gate(body), timeout=_EDGE_EVALUATE_TIMEOUT_SECONDS)
+        return _sanitize_floats(result)
     except asyncio.TimeoutError:
         log.exception("edge evaluate timeout")
         return _quant_fail_closed(
@@ -1449,14 +1461,14 @@ async def rank_cycle_candidates(body: dict):
         reverse=True,
     )
 
-    return {
+    return _sanitize_floats({
         "ranked": ranked,
         "blocked": blocked_results,
         "totalCandidates": len(results),
         "allowed": len(allowed_results),
         "blockedCount": len(blocked_results),
         "mode": "judge-coach-dual-layer-v1",
-    }
+    })
 
 
 @app.get("/regime-playbook/status")

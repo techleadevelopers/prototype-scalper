@@ -649,7 +649,8 @@ async def train_shadow_model(min_samples: int = MIN_TRAINING_SAMPLES) -> dict[st
         "dataQuality": data_quality,
     }
 
-    save_model = improves_baseline or profitability["profitabilityVerified"]
+    no_previous_model = not METADATA_PATH.exists()
+    save_model = no_previous_model or improves_baseline or profitability["profitabilityVerified"]
     if save_model:
         # Ensemble final (média dos dois modelos)
         final_model = {

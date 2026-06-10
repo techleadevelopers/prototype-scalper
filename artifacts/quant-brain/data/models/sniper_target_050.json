@@ -1,83 +1,88 @@
 {
-  "trainedAt": 1781043261.1339285,
-  "samples": 1051,
-  "trainSamples": 840,
-  "testSamples": 211,
-  "modelBrier": 0.041099,
-  "baselineBrier": 0.055432,
-  "modelLogLoss": 0.151701,
-  "rocAuc": 0.899502,
+  "trainedAt": 1781111420.5676088,
+  "samples": 372,
+  "totalSamplesBeforeFilter": 372,
+  "trainSamples": 297,
+  "testSamples": 75,
+  "sniperGridSampleCount": 0,
+  "sniperGridSamplePct": 0.0,
+  "sniperWeightMultiplier": 3.0,
+  "sniperOnlyMode": false,
+  "modelBrier": 0.207047,
+  "baselineBrier": 0.207289,
+  "modelLogLoss": 0.604536,
+  "rocAuc": 0.54717,
   "improvesBaseline": true,
   "authority": "shadow_ensemble",
   "target": "0.5",
   "cvResults": {
     "success": true,
     "n_folds": 4,
-    "avg_brier": 0.088306,
-    "avg_auc": 0.747097,
+    "avg_brier": 0.287844,
+    "avg_auc": 0.507314,
     "results": [
       {
         "fold": 0,
-        "train_samples": 210,
-        "test_samples": 210,
-        "brier": 0.143734,
-        "auc": 0.755809
+        "train_samples": 74,
+        "test_samples": 74,
+        "brier": 0.231553,
+        "auc": 0.628032
       },
       {
         "fold": 1,
-        "train_samples": 420,
-        "test_samples": 210,
-        "brier": 0.10847,
-        "auc": 0.642408
+        "train_samples": 148,
+        "test_samples": 74,
+        "brier": 0.437708,
+        "auc": 0.170455
       },
       {
         "fold": 2,
-        "train_samples": 630,
-        "test_samples": 210,
-        "brier": 0.060934,
-        "auc": 0.662172
+        "train_samples": 222,
+        "test_samples": 74,
+        "brier": 0.296595,
+        "auc": 0.432692
       },
       {
         "fold": 3,
-        "train_samples": 840,
-        "test_samples": 210,
-        "brier": 0.040088,
-        "auc": 0.928
+        "train_samples": 296,
+        "test_samples": 74,
+        "brier": 0.185519,
+        "auc": 0.798077
       }
     ]
   },
   "topFeatures": [
+    "btc_funding_rate",
     "alt_atr_pct",
     "side=LONG",
-    "btc_atr_pct",
-    "alt_price_acceleration",
-    "alt_btc_momentum_ratio",
     "side=SHORT",
+    "btc_atr_pct",
     "alt_funding_rate",
-    "alt_15m_rangePct",
-    "alt_1m_rangePct",
-    "alt_5m_rangePct"
+    "alt_1m_volumeRatioAvg",
+    "alt_price_acceleration",
+    "btc_price_acceleration",
+    "btc_price_change_pct"
   ],
   "optimalThreshold": 0.6,
   "expectedValuePct": -Infinity,
   "profitabilityVerified": false,
   "simulatedWinRate": 0,
-  "baselineEvPct": -0.652085,
+  "baselineEvPct": -0.428133,
   "breakevenWinRate": 0,
   "optimalEdgeVsBreakeven": 0,
   "kellyFraction": 0.0,
   "optimalCoverage": 0,
   "profitabilityThresholdScan": [],
   "dataQuality": {
-    "score": 75,
-    "n": 1051,
-    "winRate": 0.1284,
-    "contextDiversity": 144,
-    "symbols": 9,
-    "spanHours": 66.92,
-    "regimeCompleteness": 0.0,
+    "score": 85,
+    "n": 372,
+    "winRate": 0.293,
+    "contextDiversity": 118,
+    "symbols": 7,
+    "spanHours": 0.6,
+    "regimeCompleteness": 84.7,
     "notes": [
-      "class_imbalance"
+      "insufficient_time_coverage"
     ]
   }
 }
