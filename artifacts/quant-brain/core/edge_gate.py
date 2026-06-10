@@ -9,6 +9,14 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
+# ── Evaluation caches ─────────────────────────────────────────────────────────
+# evaluate_sniper_window e predict_shadow são CPU-intensivos.
+# Cache por (symbol) / (symbol, side) com TTL curto elimina recálculos quando
+# múltiplas chamadas chegam dentro da mesma janela de coleta (~5s).
+_SNIPER_CACHE_TTL_S: float = float(os.environ.get("QB_SNIPER_CACHE_TTL_S", "5"))
+_sniper_eval_cache: dict[str, tuple[float, dict]] = {}   # symbol → (ts, result)
+_shadow_ml_cache: dict[str, tuple[float, dict]] = {}     # "symbol|side" → (ts, result)
+
 from core.history_logger import log_arm_trigger_snapshot
 from core.movement_sniper import MovementFeatures, evaluate_sniper_window
 
@@ -809,10 +817,15 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
     alt_history = get_snapshot_history(symbol, 900)
     btc_history = get_snapshot_history("BTC-USDT", 900)
     target_moves_pct = _target_moves(config)
-    sniper = await run_edge_blocking(
-        evaluate_sniper_window,
-        symbol, alt_history, btc_history, target_moves_pct=target_moves_pct
-    )
+    _cached_sniper = _sniper_eval_cache.get(symbol)
+    if _cached_sniper and (time.time() - _cached_sniper[0]) < _SNIPER_CACHE_TTL_S:
+        sniper = _cached_sniper[1]
+    else:
+        sniper = await run_edge_blocking(
+            evaluate_sniper_window,
+            symbol, alt_history, btc_history, target_moves_pct=target_moves_pct
+        )
+        _sniper_eval_cache[symbol] = (time.time(), sniper)
     signal_metadata = {
         "signalId": signal_id,
         "predictionId": str(payload.get("predictionId") or uuid.uuid4()),
@@ -898,7 +911,13 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
             "candle_regime": sniper.get("candleRegime", {}),
         },
     }
-    shadow_ml = await run_edge_blocking(predict_shadow, shadow_row)
+    _shadow_key = f"{symbol}|{position_side}"
+    _cached_shadow = _shadow_ml_cache.get(_shadow_key)
+    if _cached_shadow and (time.time() - _cached_shadow[0]) < _SNIPER_CACHE_TTL_S:
+        shadow_ml = _cached_shadow[1]
+    else:
+        shadow_ml = await run_edge_blocking(predict_shadow, shadow_row)
+        _shadow_ml_cache[_shadow_key] = (time.time(), shadow_ml)
     if not intelligence_only:
         try:
             await record_serving_vector(
