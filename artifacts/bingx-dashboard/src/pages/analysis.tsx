@@ -361,19 +361,19 @@ export default function AnalysisPage() {
     };
   }, [recentOutcomes, window]);
 
-  const edgeLabel = !stats ? "NO DATA"
-    : stats.winRate >= 55 && stats.profitFactor >= 1.5 && stats.ev > 0 ? "STRONG EDGE"
-    : stats.winRate >= 50 && stats.profitFactor >= 1.0 && stats.ev > 0 ? "MARGINAL EDGE"
-    : "NEGATIVE EDGE / RECALIBRATE";
+  const edgeLabel = !stats ? "SEM DADOS"
+    : stats.winRate >= 55 && stats.profitFactor >= 1.5 && stats.ev > 0 ? "VANTAGEM FORTE"
+    : stats.winRate >= 50 && stats.profitFactor >= 1.0 && stats.ev > 0 ? "VANTAGEM MARGINAL"
+    : "SEM VANTAGEM — RECALIBRAR";
 
   const edgeColor = !stats ? "text-muted-foreground"
-    : edgeLabel === "STRONG EDGE" ? "text-green-400"
-    : edgeLabel === "MARGINAL EDGE" ? "text-primary"
+    : edgeLabel === "VANTAGEM FORTE" ? "text-green-400"
+    : edgeLabel === "VANTAGEM MARGINAL" ? "text-primary"
     : "text-red-400";
 
   const edgeBorder = !stats ? "border-border/30"
-    : edgeLabel === "STRONG EDGE" ? "border-green-500/40 bg-green-500/5"
-    : edgeLabel === "MARGINAL EDGE" ? "border-primary/40 bg-primary/5"
+    : edgeLabel === "VANTAGEM FORTE" ? "border-green-500/40 bg-green-500/5"
+    : edgeLabel === "VANTAGEM MARGINAL" ? "border-primary/40 bg-primary/5"
     : "border-red-500/40 bg-red-500/5";
 
   return (
@@ -382,9 +382,9 @@ export default function AnalysisPage() {
         {/* Header */}
         <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
           <div>
-            <h1 className="text-lg font-bold tracking-tight">Analysis — War Room</h1>
+            <h1 className="text-lg font-bold tracking-tight">Análise de Desempenho</h1>
             <p className="text-xs text-muted-foreground mt-0.5">
-              Telemetry-driven edge calibration · pipeline: signal → EV gate → execution → realized PnL
+              Resultados reais de trades · acerto, lucro e calibração automática da estratégia
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
@@ -426,7 +426,7 @@ export default function AnalysisPage() {
               <p className="mt-1 font-mono text-sm font-bold text-blue-400">ATIVA</p>
             </div>
             <div>
-              <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">PnL aberto</p>
+              <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Lucro aberto</p>
               <p className={`mt-1 font-mono text-sm font-bold ${openDemoPnl >= 0 ? "text-green-400" : "text-red-400"}`}>
                 {openDemoPnl >= 0 ? "+" : ""}{openDemoPnl.toFixed(4)} VST
               </p>
@@ -443,19 +443,20 @@ export default function AnalysisPage() {
             <div className="flex flex-wrap items-center justify-between gap-2">
               <CardTitle className="flex items-center gap-2 text-sm font-semibold">
                 <Shield className="h-4 w-4 text-primary" />
-                Controle permanente de PnL realizado
+                Histórico Permanente de Lucro/Perda
+                <span className="text-[10px] text-muted-foreground font-normal ml-1">💾 salvo em disco</span>
               </CardTitle>
               <Badge variant="outline" className="font-mono">{analysisSource}</Badge>
             </div>
           </CardHeader>
           <CardContent className="grid grid-cols-2 gap-4 p-5 md:grid-cols-4">
             <div>
-              <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">PnL positivo</p>
+              <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Lucro total</p>
               <p className="mt-1 font-mono text-2xl font-bold text-green-400">+{realizedLedger.positive.toFixed(4)}</p>
               <p className="mt-1 text-[10px] text-muted-foreground">{realizedLedger.wins} fechamentos positivos</p>
             </div>
             <div>
-              <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">PnL negativo</p>
+              <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Perda total</p>
               <p className="mt-1 font-mono text-2xl font-bold text-red-400">{realizedLedger.negative.toFixed(4)}</p>
               <p className="mt-1 text-[10px] text-muted-foreground">{realizedLedger.losses} fechamentos negativos</p>
             </div>

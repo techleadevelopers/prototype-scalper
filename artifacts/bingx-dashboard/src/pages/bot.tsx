@@ -277,51 +277,51 @@ export default function BotPage() {
   const pipelineSteps = config
     ? [
         {
-          label: "BTC Regime Gate",
+          label: "Filtro BTC",
           desc: config.btcRegimeRequired
-            ? `Requires ±${config.btcRegimeThresholdPct}% BTC move — current: ${btcChange >= 0 ? "+" : ""}${btcChange.toFixed(2)}% (${btcRegime})`
-            : "Disabled — entries allowed regardless of BTC direction",
+            ? `Exige variação ±${config.btcRegimeThresholdPct}% no BTC — agora: ${btcChange >= 0 ? "+" : ""}${btcChange.toFixed(2)}% (${btcRegime === "BULL" ? "ALTA" : btcRegime === "BEAR" ? "BAIXA" : "NEUTRO"})`
+            : "Desativado — entradas permitidas em qualquer direção do BTC",
           blocked: config.btcRegimeRequired && btcRegime === "NEUTRAL",
         },
         {
-          label: "EV Gate",
+          label: "Filtro de Valor Esperado",
           desc: config.evMinThreshold > 0
-            ? `Requires EV ≥ ${config.evMinThreshold.toFixed(4)} per trade (calibrate from Analysis)`
-            : "Disabled — no minimum EV required",
+            ? `Exige lucro esperado ≥ ${config.evMinThreshold.toFixed(4)} por trade (calibre pela Análise)`
+            : "Desativado — sem lucro esperado mínimo",
         },
         {
-          label: "Win Rate Gate",
+          label: "Filtro de Acerto",
           desc: config.winRateMin > 0
-            ? `Requires WR ≥ ${(config.winRateMin * 100).toFixed(1)}% from rolling telemetry`
-            : "Disabled",
+            ? `Exige taxa de acerto ≥ ${(config.winRateMin * 100).toFixed(1)}% da telemetria recente`
+            : "Desativado",
         },
         {
-          label: "Profit Factor Gate",
+          label: "Filtro de Fator de Lucro",
           desc: config.profitFactorMin > 0
-            ? `Requires PF ≥ ${config.profitFactorMin.toFixed(2)}x`
-            : "Disabled",
+            ? `Exige fator de lucro ≥ ${config.profitFactorMin.toFixed(2)}x`
+            : "Desativado",
         },
         {
-          label: "Symbol Gate",
+          label: "Filtro de Moedas",
           desc: config.allowedSymbols.length > 0
-            ? `Allowlist: ${config.allowedSymbols.join(", ")}`
-            : "Disabled — all symbols allowed",
+            ? `Permitidas: ${config.allowedSymbols.join(", ")}`
+            : "Desativado — todas as moedas permitidas",
         },
         {
-          label: "Hour Blacklist Gate",
+          label: "Filtro de Horário",
           desc: config.hourBlacklist.length > 0
-            ? `Blocked UTC hours: ${config.hourBlacklist.join(", ")}`
-            : "Disabled — all hours allowed",
+            ? `Horários bloqueados (UTC): ${config.hourBlacklist.join(", ")}h`
+            : "Desativado — todos os horários permitidos",
         },
         {
-          label: "Capital Gate",
-          desc: `Max ${config.maxConcurrentPositions} positions · max ${(config.maxMarginUtilization * 100).toFixed(0)}% margin utilization`,
+          label: "Filtro de Capital",
+          desc: `Máx. ${config.maxConcurrentPositions} posições · máx. ${(config.maxMarginUtilization * 100).toFixed(0)}% da conta`,
         },
         {
-          label: config.allowExecution ? "✓ EXECUTE ORDER" : "BLOCKED — Observation Mode",
+          label: config.allowExecution ? "✓ ENVIAR ORDEM" : "BLOQUEADO — Modo Observação",
           desc: config.allowExecution
-            ? `SCALP_ALLOW_EXECUTION=true → orders sent to BingX`
-            : "SCALP_ALLOW_EXECUTION=false → gates evaluated, nothing sent",
+            ? `Operações reais ativas — ordens enviadas à BingX`
+            : "Nenhuma ordem enviada — apenas análise e observação",
           blocked: !config.allowExecution,
         },
       ]
@@ -333,9 +333,9 @@ export default function BotPage() {
         {/* Header */}
         <div className="flex items-center justify-between flex-wrap gap-3">
           <div>
-            <h1 className="text-lg font-bold tracking-tight">Bot — Execution Engine</h1>
+            <h1 className="text-lg font-bold tracking-tight">Bot — Motor de Operações</h1>
             <p className="text-xs text-muted-foreground mt-0.5">
-              ENV = base · overrides em runtime via painel abaixo · reset zera tudo
+              Configure alavancagem, banca e filtros · ajustes manuais valem até reiniciar
             </p>
           </div>
           <div className="flex items-center gap-3">
@@ -362,7 +362,7 @@ export default function BotPage() {
                   ? <ShieldCheck className="w-5 h-5 text-green-400" />
                   : <ShieldOff className="w-5 h-5 text-muted-foreground" />}
                 <span className={`text-sm font-black tracking-tight font-mono ${config.allowExecution ? "text-green-400" : "text-muted-foreground"}`}>
-                  {config.allowExecution ? "LIVE EXECUTION" : "OBSERVATION MODE"}
+                  {config.allowExecution ? "EXECUÇÃO ATIVA" : "MODO OBSERVAÇÃO"}
                 </span>
               </div>
             ) : null}
@@ -385,11 +385,11 @@ export default function BotPage() {
               <div className="flex items-start gap-4 px-5 py-4 rounded-lg border border-orange-500/30 bg-orange-500/5">
                 <AlertTriangle className="w-5 h-5 text-orange-400 shrink-0 mt-0.5" />
                 <div>
-                  <p className="text-sm font-semibold text-orange-300">Observation Mode Active</p>
+                  <p className="text-sm font-semibold text-orange-300">Modo Observação Ativo</p>
                   <p className="text-xs text-muted-foreground mt-1">
-                    All gate logic runs and is evaluated, but no orders are sent to BingX.
-                    Set <code className="font-mono bg-muted px-1 rounded text-orange-300">SCALP_ALLOW_EXECUTION=true</code> in your environment to enable live execution.
-                    Only activate after the Analysis page shows positive EV and PF ≥ 1.5.
+                    Todos os filtros e análises rodam normalmente, mas nenhuma ordem é enviada à BingX.
+                    Para ativar as operações reais, configure <code className="font-mono bg-muted px-1 rounded text-orange-300">SCALP_ALLOW_EXECUTION=true</code> no servidor.
+                    Ative apenas após a página de Análise mostrar lucro positivo e Fator de Lucro ≥ 1.5.
                   </p>
                 </div>
               </div>
@@ -627,7 +627,7 @@ export default function BotPage() {
                     </Button>
                     <p className="text-[10px] text-muted-foreground">
                       <Info className="w-3 h-3 inline mr-1 opacity-50" />
-                      Persiste em memória até reiniciar o servidor. Para fixar permanentemente, atualize o .env.
+                      ⚡ Ajuste manual — vale até reiniciar o servidor. Para salvar permanentemente, copie os valores para o .env.
                     </p>
                   </div>
                 </CardContent>
@@ -639,19 +639,19 @@ export default function BotPage() {
               <Card className="bg-card/50 border-border/50">
                 <CardHeader className="px-4 pt-4 pb-3">
                   <CardTitle className="text-sm font-semibold flex items-center gap-2">
-                    <DollarSign className="w-4 h-4 text-primary" /> Execution Parameters
+                    <DollarSign className="w-4 h-4 text-primary" /> Parâmetros de Execução
                   </CardTitle>
                 </CardHeader>
                 <CardContent className="px-4 pb-4">
-                  <Row label="Leverage" value={`${config.leverage}×`} mono highlight="orange" overridden={ov.has("leverage")} />
-                  <Row label="Margin / trade" value={`${config.marginPerTrade} USDT`} mono overridden={ov.has("marginPerTrade")} />
-                  <Row label="Notional / trade" value={`${(config.marginPerTrade * config.leverage).toFixed(0)} USDT`} mono highlight="orange" />
-                  <Row label="Take profit" value={`${config.takeProfitPct}%`} mono highlight="green" overridden={ov.has("takeProfitPct")} />
-                  <Row label="Stop loss" value={`${config.stopLossPct}%`} mono highlight="red" overridden={ov.has("stopLossPct")} />
-                  <Row label="TP on margin" value={`${(config.takeProfitPct * config.leverage).toFixed(2)}%`} mono highlight="green" />
-                  <Row label="SL on margin" value={`-${(config.stopLossPct * config.leverage).toFixed(2)}%`} mono highlight="red" />
-                  <Row label="Order type" value={config.orderType} mono />
-                  <Row label="Margin type" value={config.marginType} mono />
+                  <Row label="Alavancagem" value={`${config.leverage}×`} mono highlight="orange" overridden={ov.has("leverage")} />
+                  <Row label="Banca / trade" value={`${config.marginPerTrade} USDT`} mono overridden={ov.has("marginPerTrade")} />
+                  <Row label="Total exposto" value={`${(config.marginPerTrade * config.leverage).toFixed(0)} USDT`} mono highlight="orange" />
+                  <Row label="Alvo de Lucro (TP)" value={`${config.takeProfitPct}%`} mono highlight="green" overridden={ov.has("takeProfitPct")} />
+                  <Row label="Stop de Perda (SL)" value={`${config.stopLossPct}%`} mono highlight="red" overridden={ov.has("stopLossPct")} />
+                  <Row label="Ganho % na margem" value={`${(config.takeProfitPct * config.leverage).toFixed(2)}%`} mono highlight="green" />
+                  <Row label="Perda % na margem" value={`-${(config.stopLossPct * config.leverage).toFixed(2)}%`} mono highlight="red" />
+                  <Row label="Tipo de Ordem" value={config.orderType} mono />
+                  <Row label="Tipo de Margem" value={config.marginType} mono />
                 </CardContent>
               </Card>
 
@@ -659,22 +659,13 @@ export default function BotPage() {
               <Card className="bg-card/50 border-border/50">
                 <CardHeader className="px-4 pt-4 pb-3">
                   <CardTitle className="text-sm font-semibold flex items-center gap-2">
-                    <Target className="w-4 h-4 text-primary" /> Capital Controls
+                    <Target className="w-4 h-4 text-primary" /> Controle de Risco
                   </CardTitle>
                 </CardHeader>
                 <CardContent className="px-4 pb-4">
-                  <Row label="Max concurrent positions" value={config.maxConcurrentPositions} mono overridden={ov.has("maxConcurrentPositions")} />
-                  <Row label="Max margin utilization" value={`${(config.maxMarginUtilization * 100).toFixed(0)}%`} mono highlight="orange" overridden={ov.has("maxMarginUtilization")} />
-                  <Row label="Max session loss" value={`${config.maxSessionLoss} USDT`} mono highlight="red" overridden={ov.has("maxSessionLoss")} />
-                  <div className="mt-4 pt-3 border-t border-border/20 space-y-2">
-                    <p className="text-[10px] text-muted-foreground font-semibold uppercase tracking-wider">Throughput ceiling</p>
-                    <p className="text-xs text-muted-foreground">
-                      BingX rate limit: <span className="text-foreground font-mono">100 orders / 10s</span>
-                    </p>
-                    <p className="text-xs text-muted-foreground">
-                      Max theoretical: <span className="text-primary font-mono">10 orders/s</span>
-                    </p>
-                  </div>
+                  <Row label="Máx. posições ao mesmo tempo" value={config.maxConcurrentPositions} mono overridden={ov.has("maxConcurrentPositions")} />
+                  <Row label="Máx. uso da conta" value={`${(config.maxMarginUtilization * 100).toFixed(0)}%`} mono highlight="orange" overridden={ov.has("maxMarginUtilization")} />
+                  <Row label="Limite de perda por sessão" value={`${config.maxSessionLoss} USDT`} mono highlight="red" overridden={ov.has("maxSessionLoss")} />
                 </CardContent>
               </Card>
 
@@ -682,36 +673,36 @@ export default function BotPage() {
               <Card className="bg-card/50 border-border/50">
                 <CardHeader className="px-4 pt-4 pb-3">
                   <CardTitle className="text-sm font-semibold flex items-center gap-2">
-                    <Clock className="w-4 h-4 text-primary" /> Symbol & Time Gates
+                    <Clock className="w-4 h-4 text-primary" /> Moedas e Horários
                   </CardTitle>
                 </CardHeader>
                 <CardContent className="px-4 pb-4">
                   <Row
-                    label="Allowed symbols"
-                    value={config.allowedSymbols.length > 0 ? config.allowedSymbols.join(", ") : "all"}
+                    label="Moedas permitidas"
+                    value={config.allowedSymbols.length > 0 ? config.allowedSymbols.join(", ") : "todas"}
                     mono
                     highlight={config.allowedSymbols.length === 0 ? "dim" : undefined}
                   />
                   <Row
-                    label="Hour blacklist (UTC)"
-                    value={config.hourBlacklist.length > 0 ? config.hourBlacklist.join(", ") : "none"}
+                    label="Horários bloqueados (UTC)"
+                    value={config.hourBlacklist.length > 0 ? config.hourBlacklist.join(", ") + "h" : "nenhum"}
                     mono
                     highlight={config.hourBlacklist.length === 0 ? "dim" : "orange"}
                   />
                   <Row
-                    label="BTC regime required"
-                    value={config.btcRegimeRequired ? "yes" : "no"}
+                    label="Exige tendência BTC"
+                    value={config.btcRegimeRequired ? "sim" : "não"}
                     highlight={config.btcRegimeRequired ? undefined : "dim"}
                     mono
                   />
                   {config.btcRegimeRequired && (
-                    <Row label="BTC regime threshold" value={`±${config.btcRegimeThresholdPct}%`} mono />
+                    <Row label="Variação mínima BTC" value={`±${config.btcRegimeThresholdPct}%`} mono />
                   )}
                   <div className="mt-4 pt-3 border-t border-border/20">
                     <div className="flex items-center justify-between">
-                      <span className="text-xs text-muted-foreground">Current BTC regime</span>
+                      <span className="text-xs text-muted-foreground">Mercado BTC agora</span>
                       <Badge variant="outline" className={`text-[10px] font-mono ${btcRegime === "BULL" ? "border-green-500/40 text-green-400" : btcRegime === "BEAR" ? "border-red-500/40 text-red-400" : "border-border/50 text-muted-foreground"}`}>
-                        {btcRegime} ({btcChange >= 0 ? "+" : ""}{btcChange.toFixed(2)}%)
+                        {btcRegime === "BULL" ? "ALTA" : btcRegime === "BEAR" ? "BAIXA" : "NEUTRO"} ({btcChange >= 0 ? "+" : ""}{btcChange.toFixed(2)}%)
                       </Badge>
                     </div>
                   </div>
@@ -724,40 +715,40 @@ export default function BotPage() {
               <Card className="border-border/50 bg-card/30">
                 <CardHeader className="px-4 pt-4 pb-3">
                   <CardTitle className="text-sm font-semibold flex items-center gap-2">
-                    <Zap className="w-4 h-4 text-primary" /> Adaptive Gate Thresholds
+                    <Zap className="w-4 h-4 text-primary" /> Filtros de Qualidade
                   </CardTitle>
-                  <p className="text-[10px] text-muted-foreground">Calibrate these from the Analysis page after collecting trade data</p>
+                  <p className="text-[10px] text-muted-foreground">Calibre pela página de Análise após coletar dados de trades</p>
                 </CardHeader>
                 <CardContent className="px-4 pb-4 space-y-0">
                   <GateIndicator
                     pass={config.evMinThreshold > 0}
-                    label={`EV minimum: ${config.evMinThreshold > 0 ? `≥ ${config.evMinThreshold.toFixed(4)}` : "disabled"}`}
-                    detail="SCALP_EV_MIN_THRESHOLD — set once EV is consistently positive"
+                    label={`Valor esperado mínimo: ${config.evMinThreshold > 0 ? `≥ ${config.evMinThreshold.toFixed(4)}` : "desativado"}`}
+                    detail="Ative quando o lucro esperado por trade for positivo de forma consistente"
                   />
                   <GateIndicator
                     pass={config.winRateMin > 0}
-                    label={`Win rate minimum: ${config.winRateMin > 0 ? `≥ ${(config.winRateMin * 100).toFixed(1)}%` : "disabled"}`}
-                    detail="SCALP_WIN_RATE_MIN — enable once you have 50+ trades in telemetry"
+                    label={`Acerto mínimo: ${config.winRateMin > 0 ? `≥ ${(config.winRateMin * 100).toFixed(1)}%` : "desativado"}`}
+                    detail="Ative após acumular 50+ trades na telemetria"
                   />
                   <GateIndicator
                     pass={config.profitFactorMin > 0}
-                    label={`Profit factor minimum: ${config.profitFactorMin > 0 ? `≥ ${config.profitFactorMin.toFixed(2)}x` : "disabled"}`}
-                    detail="SCALP_PROFIT_FACTOR_MIN — 1.5x is the sniper threshold"
+                    label={`Fator de lucro mínimo: ${config.profitFactorMin > 0 ? `≥ ${config.profitFactorMin.toFixed(2)}x` : "desativado"}`}
+                    detail="1.5x é o limiar do Sniper — lucros cobrem perdas com folga"
                   />
                   <GateIndicator
                     pass={config.btcRegimeRequired}
-                    label={`BTC regime gate: ${config.btcRegimeRequired ? `±${config.btcRegimeThresholdPct}%` : "disabled"}`}
-                    detail="SCALP_BTC_REGIME_REQUIRED — filter entries to strong BTC direction only"
+                    label={`Filtro BTC: ${config.btcRegimeRequired ? `exige ±${config.btcRegimeThresholdPct}% de variação` : "desativado"}`}
+                    detail="Filtra entradas para momentos com direção clara do BTC"
                   />
                   <GateIndicator
                     pass={config.allowedSymbols.length > 0}
-                    label={`Symbol allowlist: ${config.allowedSymbols.length > 0 ? config.allowedSymbols.length + " symbols" : "disabled"}`}
-                    detail="SCALP_SYMBOLS — restrict to symbols with positive edge from telemetry"
+                    label={`Lista de moedas: ${config.allowedSymbols.length > 0 ? config.allowedSymbols.length + " moedas" : "desativado"}`}
+                    detail="Restrinja às moedas com histórico positivo na Análise"
                   />
                   <GateIndicator
                     pass={config.hourBlacklist.length > 0}
-                    label={`Hour blacklist: ${config.hourBlacklist.length > 0 ? config.hourBlacklist.length + " hours blocked" : "disabled"}`}
-                    detail="SCALP_HOUR_BLACKLIST — use Analysis hour toxicity heatmap to configure"
+                    label={`Bloqueio de horários: ${config.hourBlacklist.length > 0 ? config.hourBlacklist.length + " horários bloqueados" : "desativado"}`}
+                    detail="Use o mapa de horários da Análise para configurar"
                   />
                 </CardContent>
               </Card>
@@ -766,10 +757,10 @@ export default function BotPage() {
               <Card className="border-border/50 bg-card/30">
                 <CardHeader className="px-4 pt-4 pb-3">
                   <CardTitle className="text-sm font-semibold flex items-center gap-2">
-                    <ChevronRight className="w-4 h-4 text-primary" /> Entry Pipeline
+                    <ChevronRight className="w-4 h-4 text-primary" /> Fluxo de Aprovação
                   </CardTitle>
                   <p className="text-[10px] text-muted-foreground">
-                    signal → gate cascade → execute (or observe)
+                    sinal → filtros em cascata → executa (ou só observa)
                   </p>
                 </CardHeader>
                 <CardContent className="px-4 pb-4">
@@ -850,10 +841,10 @@ export default function BotPage() {
                     {/* Stats row */}
                     <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4">
                       {[
-                        { icon: <Timer className="w-3.5 h-3.5" />, label: "Uptime", value: fmtUptime(ap?.uptimeMs ?? null), color: isRunning ? "text-violet-300" : "text-muted-foreground" },
+                        { icon: <Timer className="w-3.5 h-3.5" />, label: "Tempo ativo", value: fmtUptime(ap?.uptimeMs ?? null), color: isRunning ? "text-violet-300" : "text-muted-foreground" },
                         { icon: <Activity className="w-3.5 h-3.5" />, label: "Ciclos", value: ap?.totalCycles ?? 0, color: "text-foreground" },
-                        { icon: <TrendingUp className="w-3.5 h-3.5" />, label: "Ordens colocadas", value: ap?.totalPlaced ?? 0, color: ap?.totalPlaced ? "text-green-400" : "text-muted-foreground" },
-                        { icon: <DollarSign className="w-3.5 h-3.5" />, label: "Loss sessão", value: ap ? `${ap.sessionLossUsd.toFixed(2)} USDT` : "—", color: (ap?.sessionLossUsd ?? 0) > 0 ? "text-red-400" : "text-muted-foreground" },
+                        { icon: <TrendingUp className="w-3.5 h-3.5" />, label: "Ordens enviadas", value: ap?.totalPlaced ?? 0, color: ap?.totalPlaced ? "text-green-400" : "text-muted-foreground" },
+                        { icon: <DollarSign className="w-3.5 h-3.5" />, label: "Prejuízo na sessão", value: ap ? `${ap.sessionLossUsd.toFixed(2)} USDT` : "—", color: (ap?.sessionLossUsd ?? 0) > 0 ? "text-red-400" : "text-muted-foreground" },
                       ].map((stat, i) => (
                         <div key={i} className="flex flex-col gap-1 px-3 py-2.5 rounded-lg bg-muted/15 border border-border/20">
                           <div className="flex items-center gap-1.5 text-muted-foreground">{stat.icon}<span className="text-[10px]">{stat.label}</span></div>
@@ -866,10 +857,10 @@ export default function BotPage() {
                     {ap && (
                       <div className="flex flex-wrap gap-2 mb-4">
                         {[
-                          `Intervalo: ${ap.config.intervalSec}s`,
-                          `Candidatos/ciclo: ${ap.config.maxCandidatesPerCycle}`,
-                          `Score mínimo: ${ap.config.minCombinedScore}`,
-                          `Stacking: ${ap.config.positionStackingEnabled ? `ON (max ${ap.config.maxPositionsPerSymbol}×)` : "OFF"}`,
+                          `A cada: ${ap.config.intervalSec}s`,
+                          `Ativos/ciclo: ${ap.config.maxCandidatesPerCycle}`,
+                          `Score mín.: ${ap.config.minCombinedScore}`,
+                          `Empilhamento: ${ap.config.positionStackingEnabled ? `ATIVO (máx. ${ap.config.maxPositionsPerSymbol}×)` : "DESATIVADO"}`,
                         ].map((tag, i) => (
                           <span key={i} className="text-[10px] font-mono px-2 py-1 rounded bg-muted/20 border border-border/20 text-muted-foreground">
                             {tag}
@@ -893,10 +884,10 @@ export default function BotPage() {
                         <div className="flex flex-wrap gap-3 text-[11px]">
                           <span className="text-muted-foreground">Início: <span className="font-mono text-foreground">{fmtTime(ap.lastCycle.startedAt)}</span></span>
                           <span className="text-muted-foreground">Duração: <span className="font-mono text-foreground">{ap.lastCycle.durationMs}ms</span></span>
-                          <span className="text-muted-foreground">Candidatos: <span className="font-mono text-foreground">{ap.lastCycle.candidates}</span></span>
-                          <span className="text-muted-foreground">Tentadas: <span className="font-mono text-foreground">{ap.lastCycle.attempted}</span></span>
-                          <span className="text-muted-foreground">Colocadas: <span className={`font-mono font-bold ${ap.lastCycle.placed > 0 ? "text-green-400" : "text-foreground"}`}>{ap.lastCycle.placed}</span></span>
-                          <span className="text-muted-foreground">Rejeitadas: <span className="font-mono text-foreground">{ap.lastCycle.rejected}</span></span>
+                          <span className="text-muted-foreground">Ativos: <span className="font-mono text-foreground">{ap.lastCycle.candidates}</span></span>
+                          <span className="text-muted-foreground">Tentativas: <span className="font-mono text-foreground">{ap.lastCycle.attempted}</span></span>
+                          <span className="text-muted-foreground">Enviadas: <span className={`font-mono font-bold ${ap.lastCycle.placed > 0 ? "text-green-400" : "text-foreground"}`}>{ap.lastCycle.placed}</span></span>
+                          <span className="text-muted-foreground">Recusadas: <span className="font-mono text-foreground">{ap.lastCycle.rejected}</span></span>
                           <span className="text-muted-foreground">BTC: <span className={`font-mono ${ap.lastCycle.btcChangePct >= 0 ? "text-green-400" : "text-red-400"}`}>{ap.lastCycle.btcChangePct >= 0 ? "+" : ""}{ap.lastCycle.btcChangePct.toFixed(2)}%</span></span>
                         </div>
                       </div>
@@ -905,7 +896,7 @@ export default function BotPage() {
                     {/* Recent history table */}
                     {ap && ap.recentHistory.length > 0 && (
                       <div>
-                        <p className="text-[10px] text-muted-foreground font-semibold uppercase tracking-wider mb-2">Histórico (últimos {ap.recentHistory.length} ciclos)</p>
+                        <p className="text-[10px] text-muted-foreground font-semibold uppercase tracking-wider mb-2">Histórico (últimos {ap.recentHistory.length} ciclos) · ⚡ reseta ao reiniciar o servidor</p>
                         <div className="overflow-x-auto">
                           <table className="w-full text-[10px]">
                             <thead>
@@ -945,11 +936,11 @@ export default function BotPage() {
               );
             })()}
 
-            {/* ENV reference */}
+            {/* Configuração atual para salvar */}
             <Card className="border-border/30 bg-card/20">
               <CardHeader className="px-4 pt-4 pb-3">
                 <CardTitle className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">
-                  ENV Reference — copy to your .env
+                  Configuração Atual — copie para o arquivo .env para salvar permanentemente
                 </CardTitle>
               </CardHeader>
               <CardContent className="px-4 pb-4">

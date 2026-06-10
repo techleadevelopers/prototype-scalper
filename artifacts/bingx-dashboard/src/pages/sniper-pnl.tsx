@@ -134,10 +134,10 @@ export default function SniperPnlPage() {
           <div>
             <h1 className="text-2xl font-bold text-slate-100 flex items-center gap-2">
               <DollarSign className="w-6 h-6 text-emerald-400" />
-              Sniper P&L Real
+              Lucro Real do Sistema
             </h1>
             <p className="text-sm text-slate-400 mt-1">
-              Lucratividade real do sistema ARM_TRIGGER — fill rate, Kelly efficiency e breakdown por ativo
+              Resultados reais do Gatilho Sniper — taxa de execução, lucro por ativo e histórico de operações
             </p>
           </div>
           <div className="flex items-center gap-3">
@@ -173,13 +173,13 @@ export default function SniperPnlPage() {
                 </div>
                 {pilot.running && pilot.uptimeSec > 0 && (
                   <span className="text-xs text-slate-400">
-                    Uptime: {Math.floor(pilot.uptimeSec / 60)}m {pilot.uptimeSec % 60}s
+                    Tempo: {Math.floor(pilot.uptimeSec / 60)}m {pilot.uptimeSec % 60}s
                   </span>
                 )}
                 <span className="text-xs text-slate-400">Ciclos: <b className="text-slate-200">{pilot.totalCycles}</b></span>
-                <span className="text-xs text-slate-400">Ordens: <b className="text-slate-200">{pilot.totalPlaced}</b></span>
+                <span className="text-xs text-slate-400">Ordens enviadas: <b className="text-slate-200">{pilot.totalPlaced}</b></span>
                 {pilot.sessionLossUsd > 0 && (
-                  <span className="text-xs text-red-400">Loss sessão: <b>-${fmt(pilot.sessionLossUsd)}</b></span>
+                  <span className="text-xs text-red-400">Prejuízo na sessão: <b>-${fmt(pilot.sessionLossUsd)}</b></span>
                 )}
                 {pilot.stopReason && (
                   <Badge variant="destructive" className="text-xs">{pilot.stopReason}</Badge>
@@ -192,7 +192,7 @@ export default function SniperPnlPage() {
         {/* Live P&L Metrics Grid */}
         <div>
           <h2 className="text-sm font-semibold text-slate-400 uppercase tracking-wider mb-3 flex items-center gap-2">
-            <Activity className="w-4 h-4" /> Live P&L
+            <Activity className="w-4 h-4" /> Resultado Live · 💾 dados permanentes
           </h2>
           {isLoading ? (
             <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
@@ -201,48 +201,48 @@ export default function SniperPnlPage() {
           ) : (
             <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
               <MetricCard
-                label="P&L Líquido"
+                label="Lucro Líquido"
                 value={`${(live?.netPnlUsdt ?? 0) >= 0 ? "+" : ""}$${fmt(live?.netPnlUsdt ?? 0)}`}
                 icon={DollarSign}
                 positive={(live?.netPnlUsdt ?? 0) > 0}
                 sub={`${live?.totalTrades ?? 0} trades live`}
               />
               <MetricCard
-                label="Win Rate"
+                label="Taxa de Acerto"
                 value={`${fmt(live?.winRate ?? 0)}%`}
                 icon={Percent}
                 positive={(live?.winRate ?? 0) > 50}
-                sub={`${live?.wins ?? 0}W / ${live?.losses ?? 0}L`}
+                sub={`${live?.wins ?? 0} ganhos / ${live?.losses ?? 0} perdas`}
               />
               <MetricCard
-                label="Profit Factor"
+                label="Fator de Lucro"
                 value={fmt(live?.profitFactor ?? 0)}
                 icon={BarChart2}
                 positive={(live?.profitFactor ?? 0) >= 1.5}
                 neutral={(live?.profitFactor ?? 0) === 0}
-                sub={(live?.profitFactor ?? 0) >= 1.5 ? "Saudável" : (live?.profitFactor ?? 0) >= 1 ? "Marginal" : "Abaixo do breakeven"}
+                sub={(live?.profitFactor ?? 0) >= 1.5 ? "Saudável" : (live?.profitFactor ?? 0) >= 1 ? "Marginal" : "Abaixo do ponto de equilíbrio"}
               />
               <MetricCard
-                label="Avg P&L / Trade"
+                label="Lucro Médio / Trade"
                 value={`${(live?.avgPnlUsdt ?? 0) >= 0 ? "+" : ""}$${fmt(live?.avgPnlUsdt ?? 0)}`}
                 icon={TrendingUp}
                 positive={(live?.avgPnlUsdt ?? 0) > 0}
-                sub={`Avg win $${fmt(live?.avgWinUsdt ?? 0)} / avg loss $${fmt(live?.avgLossUsdt ?? 0)}`}
+                sub={`Ganho médio $${fmt(live?.avgWinUsdt ?? 0)} / perda média $${fmt(live?.avgLossUsdt ?? 0)}`}
               />
               <MetricCard
-                label="Gross Win"
+                label="Total Ganhos"
                 value={`+$${fmt(live?.grossWinUsdt ?? 0)}`}
                 icon={TrendingUp}
                 positive
               />
               <MetricCard
-                label="Gross Loss"
+                label="Total Perdas"
                 value={`-$${fmt(live?.grossLossUsdt ?? 0)}`}
                 icon={TrendingDown}
                 positive={false}
               />
               <MetricCard
-                label="Demo P&L"
+                label="Lucro Demo (VST)"
                 value={`${(demo?.netPnlUsdt ?? 0) >= 0 ? "+" : ""}$${fmt(demo?.netPnlUsdt ?? 0)}`}
                 icon={Activity}
                 positive={(demo?.netPnlUsdt ?? 0) > 0}
@@ -250,7 +250,7 @@ export default function SniperPnlPage() {
                 sub={`${demo?.totalTrades ?? 0} trades VST`}
               />
               <MetricCard
-                label="Demo Win Rate"
+                label="Acerto Demo"
                 value={`${fmt(demo?.winRate ?? 0)}%`}
                 icon={Percent}
                 positive={(demo?.winRate ?? 0) > 50}
@@ -263,7 +263,7 @@ export default function SniperPnlPage() {
         {/* Trigger Geometry Fill Rate */}
         <div>
           <h2 className="text-sm font-semibold text-slate-400 uppercase tracking-wider mb-3 flex items-center gap-2">
-            <Target className="w-4 h-4" /> Geometria ARM_TRIGGER — Fill Rate
+            <Target className="w-4 h-4" /> Gatilho Sniper — Taxa de Execução
           </h2>
           <Card className="bg-slate-900 border-slate-700">
             <CardContent className="pt-5 pb-5 space-y-4">
@@ -271,7 +271,7 @@ export default function SniperPnlPage() {
                 <Skeleton className="h-20 bg-slate-800" />
               ) : !trigger || trigger.totalArmed === 0 ? (
                 <p className="text-sm text-slate-500 italic">
-                  Nenhum gatilho ARM_TRIGGER registrado nesta sessão. Ative o autopilot no modo enforce para ver dados aqui.
+                  Nenhum gatilho Sniper registrado nesta sessão. Ative o autopilot para ver dados aqui.
                 </p>
               ) : (
                 <>
@@ -280,13 +280,13 @@ export default function SniperPnlPage() {
                       <p className="text-2xl font-bold text-emerald-400 font-mono">
                         {fmt(trigger.fillRatePct)}%
                       </p>
-                      <p className="text-xs text-slate-500">Fill Rate</p>
+                      <p className="text-xs text-slate-500">Taxa de Execução</p>
                     </div>
                     <div className="text-center">
                       <p className="text-2xl font-bold text-amber-400 font-mono">
                         {fmt(trigger.expiryRatePct)}%
                       </p>
-                      <p className="text-xs text-slate-500">Expiry Rate</p>
+                      <p className="text-xs text-slate-500">Taxa de Expiração</p>
                     </div>
                     <div className="text-center">
                       <p className="text-2xl font-bold text-slate-200 font-mono">{trigger.totalArmed}</p>
@@ -294,16 +294,16 @@ export default function SniperPnlPage() {
                     </div>
                     <div className="flex gap-4 items-center">
                       <span className="flex items-center gap-1 text-xs text-emerald-400">
-                        <CheckCircle2 className="w-3.5 h-3.5" /> {trigger.presumedFilled} filled
+                        <CheckCircle2 className="w-3.5 h-3.5" /> {trigger.presumedFilled} executada
                       </span>
                       <span className="flex items-center gap-1 text-xs text-amber-400">
-                        <Clock className="w-3.5 h-3.5" /> {trigger.expired} expired
+                        <Clock className="w-3.5 h-3.5" /> {trigger.expired} expirada
                       </span>
                       <span className="flex items-center gap-1 text-xs text-red-400">
-                        <XCircle className="w-3.5 h-3.5" /> {trigger.cancelled} cancelled
+                        <XCircle className="w-3.5 h-3.5" /> {trigger.cancelled} cancelada
                       </span>
                       <span className="flex items-center gap-1 text-xs text-slate-400">
-                        <Activity className="w-3.5 h-3.5" /> {trigger.pending} pending
+                        <Activity className="w-3.5 h-3.5" /> {trigger.pending} pendente
                       </span>
                     </div>
                   </div>
@@ -315,9 +315,9 @@ export default function SniperPnlPage() {
                     total={trigger.totalArmed}
                   />
                   <div className="flex gap-4 text-xs text-slate-500">
-                    <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded-sm bg-emerald-500 inline-block" /> Filled</span>
-                    <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded-sm bg-amber-500 inline-block" /> Expirado (TTL)</span>
-                    <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded-sm bg-red-500 inline-block" /> Cancelado</span>
+                    <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded-sm bg-emerald-500 inline-block" /> Executada</span>
+                    <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded-sm bg-amber-500 inline-block" /> Expirada (TTL)</span>
+                    <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded-sm bg-red-500 inline-block" /> Cancelada</span>
                     <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded-sm bg-slate-600 inline-block" /> Pendente</span>
                   </div>
                   {/* Recent trigger activity */}
@@ -377,7 +377,7 @@ export default function SniperPnlPage() {
         {/* Symbol Breakdown */}
         <div>
           <h2 className="text-sm font-semibold text-slate-400 uppercase tracking-wider mb-3 flex items-center gap-2">
-            <BarChart2 className="w-4 h-4" /> Breakdown por Símbolo (Live)
+            <BarChart2 className="w-4 h-4" /> Resultado por Ativo — Live
           </h2>
           <Card className="bg-slate-900 border-slate-700">
             <CardContent className="pt-4 pb-2">
@@ -385,7 +385,7 @@ export default function SniperPnlPage() {
                 <Skeleton className="h-32 bg-slate-800" />
               ) : bySymbol.length === 0 ? (
                 <p className="text-sm text-slate-500 italic py-4">
-                  Nenhum trade live registrado. Ative o bot com SCALP_ALLOW_EXECUTION=true.
+                  Nenhum trade live registrado ainda. Ative as operações reais no painel Bot para começar.
                 </p>
               ) : (
                 <div className="overflow-x-auto">
@@ -395,9 +395,9 @@ export default function SniperPnlPage() {
                         <th className="text-left pb-2 pr-4">Símbolo</th>
                         <th className="text-left pb-2 pr-4">Side</th>
                         <th className="text-right pb-2 pr-4">Trades</th>
-                        <th className="text-right pb-2 pr-4">Win Rate</th>
-                        <th className="text-right pb-2 pr-4">P&L Net</th>
-                        <th className="text-right pb-2">Profit Factor</th>
+                        <th className="text-right pb-2 pr-4">Acerto</th>
+                        <th className="text-right pb-2 pr-4">Lucro Líquido</th>
+                        <th className="text-right pb-2">Fator Lucro</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -444,7 +444,7 @@ export default function SniperPnlPage() {
               <div className="space-y-1 text-xs text-slate-400">
                 <p><span className="text-slate-200 font-semibold">Arquitetura de Execução:</span> Ordens LIMIT com <span className="text-amber-300 font-mono">timeInForce: GTX</span> (Post-Only Maker). BingX cancela automaticamente se a ordem cruzasse o spread.</p>
                 <p><span className="text-slate-200 font-semibold">Geometria:</span> triggerPrice, targetPrice e stopPrice calculados exclusivamente pelo Quant Brain. O backend é executor puro.</p>
-                <p><span className="text-slate-200 font-semibold">Fill Rate:</span> Ordens que expiram (TTL) sem fill são canceladas automaticamente — sem ordens fantasmas na pedra.</p>
+                <p><span className="text-slate-200 font-semibold">Ordens expiradas:</span> Ordens que vencem o prazo (TTL) sem executar são canceladas automaticamente — nenhuma ordem fica presa na corretora.</p>
               </div>
             </div>
           </CardContent>

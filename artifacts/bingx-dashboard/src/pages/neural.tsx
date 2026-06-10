@@ -180,7 +180,7 @@ function IALearningStatus() {
       bg: "bg-emerald-500/10",
     },
     {
-      label: "Ciclos Sampler",
+      label: "Ciclos de Coleta",
       value: cycles > 0 ? cycles.toLocaleString() : "—",
       color: "text-foreground/70",
       icon: Radio,
@@ -188,7 +188,7 @@ function IALearningStatus() {
       bg: "bg-violet-500/10",
     },
     {
-      label: "Pipeline",
+      label: "Fila de Sinais",
       value: `${pending} pend · ${finalized} fin`,
       color: "text-foreground/60",
       icon: Activity,
@@ -196,7 +196,7 @@ function IALearningStatus() {
       bg: "bg-amber-500/10",
     },
     {
-      label: "Sinais Shadow",
+      label: "Sinais Coletados",
       value: sourceShadow > 0 ? sourceShadow.toLocaleString() : "—",
       color: "text-foreground/60",
       icon: Eye,
@@ -244,7 +244,7 @@ function IALearningStatus() {
       {!isLoading && samples < 300 && samplesPerHour > 0 && (
         <div className="mt-2 space-y-1">
           <div className="flex justify-between text-[9px] text-muted-foreground/50">
-            <span>Progresso para treino Shadow ML</span>
+            <span>Progresso para treino do modelo IA</span>
             <span className="font-mono">{Math.min(100, Math.round((samples / 300) * 100))}%</span>
           </div>
           <Progress value={Math.min(100, (samples / 300) * 100)} className="h-1 bg-muted/20" />
@@ -309,8 +309,8 @@ function BTCCommander() {
               <Radar className="h-4 w-4 text-blue-400" />
             </div>
             <div>
-              <span className="text-[12px] font-bold text-foreground/80 uppercase tracking-wider">BTC Commander</span>
-              <span className="ml-2 text-[9px] text-muted-foreground/50">5m movement · edge de movimento</span>
+              <span className="text-[12px] font-bold text-foreground/80 uppercase tracking-wider">Monitor BTC</span>
+              <span className="ml-2 text-[9px] text-muted-foreground/50">Análise de 5min · movimento e regime</span>
             </div>
           </div>
           {!isLoading && (
@@ -469,8 +469,8 @@ function RegimePlaybook() {
           <div className="p-1.5 rounded-lg bg-cyan-500/15">
             <Triangle className="h-4 w-4 text-cyan-400" />
           </div>
-          <span className="text-[12px] font-bold text-foreground/80 uppercase tracking-wider">Regime Playbook</span>
-          <span className="text-[10px] text-muted-foreground ml-auto">estado de mercado agora</span>
+          <span className="text-[12px] font-bold text-foreground/80 uppercase tracking-wider">Estado do Mercado</span>
+          <span className="text-[10px] text-muted-foreground ml-auto">regime atual por ativo</span>
         </div>
 
         {isLoading ? (
@@ -580,7 +580,7 @@ function ShadowMLAndWinRate() {
             <div className="p-1 rounded-md bg-violet-500/15">
               <Brain className="h-3.5 w-3.5 text-violet-400" />
             </div>
-            <span className="text-[11px] font-bold text-foreground/80 uppercase tracking-wider">Shadow ML</span>
+            <span className="text-[11px] font-bold text-foreground/80 uppercase tracking-wider">Modelo IA</span>
           </div>
           <Badge
             variant="outline"
@@ -663,7 +663,7 @@ function ShadowMLAndWinRate() {
                 <div className="flex min-w-0 items-center gap-1">
                   <CoinSymbol sym={sym} />
                   {available && (longTrades + shortTrades) > 0 && (
-                    <span className="w-1.5 h-1.5 rounded-full bg-violet-400/60 shrink-0" title="Shadow ML ativo" />
+                    <span className="w-1.5 h-1.5 rounded-full bg-violet-400/60 shrink-0" title="Modelo IA ativo" />
                   )}
                 </div>
                 <div className="space-y-0.5 min-w-0">
